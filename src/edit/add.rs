@@ -31,6 +31,18 @@ pub(crate) struct ResolvedAddition {
     pub date_coredata: i64,
     pub date_mac: u32,
     pub media_relative: String,
+    /// Set when the added track inherits an existing album's artwork slots.
+    pub artwork: Option<ArtworkLink>,
+}
+
+/// A reused artwork link: a fresh `mhii` image ID plus the album-mate's slot
+/// references and source image size.
+#[derive(Clone, Debug)]
+pub(crate) struct ArtworkLink {
+    pub image_id: u32,
+    pub src_img_size: u32,
+    pub child_count: u32,
+    pub mhod_children: Vec<u8>,
 }
 
 pub(crate) fn add_tracks_to_staged_databases(
@@ -509,6 +521,8 @@ fn insert_item_row(
             |row| row.get(0),
         )
         .map_err(|source| sqlite_error("read physical order", path, source))?;
+    let artwork_status = i64::from(addition.artwork.is_some());
+    let artwork_cache_id = addition.artwork.as_ref().map_or(0, |art| art.image_id);
 
     transaction
         .execute(
@@ -527,7 +541,8 @@ fn insert_item_row(
              description, description_long, collection_description, copyright, track_artist_pid, \
              physical_order, has_lyrics, date_released) \
              VALUES (:pid, NULL, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, :modified, \
-             :year, 0, 0, :compilation, 0, 0, 0, 0, 0, 0, 0, 0, 0, :length, NULL, :track_number, \
+             :year, 0, 0, :compilation, 0, 0, 0, 0, 0, :artwork_status, :artwork_cache_id, 0, 0, \
+             :length, NULL, :track_number, \
              :total_tracks, :disc_number, :total_discs, 0, NULL, NULL, NULL, 0, :genre_id, 0, \
              :album_pid, :artist_pid, :composer_pid, :title, :artist, :album, :album_artist, \
              :composer, :sort_title, :sort_artist, :sort_album, :sort_album_artist, \
@@ -539,6 +554,8 @@ fn insert_item_row(
                 ":modified": addition.date_coredata,
                 ":year": i64::from(addition.year),
                 ":compilation": i64::from(addition.compilation),
+                ":artwork_status": artwork_status,
+                ":artwork_cache_id": artwork_cache_id,
                 ":length": f64::from(addition.length_ms),
                 ":track_number": i64::from(addition.track_number),
                 ":total_tracks": i64::from(addition.total_tracks),

@@ -15,7 +15,7 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, Transaction};
 
-pub(crate) use add::{add_tracks_to_staged_databases, ResolvedAddition};
+pub(crate) use add::{add_tracks_to_staged_databases, ArtworkLink, ResolvedAddition};
 pub(crate) use commit::{
     install_noop_hardware_test, install_single_addition_hardware_test,
     install_single_artwork_removal_hardware_test, install_single_removal_hardware_test,
@@ -29,7 +29,7 @@ use crate::{
     fs::read_limited,
     storage::{
         binary::{
-            add_track_to_cdb, build_hashab_cbk, remove_tracks_from_cdb, verify_cbk,
+            add_track_to_cdb, build_hashab_cbk, remove_tracks_from_cdb, verify_cbk, CdbArtworkLink,
             CdbTrackAddition,
         },
         sqlite::inspect_sqlite_database,
@@ -88,6 +88,9 @@ pub struct TrackToAdd {
     pub length_ms: u32,
     /// Whether this track belongs to a compilation album.
     pub compilation: bool,
+    /// When true, a track joining an album that already has on-device artwork
+    /// inherits that album's `.ithmb` slots (no image decoding or encoding).
+    pub reuse_album_art: bool,
 }
 
 const ITLP_PATH: &str = "iPod_Control/iTunes/iTunes Library.itlp";
@@ -285,6 +288,7 @@ impl<'device> EditSession<'device> {
             }
             if !resolved.is_empty() {
                 write_cdb_additions(self.device, &destination, guid, &resolved)?;
+                write_artwork_additions(self.device, &destination, &resolved)?;
             }
         }
         validate_staged_set(&destination)?;
@@ -327,6 +331,7 @@ impl<'device> EditSession<'device> {
             directory: destination,
             removed_tracks: self.removals.len(),
             added_tracks: resolved.len(),
+            added_artwork_tracks: resolved.iter().filter(|add| add.artwork.is_some()).count(),
             remaining_tracks: after.track_count(),
             removed_media,
             removed_artwork_tracks,
@@ -358,6 +363,11 @@ impl<'device> EditSession<'device> {
             let metadata = fs::metadata(&track.source_path)
                 .map_err(|source| io_error("inspect track source", &track.source_path, source))?;
             let pid = generate_unique_pid(&existing_pids);
+            let artwork = if track.reuse_album_art {
+                resolve_reused_artwork(self.device, track)?
+            } else {
+                None
+            };
             resolved.push(ResolvedAddition {
                 pid,
                 title: track.title.trim().to_owned(),
@@ -381,6 +391,7 @@ impl<'device> EditSession<'device> {
                 file_size: metadata.len(),
                 date_coredata,
                 media_relative,
+                artwork,
                 date_mac,
             });
         }
@@ -397,6 +408,7 @@ pub struct StagedSqliteEdit {
     directory: PathBuf,
     removed_tracks: usize,
     added_tracks: usize,
+    added_artwork_tracks: usize,
     remaining_tracks: usize,
     removed_media: Vec<IpodPath>,
     removed_artwork_tracks: usize,
@@ -422,6 +434,12 @@ impl StagedSqliteEdit {
     #[must_use]
     pub const fn added_tracks(&self) -> usize {
         self.added_tracks
+    }
+
+    /// Returns how many additions inherit reused album artwork slots.
+    #[must_use]
+    pub const fn added_artwork_tracks(&self) -> usize {
+        self.added_artwork_tracks
     }
 
     /// Returns media targets that a future completed commit would install.
@@ -626,6 +644,63 @@ fn generate_unique_pid(existing: &BTreeSet<PersistentId>) -> PersistentId {
             return candidate;
         }
     }
+}
+
+/// Finds an album-mate with on-device artwork and builds a reused-artwork
+/// link for a new track: a fresh `mhii` image ID plus the album-mate's slot
+/// references copied verbatim.
+fn resolve_reused_artwork(device: &Device, track: &TrackToAdd) -> Result<Option<ArtworkLink>> {
+    let album = track.album.as_deref().unwrap_or("");
+    let album_artist = track
+        .album_artist
+        .as_deref()
+        .or(track.artist.as_deref())
+        .unwrap_or("");
+    let mate = device
+        .library()
+        .and_then(|library| {
+            library.tracks().iter().find(|candidate| {
+                candidate.has_artwork
+                    && candidate.album == album
+                    && (if candidate.album_artist.is_empty() {
+                        candidate.artist.clone()
+                    } else {
+                        candidate.album_artist.clone()
+                    }) == album_artist
+            })
+        })
+        .cloned();
+    let Some(mate) = mate else {
+        return Ok(None);
+    };
+    let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
+    let artwork_path = device.mount().resolve_existing(&relative)?;
+    let bytes = read_limited(&artwork_path, MAX_ARTWORK_BYTES, "ArtworkDB")?;
+    let records = crate::artwork::parse_artwork_records(&bytes)?;
+    let record = records
+        .iter()
+        .find(|record| record.track_id == mate.id)
+        .ok_or_else(|| Error::Verification {
+            format: "artwork reuse",
+            reason: "album-mate track has no ArtworkDB record".to_owned(),
+        })?;
+    let (mhod_children, child_count) = crate::artwork::build_reused_children(&record.formats);
+    let next_image_id = records
+        .iter()
+        .map(|record| record.image_id)
+        .max()
+        .unwrap_or(99)
+        .checked_add(1)
+        .ok_or_else(|| Error::Verification {
+            format: "artwork reuse",
+            reason: "image ID overflow".to_owned(),
+        })?;
+    Ok(Some(ArtworkLink {
+        image_id: next_image_id,
+        src_img_size: record.src_img_size,
+        child_count,
+        mhod_children,
+    }))
 }
 
 fn validate_destination(device: &Device, supplied: &Path) -> Result<PathBuf> {
@@ -985,6 +1060,10 @@ fn write_cdb_additions(
             year: addition.year,
             compilation: addition.compilation,
             date_mac: addition.date_mac,
+            artwork: addition.artwork.as_ref().map(|art| CdbArtworkLink {
+                image_id: art.image_id,
+                src_img_size: art.src_img_size,
+            }),
         };
         bytes = add_track_to_cdb(&bytes, guid, &cdb_addition)?;
     }
@@ -1030,6 +1109,71 @@ fn write_artwork_preview(
             format: "staged ArtworkDB",
             reason: "removed artwork records remain in the rewritten ArtworkDB".to_owned(),
         });
+    }
+    let output = directory.join("ArtworkDB");
+    let mut file = File::create(&output)
+        .map_err(|source| io_error("create staged ArtworkDB", &output, source))?;
+    file.write_all(&rewritten)
+        .map_err(|source| io_error("write staged ArtworkDB", &output, source))?;
+    file.sync_all()
+        .map_err(|source| io_error("flush staged ArtworkDB", &output, source))?;
+    Ok(())
+}
+
+/// Appends a reused-artwork `mhii` record for every added track that
+/// inherits an existing album's slots. A no-op when nothing was reused.
+fn write_artwork_additions(
+    device: &Device,
+    directory: &Path,
+    additions: &[ResolvedAddition],
+) -> Result<()> {
+    let linked: Vec<&ResolvedAddition> = additions
+        .iter()
+        .filter(|addition| addition.artwork.is_some())
+        .collect();
+    if linked.is_empty() {
+        return Ok(());
+    }
+    let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
+    let source = device.mount().resolve_existing(&relative)?;
+    let bytes = read_limited(&source, MAX_ARTWORK_BYTES, "ArtworkDB")?;
+    let records: Vec<crate::artwork::NewArtworkRecord> = linked
+        .iter()
+        .map(|addition| {
+            let artwork = addition.artwork.as_ref().expect("filtered above");
+            crate::artwork::NewArtworkRecord {
+                image_id: artwork.image_id,
+                track_id: addition.pid,
+                src_img_size: artwork.src_img_size,
+                child_count: artwork.child_count,
+                mhod_children: artwork.mhod_children.clone(),
+            }
+        })
+        .collect();
+    let rewritten = crate::artwork::append_artwork_records(&bytes, &records)?;
+    let remaining = crate::artwork::parse_artwork_records(&rewritten)?;
+    for addition in &linked {
+        let artwork = addition.artwork.as_ref().expect("filtered above");
+        if !remaining
+            .iter()
+            .any(|record| record.track_id == addition.pid)
+        {
+            return Err(Error::Verification {
+                format: "staged ArtworkDB",
+                reason: "an added artwork record is missing from the rewritten ArtworkDB"
+                    .to_owned(),
+            });
+        }
+        let record = remaining
+            .iter()
+            .find(|record| record.track_id == addition.pid)
+            .expect("checked above");
+        if record.image_id != artwork.image_id {
+            return Err(Error::Verification {
+                format: "staged ArtworkDB",
+                reason: "an added artwork record has the wrong image ID".to_owned(),
+            });
+        }
     }
     let output = directory.join("ArtworkDB");
     let mut file = File::create(&output)

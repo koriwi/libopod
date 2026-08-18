@@ -566,7 +566,8 @@ fn verify_bundle(
         feature: "device transaction",
         reason: "the device profile is unknown".to_owned(),
     })?;
-    let artwork_outputs = usize::from(staged.removed_artwork_tracks() > 0);
+    let artwork_outputs =
+        usize::from(staged.removed_artwork_tracks() > 0 || staged.added_artwork_tracks() > 0);
     if manifest.profile != profile.key()
         || manifest.removed_tracks != staged.removed_tracks()
         || manifest.added_tracks != staged.added_tracks()

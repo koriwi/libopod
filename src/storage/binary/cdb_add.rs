@@ -67,6 +67,13 @@ const SORT_SEASON: u32 = 0x1e;
 const SORT_EPISODE: u32 = 0x1f;
 const SORT_ALBUM_ARTIST: u32 = 0x23;
 
+/// Reused-artwork link written into a new track's MHIT header.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CdbArtworkLink {
+    pub image_id: u32,
+    pub src_img_size: u32,
+}
+
 /// Metadata for one staged track insertion into `iTunesCDB`.
 ///
 /// The CDB-internal `track_id`, `album_id` (MHLA), and `artist_id_ref`
@@ -92,6 +99,7 @@ pub(crate) struct CdbTrackAddition {
     pub year: u32,
     pub compilation: bool,
     pub date_mac: u32,
+    pub artwork: Option<CdbArtworkLink>,
 }
 
 pub(crate) fn add_track_to_cdb(
@@ -877,6 +885,7 @@ fn build_mhit(
     album_id: u32,
     artist_id_ref: u32,
 ) -> Vec<u8> {
+    let artwork = addition.artwork;
     let mhod_fields = [
         (MHOD_TYPE_TITLE, Some(addition.title.clone())),
         (MHOD_TYPE_LOCATION, Some(addition.location.clone())),
@@ -943,9 +952,9 @@ fn build_mhit(
         addition.persistent_id.to_bits(),
     )
     .ok();
-    write_u16(&mut header, 0x7c, 0).ok(); // artwork_count
+    write_u16(&mut header, 0x7c, artwork.map_or(0, |_| 1)).ok(); // artwork_count
     write_u16(&mut header, 0x7e, 0xffff).ok(); // audio_format_flag
-    write_u32(&mut header, 0x80, 0).ok(); // artwork_size
+    write_u32(&mut header, 0x80, artwork.map_or(0, |art| art.src_img_size)).ok(); // artwork_size
     header[0x84..0x88].copy_from_slice(&0_u32.to_le_bytes());
     write_u32(
         &mut header,
@@ -959,7 +968,7 @@ fn build_mhit(
     write_u32(&mut header, 0x98, 0).ok(); // genius_category_id
     write_u32(&mut header, 0x9c, 0).ok(); // skip_count
     write_u32(&mut header, 0xa0, 0).ok(); // last_skipped
-    header[0xa4] = 2; // has_artwork (none)
+    header[0xa4] = if artwork.is_some() { 1 } else { 2 }; // has_artwork
     write_u64(&mut header, 0xa8, addition.persistent_id.to_bits()).ok(); // db_track_id_2
     write_u32(&mut header, 0xb8, 0).ok(); // pregap
     write_u64(&mut header, 0xbc, 0).ok(); // sample_count
@@ -973,6 +982,7 @@ fn build_mhit(
     write_u32(&mut header, 0x120, album_id).ok(); // album_id
     write_u64(&mut header, MHIT_DB_ID2_REF, db_id_2).ok();
     write_u32(&mut header, 0x12c, addition.file_size).ok(); // size_2
+    write_u32(&mut header, 0x160, artwork.map_or(0, |art| art.image_id)).ok(); // artwork_id_ref
     header[0x134..0x13a].copy_from_slice(&[0x80; 6]); // sort indicators, no sort MHODs
     write_u32(&mut header, 0x168, 1).ok(); // opaque marker
     write_u32(&mut header, MHIT_ARTIST_ID_REF, artist_id_ref).ok();
@@ -1093,6 +1103,7 @@ mod tests {
             year: 2024,
             compilation: false,
             date_mac: 0,
+            artwork: None,
         };
         let fields = sort_fields(&CdbSortView::from_addition(&addition), SORT_TITLE);
         assert_eq!(fields.0[0], SortField::Text("same title".to_owned()));

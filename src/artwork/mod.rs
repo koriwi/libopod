@@ -4,6 +4,10 @@
 //! preserves every other chunk byte-for-byte. `.ithmb` slot payloads are left
 //! in place as unreferenced data, mirroring the orphaned-media policy.
 
+mod write;
+
+pub(crate) use write::{append_artwork_records, build_reused_children, NewArtworkRecord};
+
 use std::{fs, path::Path};
 
 use crate::{error::io_error, Error, PersistentId, Result};
@@ -47,6 +51,7 @@ pub struct ArtworkFrameInfo {
 pub struct ArtworkRecord {
     pub image_id: u32,
     pub track_id: PersistentId,
+    pub src_img_size: u32,
     pub formats: Vec<ArtworkFormatRef>,
 }
 
@@ -226,6 +231,7 @@ fn parse_mhii(bytes: &[u8], offset: usize) -> Result<ArtworkRecord> {
     let child_count = usize_value(le_u32(bytes, offset + 12)?, offset + 12)?;
     let image_id = le_u32(bytes, offset + 16)?;
     let track_id = PersistentId::from_bits(le_u64(bytes, offset + 20)?);
+    let src_img_size = le_u32(bytes, offset + 48)?;
     let mut formats = Vec::with_capacity(child_count);
     let mut child_offset = offset
         .checked_add(usize_value(le_u32(bytes, offset + 4)?, offset + 4)?)
@@ -256,6 +262,7 @@ fn parse_mhii(bytes: &[u8], offset: usize) -> Result<ArtworkRecord> {
     Ok(ArtworkRecord {
         image_id,
         track_id,
+        src_img_size,
         formats,
     })
 }
@@ -435,12 +442,12 @@ fn require_magic(bytes: &[u8], offset: usize, expected: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn usize_value(value: u32, offset: usize) -> Result<usize> {
+pub(super) fn usize_value(value: u32, offset: usize) -> Result<usize> {
     usize::try_from(value)
         .map_err(|_| malformed_error(to_u64(offset), "value does not fit this host"))
 }
 
-fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<()> {
+pub(super) fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<()> {
     let target = bytes
         .get_mut(offset..offset + 4)
         .ok_or_else(|| malformed_error(to_u64(offset), "truncated u32 target"))?;
@@ -464,22 +471,22 @@ fn le_u64(bytes: &[u8], offset: usize) -> Result<u64> {
     })?))
 }
 
-fn le_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+pub(super) fn le_u32(bytes: &[u8], offset: usize) -> Result<u32> {
     let value = bytes
         .get(offset..offset + 4)
         .ok_or_else(|| malformed_error(to_u64(offset), "truncated u32"))?;
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
-fn to_u64(value: usize) -> u64 {
+pub(super) fn to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-fn malformed<T>(offset: u64, reason: &str) -> Result<T> {
+pub(super) fn malformed<T>(offset: u64, reason: &str) -> Result<T> {
     Err(malformed_error(offset, reason))
 }
 
-fn malformed_error(offset: u64, reason: &str) -> Error {
+pub(super) fn malformed_error(offset: u64, reason: &str) -> Error {
     Error::Malformed {
         format: "ArtworkDB",
         offset,
@@ -487,7 +494,7 @@ fn malformed_error(offset: u64, reason: &str) -> Error {
     }
 }
 
-fn verification(reason: &str) -> Error {
+pub(super) fn verification(reason: &str) -> Error {
     Error::Verification {
         format: "ArtworkDB",
         reason: reason.to_owned(),

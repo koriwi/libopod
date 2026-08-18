@@ -375,6 +375,103 @@ mod tests {
         assert_eq!(reopened.library().unwrap().track_count(), 726);
     }
 
+    #[test]
+    fn stages_and_installs_an_addition_with_reused_album_art() {
+        let Some((bundle, staged)) = stage_private_artwork_addition() else {
+            return;
+        };
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(staged.added_artwork_tracks(), 1);
+        assert_eq!(staged.remaining_tracks(), 727);
+        let directory = bundle.path();
+        let library = rusqlite::Connection::open(
+            directory.join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let (status, cache_id): (i64, i64) = library
+            .query_row(
+                "SELECT artwork_status, artwork_cache_id FROM item \
+                 WHERE title = 'LibOpod Artwork Reuse'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, 1);
+        assert_eq!(cache_id, 804);
+        let artwork_bytes = std::fs::read(directory.join("ArtworkDB")).unwrap();
+        let records = crate::artwork::parse_artwork_records(&artwork_bytes).unwrap();
+        assert_eq!(records.len(), 705);
+        let added = records
+            .iter()
+            .find(|record| record.track_id == staged_new_pid(&staged))
+            .unwrap();
+        assert_eq!(added.image_id, 804);
+        assert_eq!(added.formats.len(), 4);
+
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        virtual_device
+            .install_single_addition_hardware_test(&staged, ADDITION_CONFIRMATION)
+            .unwrap();
+        let installed =
+            std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        assert_eq!(crate::artwork::parse_artwork_records(&installed).unwrap().len(), 705);
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 727);
+    }
+
+    fn staged_new_pid(staged: &super::StagedSqliteEdit) -> PersistentId {
+        let library = rusqlite::Connection::open(
+            staged.directory().join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let pid: i64 = library
+            .query_row(
+                "SELECT pid FROM item WHERE title = 'LibOpod Artwork Reuse'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        PersistentId::from_bits(u64::from_ne_bytes(pid.to_ne_bytes()))
+    }
+
+    fn stage_private_artwork_addition() -> Option<(TempDir, super::StagedSqliteEdit)> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return None;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let source = fixture.join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return None;
+        }
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "LibOpod Artwork Reuse".to_owned(),
+            artist: Some("Linkin Park".to_owned()),
+            album: Some("Hybrid Theory".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2000,
+            track_number: 13,
+            total_tracks: 13,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 192,
+            sample_rate: 44100,
+            length_ms: 155_742,
+            compilation: false,
+            reuse_album_art: true,
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        Some((bundle, staged))
+    }
+
     fn stage_private_artwork_removal() -> Option<(TempDir, super::StagedSqliteEdit)> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
         if !fixture.is_dir() {
@@ -425,6 +522,7 @@ mod tests {
             sample_rate: 44100,
             length_ms: 155_742,
             compilation: false,
+        reuse_album_art: false,
         })
         .unwrap();
         assert_eq!(edit.addition_count(), 1);
