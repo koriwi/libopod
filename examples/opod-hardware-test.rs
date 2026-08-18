@@ -126,6 +126,7 @@ fn run_addition(
         length_ms,
         compilation: false,
         reuse_album_art: false,
+        artwork_source: None,
     };
     if track.title.is_empty() {
         return Err(invalid_input("TITLE must be non-empty"));

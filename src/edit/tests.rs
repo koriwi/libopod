@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(records.len(), 705);
         let added = records
             .iter()
-            .find(|record| record.track_id == staged_new_pid(&staged))
+            .find(|record| record.track_id == staged_pid(&staged, "LibOpod Artwork Reuse"))
             .unwrap();
         assert_eq!(added.image_id, 804);
         assert_eq!(added.formats.len(), 4);
@@ -421,15 +421,15 @@ mod tests {
         assert_eq!(reopened.library().unwrap().track_count(), 727);
     }
 
-    fn staged_new_pid(staged: &super::StagedSqliteEdit) -> PersistentId {
+    fn staged_pid(staged: &super::StagedSqliteEdit, title: &str) -> PersistentId {
         let library = rusqlite::Connection::open(
             staged.directory().join(SqliteLibraryFile::Library.file_name()),
         )
         .unwrap();
         let pid: i64 = library
             .query_row(
-                "SELECT pid FROM item WHERE title = 'LibOpod Artwork Reuse'",
-                [],
+                "SELECT pid FROM item WHERE title = ?1",
+                [title],
                 |row| row.get(0),
             )
             .unwrap();
@@ -465,6 +465,116 @@ mod tests {
             length_ms: 155_742,
             compilation: false,
             reuse_album_art: true,
+            artwork_source: None,
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        Some((bundle, staged))
+    }
+
+    #[test]
+    fn stages_and_installs_an_addition_with_new_encoded_artwork() {
+        let Some((bundle, staged)) = stage_private_new_art_addition() else {
+            return;
+        };
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(staged.added_artwork_tracks(), 1);
+        assert_eq!(staged.added_ithmb().len(), 4);
+        assert_eq!(staged.remaining_tracks(), 727);
+        let directory = bundle.path();
+        let library = rusqlite::Connection::open(
+            directory.join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let (status, cache_id): (i64, i64) = library
+            .query_row(
+                "SELECT artwork_status, artwork_cache_id FROM item \
+                 WHERE title = 'LibOpod New Art'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, 1);
+        assert_eq!(cache_id, 804);
+        let artwork_bytes = std::fs::read(directory.join("ArtworkDB")).unwrap();
+        let records = crate::artwork::parse_artwork_records(&artwork_bytes).unwrap();
+        assert_eq!(records.len(), 705);
+        let added = records
+            .iter()
+            .find(|record| record.track_id == staged_pid(&staged, "LibOpod New Art"))
+            .unwrap();
+        assert_eq!(added.image_id, 804);
+        // Each ithmb file grew by exactly one slot.
+        for ithmb in staged.added_ithmb() {
+            let staged_file = directory.join(ithmb.as_str());
+            let original = bundle.path().join("original").join(ithmb.as_str());
+            let grown = std::fs::metadata(&staged_file).unwrap().len();
+            let before = std::fs::metadata(&original).unwrap().len();
+            assert_eq!(grown, before + (grown - before));
+            assert!(grown > before, "{} did not grow", ithmb.as_str());
+        }
+
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        virtual_device
+            .install_single_addition_hardware_test(&staged, ADDITION_CONFIRMATION)
+            .unwrap();
+        for ithmb in staged.added_ithmb() {
+            assert!(virtual_root.join(ithmb.as_str()).is_file());
+        }
+        let installed =
+            std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        assert_eq!(crate::artwork::parse_artwork_records(&installed).unwrap().len(), 705);
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 727);
+    }
+
+    fn stage_private_new_art_addition() -> Option<(TempDir, super::StagedSqliteEdit)> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return None;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let source = fixture.join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return None;
+        }
+        let art_dir = tempdir().unwrap();
+        let art_path = art_dir.path().join("cover.png");
+        let mut buffer = Vec::new();
+        let rgba = image::RgbaImage::from_pixel(512, 512, image::Rgba([120, 40, 200, 255]));
+        let encoder = image::codecs::png::PngEncoder::new(&mut buffer);
+        image::ImageEncoder::write_image(
+            encoder,
+            rgba.as_raw(),
+            512,
+            512,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        std::fs::write(&art_path, &buffer).unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "LibOpod New Art".to_owned(),
+            artist: Some("New Art Artist".to_owned()),
+            album: Some("New Art Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2024,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 192,
+            sample_rate: 44100,
+            length_ms: 155_742,
+            compilation: false,
+            reuse_album_art: false,
+            artwork_source: Some(art_path),
         })
         .unwrap();
         let bundle = tempdir().unwrap();
@@ -523,6 +633,7 @@ mod tests {
             length_ms: 155_742,
             compilation: false,
         reuse_album_art: false,
+        artwork_source: None,
         })
         .unwrap();
         assert_eq!(edit.addition_count(), 1);

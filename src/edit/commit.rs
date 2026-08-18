@@ -213,6 +213,11 @@ fn install_inner(
                 let target = resolve_target(device.mount(), output)?;
                 verify_file(&target, bytes, digest, "live transaction input")?;
                 let backup_file = backup.join(&output.staged);
+                if let Some(parent) = backup_file.parent() {
+                    fs::create_dir_all(parent).map_err(|source| {
+                        io_error("create transaction backup parent", parent, source)
+                    })?;
+                }
                 copy_new_verified(&target, &backup_file, bytes, digest)?;
             }
             (None, None) => {
@@ -456,6 +461,7 @@ fn validate_recovery_state(
         if !expected_targets.contains(&output.target.as_str())
             && output.target != artwork_target
             && !output.target.starts_with("iPod_Control/Music/")
+            && !output.target.starts_with("iPod_Control/Artwork/")
         {
             return Err(Error::Verification {
                 format: "device transaction",
@@ -567,7 +573,8 @@ fn verify_bundle(
         reason: "the device profile is unknown".to_owned(),
     })?;
     let artwork_outputs =
-        usize::from(staged.removed_artwork_tracks() > 0 || staged.added_artwork_tracks() > 0);
+        usize::from(staged.removed_artwork_tracks() > 0 || staged.added_artwork_tracks() > 0)
+            + staged.added_ithmb().len();
     if manifest.profile != profile.key()
         || manifest.removed_tracks != staged.removed_tracks()
         || manifest.added_tracks != staged.added_tracks()

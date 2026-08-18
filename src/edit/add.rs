@@ -35,14 +35,24 @@ pub(crate) struct ResolvedAddition {
     pub artwork: Option<ArtworkLink>,
 }
 
-/// A reused artwork link: a fresh `mhii` image ID plus the album-mate's slot
-/// references and source image size.
+/// A reused or freshly encoded artwork link: a fresh `mhii` image ID plus the
+/// slot references and (for new art) the encoded frames to write.
 #[derive(Clone, Debug)]
 pub(crate) struct ArtworkLink {
     pub image_id: u32,
     pub src_img_size: u32,
     pub child_count: u32,
     pub mhod_children: Vec<u8>,
+    /// Encoded `.ithmb` frames to append, in format order.
+    pub frames: Vec<ArtworkFrameOut>,
+}
+
+/// One encoded `.ithmb` frame plus the slot offset it will occupy.
+#[derive(Clone, Debug)]
+pub(crate) struct ArtworkFrameOut {
+    pub filename: String,
+    pub ithmb_offset: u32,
+    pub frame: Vec<u8>,
 }
 
 pub(crate) fn add_tracks_to_staged_databases(

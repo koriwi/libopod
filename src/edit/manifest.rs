@@ -230,6 +230,21 @@ fn output_targets(destination: &Path) -> Result<Vec<(String, IpodPath)>> {
             IpodPath::new("iPod_Control/Artwork/ArtworkDB")?,
         ));
     }
+    let artwork_dir = destination.join("iPod_Control").join("Artwork");
+    if let Ok(entries) = fs::read_dir(&artwork_dir) {
+        let mut names: Vec<String> = entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.to_ascii_lowercase().ends_with(".ithmb"))
+            .collect();
+        names.sort();
+        for name in names {
+            targets.push((
+                format!("iPod_Control/Artwork/{name}"),
+                IpodPath::new(format!("iPod_Control/Artwork/{name}"))?,
+            ));
+        }
+    }
     Ok(targets)
 }
 

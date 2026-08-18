@@ -4,6 +4,9 @@
 //! preserves every other chunk byte-for-byte. `.ithmb` slot payloads are left
 //! in place as unreferenced data, mirroring the orphaned-media policy.
 
+mod encode;
+
+pub(crate) use encode::encode_new_frames;
 mod write;
 
 pub(crate) use write::{append_artwork_records, build_reused_children, NewArtworkRecord};
