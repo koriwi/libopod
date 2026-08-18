@@ -6,12 +6,12 @@ operator confirmation that identifies the mounted volume.
 The initial Nano 7G backup at `backup_7g/` is private and immutable. It is a
 file-level development input, not a write target.
 
-## Current gate: reused-album-art addition (gate 5)
+## Current gate: new-cover-art addition (gate 6)
 
-Gates 1–4 (no-op, no-artwork removal, no-artwork addition, artwork-bearing
-removal) have passed on hardware. The device is at 725 tracks / 703
-ArtworkDB records. Gate 5 adds one track whose album already has artwork and
-validates the reuse path end to end.
+Gates 1–5 (no-op, no-artwork removal, no-artwork addition, artwork-bearing
+removal, reused-art addition) have passed on hardware. The device is at 726
+tracks / 704 ArtworkDB records. Gate 6 adds one track with a fresh encoded
+cover and validates the full new-art path end to end.
 
 The edit stage can read a mounted iPod and write modified SQLite and signed
 CDB copies to separate host storage. It does not write to the iPod unless an
@@ -227,6 +227,13 @@ Expect one more track (726 total), the same artwork as its album-mates, 704
 ArtworkDB records (703 + the new track's reused record), valid signatures,
 and no restore warning after reboot.
 
+### Gate 5 result
+
+Passed on hardware 2025-08-18: one track added with reused album artwork.
+Tracks 725 → 726, ArtworkDB records 703 → 704, the new track appears under
+the correct album and displays the shared artwork. Signatures valid, no
+restore warning after reboot.
+
 ## Nano 7G gate 6: addition with new encoded cover art
 
 Adds one track with a fresh cover image (JPEG/PNG) encoded into all four Nano
@@ -239,6 +246,6 @@ cargo run --release --example opod-hardware-test -- \
   'I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH NEW COVER ART'
 ```
 
-Expect one more track (726 total), 704 ArtworkDB records, the four `.ithmb`
-files each one slot longer, the new artwork visible in Now Playing/browse,
-valid signatures, and no restore warning after reboot.
+Expect one more track (727 total, 726 + 1), 705 ArtworkDB records (704 + 1),
+the four `.ithmb` files each one slot longer, the new artwork visible in Now
+Playing/browse, valid signatures, and no restore warning after reboot.
