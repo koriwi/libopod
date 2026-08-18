@@ -702,3 +702,16 @@ multi-cycle mirrors. Validated end to end against a throwaway copy of
 empty) plus one addition installed, and the device re-read with the expected
 single track. Remaining hardware steps are the delete-path gates 7/8 on the
 real Nano 7G, and the non-Nano profiles (HASH58/HASH72, legacy generations).
+
+Classic status (2025-08-18): Nano 1–4 support is implemented and validated
+against the operator's real Nano 3G files. HASH58 verifies against the
+device's stored signature; the read path resolves the profile via `FamilyID`
+(12=3G, 18=7G verified; 14=4G provisional), parses all 724 tracks, artwork
+presence, and playlists. The write path stages removals/additions on the
+uncompressed `iTunesDB`, re-signs with NONE (1G/2G) or HASH58 (3G/4G), and
+installs through the same transactional engine; new `mhit` headers match the
+device's size (0x248 on the 3G). 1G/2G identity and the GUID come from the
+Linux USB hierarchy (sysfs) when `SysInfo` is empty; classic artwork is
+preserved but not yet written (copyPod artwork updates on classic are
+rejected with a clear error until classic thumbnail encoding lands). Nano 4G
+needs its `FamilyID` confirmed on hardware; Nano 5G/6G (HASH72) remain open.
