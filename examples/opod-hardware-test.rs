@@ -2,7 +2,8 @@ use std::{error::Error, ffi::OsString, io::Error as IoError, path::PathBuf, proc
 
 use libopod::{
     recover_interrupted_transaction, Device, TrackToAdd, NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION,
-    NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+    NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION, NANO7_ARTWORK_REUSE_ADDITION_CONFIRMATION,
+    NANO7_NEW_ART_ADDITION_CONFIRMATION, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
     NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
 };
 
@@ -43,9 +44,32 @@ fn run(arguments: &[OsString]) -> CliResult<()> {
                 .ok_or_else(|| invalid_input("confirmation must be UTF-8"))?;
             run_addition(mount, source, title, artist, album, length_ms, staging, confirmation)
         }
+        [command, mount, source, title, artist, album, length_ms, staging, confirmation]
+            if command == "add-reuse" =>
+        {
+            let length_ms = parse_u32(length_ms, "LENGTH_MS")?;
+            let confirmation = confirmation
+                .to_str()
+                .ok_or_else(|| invalid_input("confirmation must be UTF-8"))?;
+            run_art_addition(
+                mount, source, title, artist, album, length_ms, staging, confirmation, true, None,
+            )
+        }
+        [command, mount, source, art, title, artist, album, length_ms, staging, confirmation]
+            if command == "add-art" =>
+        {
+            let length_ms = parse_u32(length_ms, "LENGTH_MS")?;
+            let confirmation = confirmation
+                .to_str()
+                .ok_or_else(|| invalid_input("confirmation must be UTF-8"))?;
+            run_art_addition(
+                mount, source, title, artist, album, length_ms, staging, confirmation, false,
+                Some(art),
+            )
+        }
         [command, mount] if command == "recover" => run_recovery(mount),
         _ => Err(invalid_input(&format!(
-            "usage:\n  opod-hardware-test noop MOUNT EMPTY_HOST_DIRECTORY '{NANO7_NOOP_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION}'  (for an artwork-bearing track)\n  opod-hardware-test add MOUNT SOURCE_MP3 TITLE ARTIST ALBUM LENGTH_MS EMPTY_HOST_DIRECTORY '{NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test recover MOUNT"
+            "usage:\n  opod-hardware-test noop MOUNT EMPTY_HOST_DIRECTORY '{NANO7_NOOP_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION}'  (for an artwork-bearing track)\n  opod-hardware-test add MOUNT SOURCE_MP3 TITLE ARTIST ALBUM LENGTH_MS EMPTY_HOST_DIRECTORY '{NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test add-reuse MOUNT SOURCE_MP3 TITLE ARTIST ALBUM LENGTH_MS EMPTY_HOST_DIRECTORY '{NANO7_ARTWORK_REUSE_ADDITION_CONFIRMATION}'\n  opod-hardware-test add-art MOUNT SOURCE_MP3 ART_IMAGE TITLE ARTIST ALBUM LENGTH_MS EMPTY_HOST_DIRECTORY '{NANO7_NEW_ART_ADDITION_CONFIRMATION}'\n  opod-hardware-test recover MOUNT"
         ))),
     }
 }
@@ -107,12 +131,11 @@ fn run_addition(
     confirmation: &str,
 ) -> CliResult<()> {
     let device = Device::open(PathBuf::from(mount))?;
-    let text = |value: &OsString| value.to_str().map(str::to_owned);
     let track = TrackToAdd {
         source_path: PathBuf::from(source),
-        title: text(title).unwrap_or_default(),
-        artist: text(artist).filter(|value| !value.is_empty()),
-        album: text(album).filter(|value| !value.is_empty()),
+        title: text(title),
+        artist: optional_text(artist),
+        album: optional_text(album),
         album_artist: None,
         genre: None,
         composer: None,
@@ -128,9 +151,6 @@ fn run_addition(
         reuse_album_art: false,
         artwork_source: None,
     };
-    if track.title.is_empty() {
-        return Err(invalid_input("TITLE must be non-empty"));
-    }
     let mut edit = device.edit()?;
     edit.add_track(track)?;
     let staged = edit.stage_sqlite_preview(PathBuf::from(staging))?;
@@ -141,6 +161,63 @@ fn run_addition(
     println!("installed media: {}", staged.added_media()[0]);
     println!("Keep the host bundle, safely eject, reboot, and validate before continuing.");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_art_addition(
+    mount: &OsString,
+    source: &OsString,
+    title: &OsString,
+    artist: &OsString,
+    album: &OsString,
+    length_ms: u32,
+    staging: &OsString,
+    confirmation: &str,
+    reuse: bool,
+    art_image: Option<&OsString>,
+) -> CliResult<()> {
+    let device = Device::open(PathBuf::from(mount))?;
+    let track = TrackToAdd {
+        source_path: PathBuf::from(source),
+        title: text(title),
+        artist: optional_text(artist),
+        album: optional_text(album),
+        album_artist: None,
+        genre: None,
+        composer: None,
+        year: 0,
+        track_number: 1,
+        total_tracks: 1,
+        disc_number: 1,
+        total_discs: 1,
+        bitrate: 192,
+        sample_rate: 44_100,
+        length_ms,
+        compilation: false,
+        reuse_album_art: reuse,
+        artwork_source: art_image.map(PathBuf::from),
+    };
+    let mut edit = device.edit()?;
+    edit.add_track(track)?;
+    let staged = edit.stage_sqlite_preview(PathBuf::from(staging))?;
+    device.install_artwork_addition_hardware_test(&staged, confirmation, !reuse)?;
+    println!("Nano 7G one-track artwork addition completed and read back successfully.");
+    println!("total tracks: {}", staged.remaining_tracks());
+    println!("artwork records: {}", 704 + staged.added_artwork_tracks());
+    if !staged.added_ithmb().is_empty() {
+        println!("new ithmb frames: {}", staged.added_ithmb().len());
+    }
+    println!("Keep the host bundle, safely eject, reboot, and validate before continuing.");
+    Ok(())
+}
+
+fn text(value: &OsString) -> String {
+    value.to_str().unwrap_or_default().to_owned()
+}
+
+fn optional_text(value: &OsString) -> Option<String> {
+    let value = value.to_str().unwrap_or_default();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn run_recovery(mount: &OsString) -> CliResult<()> {

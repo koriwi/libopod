@@ -21,6 +21,10 @@ pub(crate) const ARTWORK_REMOVAL_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; REMOVE ONE ARTWORK-BEARING TRACK AND KEEP ITS MEDIA FILE";
 pub(crate) const ADDITION_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; ADD ONE NO-ARTWORK MP3 TRACK";
+pub(crate) const ARTWORK_REUSE_ADDITION_CONFIRMATION: &str =
+    "I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH REUSED ALBUM ART";
+pub(crate) const NEW_ART_ADDITION_CONFIRMATION: &str =
+    "I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH NEW COVER ART";
 const JOURNAL_NAME: &str = "journal.json";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +145,44 @@ pub(crate) fn install_single_addition_hardware_test(
         return Err(Error::Unsupported {
             feature: "Nano 7G single-track addition hardware test",
             reason: "exactly one added track on a resolved Nano 7G is required".to_owned(),
+        });
+    }
+    install_staged_removal(device, staged, FailureMode::RollBack)
+}
+
+pub(crate) fn install_artwork_addition_hardware_test(
+    device: &Device,
+    staged: &StagedSqliteEdit,
+    confirmation: &str,
+    new_art: bool,
+) -> Result<()> {
+    let expected = if new_art {
+        NEW_ART_ADDITION_CONFIRMATION
+    } else {
+        ARTWORK_REUSE_ADDITION_CONFIRMATION
+    };
+    if confirmation != expected {
+        return Err(Error::Unsupported {
+            feature: "Nano 7G artwork addition hardware test confirmation",
+            reason: format!("confirmation must exactly equal: {expected}"),
+        });
+    }
+    if device.profile().map(crate::DeviceProfile::key) != Some("nano-7g")
+        || staged.removed_tracks() != 0
+        || staged.added_tracks() != 1
+        || staged.added_artwork_tracks() != 1
+        || if new_art {
+            staged.added_ithmb().len() != 4
+        } else {
+            !staged.added_ithmb().is_empty()
+        }
+    {
+        return Err(Error::Unsupported {
+            feature: "Nano 7G artwork addition hardware test",
+            reason: format!(
+                "exactly one added track with {} artwork on a resolved Nano 7G is required",
+                if new_art { "new encoded" } else { "reused" }
+            ),
         });
     }
     install_staged_removal(device, staged, FailureMode::RollBack)

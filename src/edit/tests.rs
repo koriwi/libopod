@@ -411,8 +411,15 @@ mod tests {
         let virtual_root = bundle.path().join("original");
         create_virtual_media_dirs(&virtual_root, staged.added_media());
         let virtual_device = Device::open(&virtual_root).unwrap();
+        assert!(virtual_device
+            .install_artwork_addition_hardware_test(&staged, "not confirmed", false)
+            .is_err());
         virtual_device
-            .install_single_addition_hardware_test(&staged, ADDITION_CONFIRMATION)
+            .install_artwork_addition_hardware_test(
+                &staged,
+                "I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH REUSED ALBUM ART",
+                false,
+            )
             .unwrap();
         let installed =
             std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
@@ -518,8 +525,15 @@ mod tests {
         let virtual_root = bundle.path().join("original");
         create_virtual_media_dirs(&virtual_root, staged.added_media());
         let virtual_device = Device::open(&virtual_root).unwrap();
+        assert!(virtual_device
+            .install_artwork_addition_hardware_test(&staged, "not confirmed", true)
+            .is_err());
         virtual_device
-            .install_single_addition_hardware_test(&staged, ADDITION_CONFIRMATION)
+            .install_artwork_addition_hardware_test(
+                &staged,
+                "I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH NEW COVER ART",
+                true,
+            )
             .unwrap();
         for ithmb in staged.added_ithmb() {
             assert!(virtual_root.join(ithmb.as_str()).is_file());

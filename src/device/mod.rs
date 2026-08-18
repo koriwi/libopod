@@ -197,6 +197,23 @@ impl Device {
         crate::edit::install_single_addition_hardware_test(self, staged, confirmation)
     }
 
+    /// Installs one staged addition with reused or freshly encoded artwork as
+    /// a Nano 7G hardware test.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before mutation unless the bundle adds exactly one
+    /// artwork-bearing track and `confirmation` matches the reuse or new-art
+    /// acknowledgement respectively.
+    pub fn install_artwork_addition_hardware_test(
+        &self,
+        staged: &crate::StagedSqliteEdit,
+        confirmation: &str,
+        new_art: bool,
+    ) -> Result<()> {
+        crate::edit::install_artwork_addition_hardware_test(self, staged, confirmation, new_art)
+    }
+
     /// Starts an in-memory edit session without modifying the device.
     ///
     /// # Errors

@@ -19,9 +19,9 @@ pub(crate) use add::{
     add_tracks_to_staged_databases, ArtworkFrameOut, ArtworkLink, ResolvedAddition,
 };
 pub(crate) use commit::{
-    install_noop_hardware_test, install_single_addition_hardware_test,
-    install_single_artwork_removal_hardware_test, install_single_removal_hardware_test,
-    pending_transaction,
+    install_artwork_addition_hardware_test, install_noop_hardware_test,
+    install_single_addition_hardware_test, install_single_artwork_removal_hardware_test,
+    install_single_removal_hardware_test, pending_transaction,
 };
 
 use self::generation::fingerprint_host_file;
@@ -52,6 +52,13 @@ pub const NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION: &str =
 
 /// Exact acknowledgement required by the single no-artwork addition gate.
 pub const NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION: &str = commit::ADDITION_CONFIRMATION;
+
+/// Exact acknowledgement required by the reused-album-art addition gate.
+pub const NANO7_ARTWORK_REUSE_ADDITION_CONFIRMATION: &str =
+    commit::ARTWORK_REUSE_ADDITION_CONFIRMATION;
+
+/// Exact acknowledgement required by the new-cover-art addition gate.
+pub const NANO7_NEW_ART_ADDITION_CONFIRMATION: &str = commit::NEW_ART_ADDITION_CONFIRMATION;
 
 /// Metadata for one track to add to the staged library.
 ///
