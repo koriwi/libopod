@@ -9,11 +9,12 @@ mod tests {
     use super::{
         commit::{
             install_staged_removal, recover_transaction, FailureMode, ADDITION_CONFIRMATION,
-            TRANSACTION_PATH,
+            ARTWORK_REMOVAL_CONFIRMATION, TRANSACTION_PATH,
         },
         edit_staged_databases, TrackToAdd,
     };
     use crate::{
+        artwork::parse_artwork_records,
         Device, Error, MountRoot, PersistentId, SqliteLibraryFile,
         NANO7_NOOP_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
     };
@@ -304,6 +305,95 @@ mod tests {
             let parent = virtual_root.join(media.as_str()).parent().unwrap().to_path_buf();
             std::fs::create_dir_all(&parent).unwrap();
         }
+    }
+
+    #[test]
+    fn stages_an_artwork_bearing_removal_with_artworkdb_output() {
+        let Some((bundle, staged)) = stage_private_artwork_removal() else {
+            return;
+        };
+        assert_eq!(staged.removed_tracks(), 1);
+        assert_eq!(staged.removed_artwork_tracks(), 1);
+        assert_eq!(staged.remaining_tracks(), 725);
+        let artwork = bundle.path().join("ArtworkDB");
+        assert!(artwork.is_file());
+        let bytes = std::fs::read(&artwork).unwrap();
+        let records = parse_artwork_records(&bytes).unwrap();
+        assert_eq!(records.len(), 703);
+        // The manifest must carry the ArtworkDB output.
+        let manifest = std::fs::read_to_string(staged.manifest()).unwrap();
+        assert!(manifest.contains("iPod_Control/Artwork/ArtworkDB"));
+        let library = rusqlite::Connection::open(
+            bundle.path().join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let tracks: i64 = library
+            .query_row("SELECT COUNT(*) FROM item", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tracks, 725);
+    }
+
+    #[test]
+    fn installs_and_recovers_a_virtual_nano_artwork_removal() {
+        let Some((bundle, staged)) = stage_private_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        // The artwork-bearing gate refuses the wrong confirmation.
+        assert!(virtual_device
+            .install_single_artwork_removal_hardware_test(&staged, "not confirmed")
+            .is_err());
+        virtual_device
+            .install_single_artwork_removal_hardware_test(&staged, ARTWORK_REMOVAL_CONFIRMATION)
+            .unwrap();
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        let installed = std::fs::read(
+            virtual_root.join("iPod_Control/Artwork/ArtworkDB"),
+        )
+        .unwrap();
+        assert_eq!(parse_artwork_records(&installed).unwrap().len(), 703);
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+
+        // Interrupted installation must roll the ArtworkDB back to 704 records.
+        let (bundle, staged) = stage_private_artwork_removal().unwrap();
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(3),
+        )
+        .unwrap_err();
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let rolled_back =
+            std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        assert_eq!(parse_artwork_records(&rolled_back).unwrap().len(), 704);
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    fn stage_private_artwork_removal() -> Option<(TempDir, super::StagedSqliteEdit)> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return None;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let track = device
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| track.has_artwork)
+            .unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.removed_artwork_tracks(), 1);
+        Some((bundle, staged))
     }
 
     fn stage_private_addition() -> Option<(TempDir, super::StagedSqliteEdit)> {

@@ -18,7 +18,8 @@ use rusqlite::{Connection, OpenFlags, Transaction};
 pub(crate) use add::{add_tracks_to_staged_databases, ResolvedAddition};
 pub(crate) use commit::{
     install_noop_hardware_test, install_single_addition_hardware_test,
-    install_single_removal_hardware_test, pending_transaction,
+    install_single_artwork_removal_hardware_test, install_single_removal_hardware_test,
+    pending_transaction,
 };
 
 use self::generation::fingerprint_host_file;
@@ -42,6 +43,10 @@ pub const NANO7_NOOP_HARDWARE_TEST_CONFIRMATION: &str = commit::NOOP_CONFIRMATIO
 
 /// Exact acknowledgement required by the single no-artwork removal gate.
 pub const NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION: &str = commit::REMOVAL_CONFIRMATION;
+
+/// Exact acknowledgement required by the single artwork-bearing removal gate.
+pub const NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION: &str =
+    commit::ARTWORK_REMOVAL_CONFIRMATION;
 
 /// Exact acknowledgement required by the single no-artwork addition gate.
 pub const NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION: &str = commit::ADDITION_CONFIRMATION;
@@ -88,6 +93,7 @@ pub struct TrackToAdd {
 const ITLP_PATH: &str = "iPod_Control/iTunes/iTunes Library.itlp";
 const MAX_LOCATIONS_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CDB_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ARTWORK_BYTES: u64 = 64 * 1024 * 1024;
 const SQLITE_FILES: [SqliteLibraryFile; 5] = [
     SqliteLibraryFile::Library,
     SqliteLibraryFile::Locations,
@@ -275,6 +281,7 @@ impl<'device> EditSession<'device> {
             write_and_verify_cbk(&destination, guid)?;
             if !self.removals.is_empty() {
                 write_cdb_preview(self.device, &destination, guid, &self.removals)?;
+                write_artwork_preview(self.device, &destination, &self.removals)?;
             }
             if !resolved.is_empty() {
                 write_cdb_additions(self.device, &destination, guid, &resolved)?;
@@ -290,20 +297,6 @@ impl<'device> EditSession<'device> {
         self.device
             .generation()
             .verify_unchanged(self.device.mount(), self.device.profile())?;
-        let added_targets: Vec<IpodPath> = resolved
-            .iter()
-            .map(|addition| {
-                IpodPath::new(format!("iPod_Control/Music/{}", addition.media_relative))
-            })
-            .collect::<Result<_>>()?;
-        let manifest = write_staging_manifest(
-            self.device,
-            &destination,
-            self.device.generation(),
-            self.removals.len(),
-            &added_targets,
-        )?;
-
         let removed_tracks: Vec<_> = before
             .tracks()
             .iter()
@@ -317,6 +310,19 @@ impl<'device> EditSession<'device> {
             .iter()
             .filter(|track| track.has_artwork)
             .count();
+        let added_targets: Vec<IpodPath> = resolved
+            .iter()
+            .map(|addition| {
+                IpodPath::new(format!("iPod_Control/Music/{}", addition.media_relative))
+            })
+            .collect::<Result<_>>()?;
+        let manifest = write_staging_manifest(
+            self.device,
+            &destination,
+            self.device.generation(),
+            self.removals.len(),
+            &added_targets,
+        )?;
         Ok(StagedSqliteEdit {
             directory: destination,
             removed_tracks: self.removals.len(),
@@ -992,6 +998,49 @@ fn write_cdb_additions(
     Ok(())
 }
 
+/// Removes the `ArtworkDB` records of every removed track that has one.
+///
+/// A no-op when none of the removals reference artwork, so no-artwork
+/// removals keep an unchanged `ArtworkDB`. `.ithmb` slot payloads are left in
+/// place as unreferenced data.
+fn write_artwork_preview(
+    device: &Device,
+    directory: &Path,
+    removals: &BTreeSet<PersistentId>,
+) -> Result<()> {
+    let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
+    let source = device.mount().resolve_existing(&relative)?;
+    let bytes = read_limited(&source, MAX_ARTWORK_BYTES, "ArtworkDB")?;
+    let records = crate::artwork::parse_artwork_records(&bytes)?;
+    let requested: Vec<PersistentId> = records
+        .iter()
+        .map(|record| record.track_id)
+        .filter(|track_id| removals.contains(track_id))
+        .collect();
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let rewritten = crate::artwork::remove_tracks_from_artworkdb(&bytes, &requested)?;
+    let remaining = crate::artwork::parse_artwork_records(&rewritten)?;
+    if remaining
+        .iter()
+        .any(|record| removals.contains(&record.track_id))
+    {
+        return Err(Error::Verification {
+            format: "staged ArtworkDB",
+            reason: "removed artwork records remain in the rewritten ArtworkDB".to_owned(),
+        });
+    }
+    let output = directory.join("ArtworkDB");
+    let mut file = File::create(&output)
+        .map_err(|source| io_error("create staged ArtworkDB", &output, source))?;
+    file.write_all(&rewritten)
+        .map_err(|source| io_error("write staged ArtworkDB", &output, source))?;
+    file.sync_all()
+        .map_err(|source| io_error("flush staged ArtworkDB", &output, source))?;
+    Ok(())
+}
+
 fn validate_staged_set(directory: &Path) -> Result<()> {
     for file in SQLITE_FILES {
         let info = inspect_sqlite_database(&directory.join(file.file_name()), file)?;
@@ -1001,6 +1050,11 @@ fn validate_staged_set(directory: &Path) -> Result<()> {
                 reason: format!("{} failed integrity_check", file.file_name()),
             });
         }
+    }
+    let artwork = directory.join("ArtworkDB");
+    if artwork.exists() {
+        let bytes = read_limited(&artwork, MAX_ARTWORK_BYTES, "ArtworkDB")?;
+        crate::artwork::inspect_artwork_db(&bytes)?;
     }
     Ok(())
 }

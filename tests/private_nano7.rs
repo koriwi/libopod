@@ -142,6 +142,7 @@ fn inspects_private_nano7_without_reading_media_payloads() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn stages_a_schema_preserving_removal_outside_the_private_fixture() {
     let Some(root) = fixture_root() else {
         return;
@@ -183,7 +184,19 @@ fn stages_a_schema_preserving_removal_outside_the_private_fixture() {
     assert_eq!(manifest["profile"], "nano-7g");
     assert_eq!(manifest["removed_tracks"], 1);
     assert_eq!(manifest["source"].as_array().unwrap().len(), 15);
-    assert_eq!(manifest["outputs"].as_array().unwrap().len(), 7);
+    // The first track of the fixture has artwork, so the preview rewrites
+    // ArtworkDB as an eighth output and leaves the ithmb slots untouched.
+    assert_eq!(manifest["outputs"].as_array().unwrap().len(), 8);
+    assert!(manifest["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|output| output["target"] == "iPod_Control/Artwork/ArtworkDB"));
+    let staged_artwork = staging.path().join("ArtworkDB");
+    assert!(staged_artwork.is_file());
+    let artwork_bytes = std::fs::read(&staged_artwork).unwrap();
+    let records = libopod::parse_artwork_records(&artwork_bytes).unwrap();
+    assert_eq!(records.len(), 703);
     let staged_cdb = staging.path().join("iTunesCDB");
     assert_eq!(cdb_track_count(&staged_cdb), 725);
     assert_eq!(

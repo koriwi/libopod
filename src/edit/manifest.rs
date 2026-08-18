@@ -123,7 +123,7 @@ pub(crate) fn write_staging_manifest(
         });
     }
     let mut outputs = Vec::new();
-    for (staged, target) in output_targets()? {
+    for (staged, target) in output_targets(destination)? {
         let path = destination.join(&staged);
         let (bytes, digest) = fingerprint_host_file(&path)?;
         outputs.push(ManifestOutputFile {
@@ -205,8 +205,8 @@ pub(crate) fn read_staging_manifest(path: &Path) -> Result<StagingManifest> {
     Ok(manifest)
 }
 
-fn output_targets() -> Result<Vec<(String, IpodPath)>> {
-    let mut targets = Vec::with_capacity(7);
+fn output_targets(destination: &Path) -> Result<Vec<(String, IpodPath)>> {
+    let mut targets = Vec::with_capacity(8);
     for file in SqliteLibraryFile::ALL {
         targets.push((
             file.file_name().to_owned(),
@@ -224,6 +224,12 @@ fn output_targets() -> Result<Vec<(String, IpodPath)>> {
         "iTunesCDB".to_owned(),
         IpodPath::new("iPod_Control/iTunes/iTunesCDB")?,
     ));
+    if destination.join("ArtworkDB").exists() {
+        targets.push((
+            "ArtworkDB".to_owned(),
+            IpodPath::new("iPod_Control/Artwork/ArtworkDB")?,
+        ));
+    }
     Ok(targets)
 }
 

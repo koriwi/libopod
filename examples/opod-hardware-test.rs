@@ -2,7 +2,8 @@ use std::{error::Error, ffi::OsString, io::Error as IoError, path::PathBuf, proc
 
 use libopod::{
     recover_interrupted_transaction, Device, TrackToAdd, NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION,
-    NANO7_NOOP_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
+    NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+    NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -44,7 +45,7 @@ fn run(arguments: &[OsString]) -> CliResult<()> {
         }
         [command, mount] if command == "recover" => run_recovery(mount),
         _ => Err(invalid_input(&format!(
-            "usage:\n  opod-hardware-test noop MOUNT EMPTY_HOST_DIRECTORY '{NANO7_NOOP_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test add MOUNT SOURCE_MP3 TITLE ARTIST ALBUM LENGTH_MS EMPTY_HOST_DIRECTORY '{NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test recover MOUNT"
+            "usage:\n  opod-hardware-test noop MOUNT EMPTY_HOST_DIRECTORY '{NANO7_NOOP_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION}'  (for an artwork-bearing track)\n  opod-hardware-test add MOUNT SOURCE_MP3 TITLE ARTIST ALBUM LENGTH_MS EMPTY_HOST_DIRECTORY '{NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test recover MOUNT"
         ))),
     }
 }
@@ -70,19 +71,26 @@ fn run_removal(
         .library()
         .and_then(|library| library.tracks().get(index))
         .ok_or_else(|| invalid_input("TRACK_INDEX is not present in the opened library"))?;
-    if track.has_artwork {
-        return Err(invalid_input(
-            "the selected track has artwork; choose an index marked 'no' by opod-stage-remove list",
-        ));
-    }
     let mut edit = device.edit()?;
     edit.remove_track(track.id)?;
     let staged = edit.stage_sqlite_preview(PathBuf::from(staging))?;
-    device.install_single_removal_hardware_test(&staged, confirmation)?;
-    println!("Nano 7G one-track removal transaction completed and read back successfully.");
+    if track.has_artwork {
+        device.install_single_artwork_removal_hardware_test(&staged, confirmation)?;
+        println!(
+            "Nano 7G one-track artwork removal transaction completed and read back successfully."
+        );
+        println!(
+            "ArtworkDB records now: {}",
+            704 - staged.removed_artwork_tracks()
+        );
+        println!("The .ithmb slots remain as unreferenced data; the MP3 remains on disk.");
+    } else {
+        device.install_single_removal_hardware_test(&staged, confirmation)?;
+        println!("Nano 7G one-track removal transaction completed and read back successfully.");
+        println!("The media file remains on the iPod as an unreferenced safety copy.");
+    }
     println!("removed database index: {index}");
     println!("remaining tracks: {}", staged.remaining_tracks());
-    println!("The media file remains on the iPod as an unreferenced safety copy.");
     println!("Keep the host bundle, safely eject, reboot, and validate before continuing.");
     Ok(())
 }

@@ -17,6 +17,8 @@ pub(crate) const TRANSACTION_PATH: &str = "iPod_Control/iTunes/.libopod-transact
 pub(crate) const NOOP_CONFIRMATION: &str = "I HAVE A VERIFIED BACKUP; RUN NANO 7G NO-OP WRITE TEST";
 pub(crate) const REMOVAL_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; REMOVE ONE NO-ARTWORK TRACK AND KEEP ITS MEDIA FILE";
+pub(crate) const ARTWORK_REMOVAL_CONFIRMATION: &str =
+    "I HAVE A VERIFIED BACKUP; REMOVE ONE ARTWORK-BEARING TRACK AND KEEP ITS MEDIA FILE";
 pub(crate) const ADDITION_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; ADD ONE NO-ARTWORK MP3 TRACK";
 const JOURNAL_NAME: &str = "journal.json";
@@ -97,6 +99,30 @@ pub(crate) fn install_single_removal_hardware_test(
     install_staged_removal(device, staged, FailureMode::RollBack)
 }
 
+pub(crate) fn install_single_artwork_removal_hardware_test(
+    device: &Device,
+    staged: &StagedSqliteEdit,
+    confirmation: &str,
+) -> Result<()> {
+    if confirmation != ARTWORK_REMOVAL_CONFIRMATION {
+        return Err(Error::Unsupported {
+            feature: "Nano 7G artwork-removal hardware test confirmation",
+            reason: format!("confirmation must exactly equal: {ARTWORK_REMOVAL_CONFIRMATION}"),
+        });
+    }
+    if device.profile().map(crate::DeviceProfile::key) != Some("nano-7g")
+        || staged.removed_tracks() != 1
+        || staged.removed_artwork_tracks() != 1
+    {
+        return Err(Error::Unsupported {
+            feature: "Nano 7G artwork-removal hardware test",
+            reason: "exactly one artwork-bearing track on a resolved Nano 7G is required"
+                .to_owned(),
+        });
+    }
+    install_staged_removal(device, staged, FailureMode::RollBack)
+}
+
 pub(crate) fn install_single_addition_hardware_test(
     device: &Device,
     staged: &StagedSqliteEdit,
@@ -125,12 +151,6 @@ pub(crate) fn install_staged_removal(
     staged: &StagedSqliteEdit,
     failure_mode: FailureMode,
 ) -> Result<()> {
-    if staged.removed_artwork_tracks() != 0 {
-        return Err(Error::Unsupported {
-            feature: "installation of artwork-bearing removals",
-            reason: "ArtworkDB transaction support is not implemented".to_owned(),
-        });
-    }
     staged
         .source_generation
         .verify_unchanged(device.mount(), device.profile())?;
@@ -412,9 +432,29 @@ fn validate_recovery_state(
             });
         }
     }
+    let artwork_target = "iPod_Control/Artwork/ArtworkDB";
+    if journal
+        .staging
+        .outputs
+        .iter()
+        .any(|output| output.target == artwork_target)
+        && journal
+            .staging
+            .outputs
+            .iter()
+            .filter(|output| output.target == artwork_target)
+            .count()
+            != 1
+    {
+        return Err(Error::Verification {
+            format: "device transaction",
+            reason: "journal ArtworkDB target is invalid".to_owned(),
+        });
+    }
     for output in &journal.staging.outputs {
         let relative = IpodPath::new(output.target.clone())?;
         if !expected_targets.contains(&output.target.as_str())
+            && output.target != artwork_target
             && !output.target.starts_with("iPod_Control/Music/")
         {
             return Err(Error::Verification {
@@ -526,17 +566,18 @@ fn verify_bundle(
         feature: "device transaction",
         reason: "the device profile is unknown".to_owned(),
     })?;
+    let artwork_outputs = usize::from(staged.removed_artwork_tracks() > 0);
     if manifest.profile != profile.key()
         || manifest.removed_tracks != staged.removed_tracks()
         || manifest.added_tracks != staged.added_tracks()
-        || manifest.outputs.len() != 7 + staged.added_tracks()
+        || manifest.outputs.len() != 7 + staged.added_tracks() + artwork_outputs
     {
         return Err(Error::Verification {
             format: "staging manifest",
             reason: "bundle profile, operation, or output count is inconsistent".to_owned(),
         });
     }
-    if manifest.outputs.len() != staged.added_media().len() + 7 {
+    if manifest.outputs.len() != staged.added_media().len() + 7 + artwork_outputs {
         return Err(Error::Verification {
             format: "staging manifest",
             reason: "media output count is inconsistent".to_owned(),

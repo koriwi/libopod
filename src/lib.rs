@@ -10,7 +10,10 @@ pub mod fs;
 pub mod library;
 mod storage;
 
-pub use artwork::{ArtworkDatabaseInfo, ArtworkDatasetInfo, ArtworkFrameInfo};
+pub use artwork::{
+    parse_artwork_records, ArtworkDatabaseInfo, ArtworkDatasetInfo, ArtworkFormatRef,
+    ArtworkFrameInfo, ArtworkRecord,
+};
 pub use device::{
     ArtworkFormatProfile, BackendKind, ChecksumKind, Device, DeviceCapabilities, DeviceInspection,
     DeviceProfile, EvidenceSource, IdentityEvidence, Sourced, VolumeFormat,
@@ -18,7 +21,8 @@ pub use device::{
 pub use edit::{
     recover_interrupted_transaction, EditSession, FileFingerprint, GenerationFingerprint,
     StagedSqliteEdit, TrackToAdd, NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION,
-    NANO7_NOOP_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
+    NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+    NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
 };
 pub use error::{Error, Result};
 pub use fs::{IpodPath, MountRoot};

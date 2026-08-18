@@ -158,6 +158,26 @@ impl Device {
         crate::edit::install_single_removal_hardware_test(self, staged, confirmation)
     }
 
+    /// Installs one staged artwork-bearing removal as a Nano 7G hardware test.
+    ///
+    /// The database transaction is recoverable and read back before success;
+    /// the matching `ArtworkDB` record is removed while `.ithmb` slot payloads
+    /// remain as unreferenced data. This is a qualification gate, not general
+    /// sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before mutation unless the bundle removes exactly one
+    /// artwork-bearing track from this generation and `confirmation` exactly
+    /// equals [`crate::NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION`].
+    pub fn install_single_artwork_removal_hardware_test(
+        &self,
+        staged: &crate::StagedSqliteEdit,
+        confirmation: &str,
+    ) -> Result<()> {
+        crate::edit::install_single_artwork_removal_hardware_test(self, staged, confirmation)
+    }
+
     /// Installs one staged no-artwork MP3 addition as a Nano 7G hardware test.
     ///
     /// The database transaction is recoverable and read back before success;
