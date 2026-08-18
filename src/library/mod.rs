@@ -84,6 +84,63 @@ impl Library {
         &self.playlists
     }
 
+    /// Builds the normalized library from an uncompressed classic iTunesDB.
+    ///
+    /// `artworkdb` optionally resolves per-track artwork presence from the
+    /// device's `ArtworkDB`; track locations and playlist membership come from
+    /// the binary itself.
+    pub(crate) fn read_binary(itunesdb: &[u8], artworkdb: Option<&[u8]>) -> Result<Self> {
+        let classic = crate::storage::binary::parse_library(itunesdb, artworkdb)?;
+        let track_id_to_persistent: HashMap<u32, PersistentId> = classic
+            .tracks
+            .iter()
+            .map(|track| (track.track_id, track.persistent_id))
+            .collect();
+        let tracks = classic
+            .tracks
+            .iter()
+            .map(|track| {
+                let location =
+                    IpodPath::new(track.location.clone()).map_err(|error| Error::Malformed {
+                        format: "classic iTunesDB",
+                        offset: 0,
+                        reason: format!("invalid track location: {error}"),
+                    })?;
+                Ok(Track {
+                    id: track.persistent_id,
+                    location,
+                    title: track.title.clone(),
+                    album: track.album.clone(),
+                    artist: track.artist.clone(),
+                    album_artist: track.album_artist.clone(),
+                    size: track.size,
+                    duration_ms: track.duration_ms,
+                    track_number: track.track_number,
+                    disc_number: track.disc_number,
+                    has_artwork: track.has_artwork,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let playlists = classic
+            .playlists
+            .iter()
+            .map(|playlist| Playlist {
+                id: playlist.id,
+                name: playlist.name.clone(),
+                parent_id: None,
+                distinguished_kind: 0,
+                is_hidden: false,
+                is_smart: false,
+                track_ids: playlist
+                    .track_ids
+                    .iter()
+                    .filter_map(|track_id| track_id_to_persistent.get(track_id).copied())
+                    .collect(),
+            })
+            .collect();
+        Ok(Library { tracks, playlists })
+    }
+
     pub(crate) fn read_sqlite(library_path: &Path, locations_path: &Path) -> Result<Self> {
         let locations = read_locations(locations_path)?;
         let connection = open_read_only(library_path)?;

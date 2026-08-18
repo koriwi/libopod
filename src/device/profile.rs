@@ -73,45 +73,95 @@ impl DeviceProfile {
     }
 }
 
+/// USB product IDs for the iPod Nano generations (fallback identity when
+/// `SysInfo` model fields are missing or ambiguous).
+const NANO_PRODUCT_IDS: [(u16, u8); 7] = [
+    (0x1240, 1),
+    (0x1242, 2),
+    (0x1260, 3),
+    (0x1262, 4),
+    (0x1263, 5),
+    (0x1265, 6),
+    (0x1267, 7),
+];
+
+/// Parses the `SysInfo` generation field into a Nano generation number.
+fn nano_generation(evidence: &IdentityEvidence) -> Option<u8> {
+    let generation = evidence.generation()?.value.to_ascii_lowercase();
+    if generation.contains("7th") || generation.starts_with('7') {
+        Some(7)
+    } else if generation.contains("6th") || generation.starts_with('6') {
+        Some(6)
+    } else if generation.contains("5th") || generation.starts_with('5') {
+        Some(5)
+    } else if generation.contains("4th") || generation.starts_with('4') {
+        Some(4)
+    } else if generation.contains("3rd") || generation.starts_with('3') {
+        Some(3)
+    } else if generation.contains("2nd") || generation.starts_with('2') {
+        Some(2)
+    } else if generation.contains("1st") || generation.starts_with('1') {
+        Some(1)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn resolve(evidence: &IdentityEvidence) -> Result<Option<DeviceProfile>> {
     let family = evidence
         .model_family()
         .map(|value| value.value.to_ascii_lowercase());
-    let generation = evidence
-        .generation()
-        .map(|value| value.value.to_ascii_lowercase());
     let product_id = evidence.usb_product_id().map(|value| value.value);
 
-    let model_says_nano7 = family
+    let is_nano = family
         .as_deref()
-        .is_some_and(|value| value.contains("nano"))
-        && generation
-            .as_deref()
-            .is_some_and(|value| value.contains("7th") || value.starts_with('7'));
-    let pid_says_nano7 = product_id == Some(0x1267);
+        .is_some_and(|value| value.contains("nano"));
+    let generation = nano_generation(evidence);
+    let pid_generation = product_id.and_then(|pid| {
+        NANO_PRODUCT_IDS
+            .iter()
+            .find_map(|(candidate, generation)| (*candidate == pid).then_some(*generation))
+    });
 
-    if pid_says_nano7
+    if pid_generation.is_some()
         && family
             .as_deref()
             .is_some_and(|value| !value.contains("nano"))
     {
         return Err(Error::ConflictingEvidence {
-            reason:
-                "USB product ID 0x1267 indicates Nano 7G but ModelFamily does not indicate a Nano"
-                    .to_owned(),
+            reason: format!(
+                "USB product ID 0x{:04x} indicates a Nano but ModelFamily does not",
+                product_id.unwrap_or(0)
+            ),
         });
     }
-    if model_says_nano7 && product_id.is_some_and(|value| value != 0x1267) {
+    if family
+        .as_deref()
+        .is_some_and(|value| value.contains("nano"))
+        && pid_generation.is_some_and(|pid_generation| {
+            generation.is_some_and(|generation| generation != pid_generation)
+        })
+    {
         return Err(Error::ConflictingEvidence {
-            reason: "model fields indicate Nano 7G but SysInfo has an unexpected USB product ID"
+            reason: "SysInfo generation and USB product ID disagree on the Nano generation"
                 .to_owned(),
         });
     }
 
-    if model_says_nano7 || pid_says_nano7 {
-        return Ok(Some(nano_7g()));
+    let generation = generation.or(pid_generation);
+    if !is_nano && pid_generation.is_none() {
+        return Ok(None);
     }
-    Ok(None)
+    let profile = match generation {
+        Some(7) => nano_7g(),
+        // HASH72 Nano 5G/6G profiles are not implemented yet.
+        Some(4) => nano_4g(),
+        Some(3) => nano_3g(),
+        Some(2) => nano_2g(),
+        Some(1) => nano_1g(),
+        Some(_) | None => return Ok(None),
+    };
+    Ok(Some(profile))
 }
 
 fn nano_7g() -> DeviceProfile {
@@ -145,4 +195,72 @@ fn nano_7g() -> DeviceProfile {
             ],
         },
     }
+}
+
+/// Classic Nano 1–4 profile: uncompressed binary `iTunesDB`, no `SQLite`, and
+/// artwork preserved but not yet written.
+///
+/// Covers the signing matrix entry NONE for Nano 1–2G and HASH58 for
+/// Nano 3–4G. `cdb_version` matches the device's `mhbd` version field
+/// (Nano 1–2G 0x13, Nano 3–4G 0x30).
+fn classic_nano(
+    key: &'static str,
+    display_name: &'static str,
+    checksum: ChecksumKind,
+    cdb_version: u32,
+    music_directories: u8,
+) -> DeviceProfile {
+    DeviceProfile {
+        key,
+        display_name,
+        capabilities: DeviceCapabilities {
+            backend: BackendKind::Binary,
+            checksum,
+            compressed_cdb: false,
+            cdb_version,
+            music_directories,
+            sparse_artwork: false,
+            artwork_formats: Vec::new(),
+        },
+    }
+}
+
+fn nano_1g() -> DeviceProfile {
+    classic_nano(
+        "nano-1g",
+        "iPod Nano (1st generation)",
+        ChecksumKind::None,
+        0x13,
+        14,
+    )
+}
+
+fn nano_2g() -> DeviceProfile {
+    classic_nano(
+        "nano-2g",
+        "iPod Nano (2nd generation)",
+        ChecksumKind::None,
+        0x13,
+        14,
+    )
+}
+
+fn nano_3g() -> DeviceProfile {
+    classic_nano(
+        "nano-3g",
+        "iPod Nano (3rd generation)",
+        ChecksumKind::Hash58,
+        0x30,
+        20,
+    )
+}
+
+fn nano_4g() -> DeviceProfile {
+    classic_nano(
+        "nano-4g",
+        "iPod Nano (4th generation)",
+        ChecksumKind::Hash58,
+        0x30,
+        20,
+    )
 }

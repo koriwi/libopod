@@ -91,7 +91,7 @@ pub(super) fn finalize_cdb(
     Ok(output)
 }
 
-fn split_datasets(payload: &[u8], expected: usize) -> Result<Vec<Vec<u8>>> {
+pub(super) fn split_datasets(payload: &[u8], expected: usize) -> Result<Vec<Vec<u8>>> {
     let mut datasets = Vec::with_capacity(expected);
     let mut offset = 0;
     while offset < payload.len() {

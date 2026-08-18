@@ -245,7 +245,7 @@ fn string_or(strings: &HashMap<u32, String>, mhod_type: u32) -> String {
 /// Reads an `mhod` child at `offset` leniently, returning its type, its
 /// claimed end (which may exceed the parent for legacy string mhods), and
 /// whether it uses the legacy pre-gap string layout.
-fn mhod_child(chunk: &[u8], offset: usize) -> Result<(u32, usize, bool)> {
+pub(super) fn mhod_child(chunk: &[u8], offset: usize) -> Result<(u32, usize, bool)> {
     require_magic(chunk, offset, b"mhod")?;
     let header_length = usize_value(read_u32(chunk, offset + 4)?, offset + 4)?;
     let total_length = usize_value(read_u32(chunk, offset + 8)?, offset + 8)?;
@@ -267,7 +267,11 @@ fn mhod_child(chunk: &[u8], offset: usize) -> Result<(u32, usize, bool)> {
 /// by the pre-gap Nano 7G writer claim `40 + len` bytes but store only
 /// `32 + len`, so walking by the claimed total misaligns the next child.
 /// Callers must advance by the returned end.
-fn parse_string_mhod(chunk: &[u8], offset: usize, legacy: bool) -> Result<Option<(String, usize)>> {
+pub(super) fn parse_string_mhod(
+    chunk: &[u8],
+    offset: usize,
+    legacy: bool,
+) -> Result<Option<(String, usize)>> {
     let (encoding_offset, length_offset, data_offset) = if legacy {
         (offset + 16, offset + 20, offset + 32)
     } else {

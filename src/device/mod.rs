@@ -10,7 +10,12 @@ pub use profile::{
     ArtworkFormatProfile, BackendKind, ChecksumKind, DeviceCapabilities, DeviceProfile,
 };
 
-use crate::{EditSession, GenerationFingerprint, IpodPath, Library, MountRoot, Result, Track};
+use crate::{
+    edit::EditSession, Error, GenerationFingerprint, IpodPath, Library, MountRoot, Result, Track,
+};
+
+const MAX_CLASSIC_DATABASE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ARTWORK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A read-only handle to a mounted iPod.
 ///
@@ -236,19 +241,63 @@ impl Device {
 }
 
 fn read_library(mount: &MountRoot, profile: Option<&DeviceProfile>) -> Result<Option<Library>> {
-    if !profile.is_some_and(|profile| {
-        profile.capabilities().backend == BackendKind::SqliteWithBinaryCompanion
-    }) {
+    let Some(profile) = profile else {
         return Ok(None);
+    };
+    match profile.capabilities().backend {
+        BackendKind::SqliteWithBinaryCompanion => {
+            let library = IpodPath::new("iPod_Control/iTunes/iTunes Library.itlp/Library.itdb")?;
+            let locations =
+                IpodPath::new("iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb")?;
+            if !mount.contains(&library)? || !mount.contains(&locations)? {
+                return Ok(None);
+            }
+            Library::read_sqlite(
+                &mount.resolve_existing(&library)?,
+                &mount.resolve_existing(&locations)?,
+            )
+            .map(Some)
+        }
+        BackendKind::Binary => {
+            let itunesdb = IpodPath::new("iPod_Control/iTunes/iTunesDB")?;
+            if !mount.contains(&itunesdb)? {
+                return Ok(None);
+            }
+            let database = read_limited(
+                &mount.resolve_existing(&itunesdb)?,
+                MAX_CLASSIC_DATABASE_BYTES,
+                "classic iTunesDB",
+            )?;
+            let artwork = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
+            let artworkdb = if mount.contains(&artwork)? {
+                Some(read_limited(
+                    &mount.resolve_existing(&artwork)?,
+                    MAX_ARTWORK_BYTES,
+                    "ArtworkDB",
+                )?)
+            } else {
+                None
+            };
+            Library::read_binary(&database, artworkdb.as_deref()).map(Some)
+        }
     }
-    let library = IpodPath::new("iPod_Control/iTunes/iTunes Library.itlp/Library.itdb")?;
-    let locations = IpodPath::new("iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb")?;
-    if !mount.contains(&library)? || !mount.contains(&locations)? {
-        return Ok(None);
+}
+
+/// Read a file up to a byte cap.
+fn read_limited(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)
+        .map_err(|source| crate::error::io_error("open device file", path, source))?;
+    let mut buffer = Vec::new();
+    file.by_ref()
+        .take(limit + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|source| crate::error::io_error("read device file", path, source))?;
+    if u64::try_from(buffer.len()).unwrap_or(u64::MAX) > limit {
+        return Err(Error::Unsupported {
+            feature: "device database read",
+            reason: format!("{label} exceeds the {limit}-byte limit"),
+        });
     }
-    Library::read_sqlite(
-        &mount.resolve_existing(&library)?,
-        &mount.resolve_existing(&locations)?,
-    )
-    .map(Some)
+    Ok(buffer)
 }
