@@ -371,6 +371,8 @@ impl<'device> EditSession<'device> {
         let date_coredata = i64::try_from(now.saturating_add(978_307_200)).unwrap_or(i64::MAX);
         let date_mac = u32::try_from(now.saturating_add(2_082_844_800)).unwrap_or(u32::MAX);
         let mut resolved = Vec::with_capacity(self.additions.len());
+        let mut running_sizes = std::collections::HashMap::new();
+        let mut next_image_id = base_image_id(self.device)?;
         for track in &self.additions {
             let (media_relative, _staged_path) =
                 allocate_media_path(self.device, destination, &track.source_path)?;
@@ -383,9 +385,9 @@ impl<'device> EditSession<'device> {
                     reason: "reuse_album_art and artwork_source are mutually exclusive".to_owned(),
                 });
             } else if track.reuse_album_art {
-                resolve_reused_artwork(self.device, track)?
+                resolve_reused_artwork(self.device, track, &mut next_image_id)?
             } else if track.artwork_source.is_some() {
-                resolve_new_artwork(self.device, track)?
+                resolve_new_artwork(self.device, track, &mut running_sizes, &mut next_image_id)?
             } else {
                 None
             };
@@ -677,7 +679,11 @@ fn generate_unique_pid(existing: &BTreeSet<PersistentId>) -> PersistentId {
 /// Finds an album-mate with on-device artwork and builds a reused-artwork
 /// link for a new track: a fresh `mhii` image ID plus the album-mate's slot
 /// references copied verbatim.
-fn resolve_reused_artwork(device: &Device, track: &TrackToAdd) -> Result<Option<ArtworkLink>> {
+fn resolve_reused_artwork(
+    device: &Device,
+    track: &TrackToAdd,
+    next_image_id: &mut u32,
+) -> Result<Option<ArtworkLink>> {
     let album = track.album.as_deref().unwrap_or("");
     let album_artist = track
         .album_artist
@@ -713,18 +719,10 @@ fn resolve_reused_artwork(device: &Device, track: &TrackToAdd) -> Result<Option<
             reason: "album-mate track has no ArtworkDB record".to_owned(),
         })?;
     let (mhod_children, child_count) = crate::artwork::build_reused_children(&record.formats);
-    let next_image_id = records
-        .iter()
-        .map(|record| record.image_id)
-        .max()
-        .unwrap_or(99)
-        .checked_add(1)
-        .ok_or_else(|| Error::Verification {
-            format: "artwork reuse",
-            reason: "image ID overflow".to_owned(),
-        })?;
+    let image_id = *next_image_id;
+    *next_image_id = next_image_id.saturating_add(1);
     Ok(Some(ArtworkLink {
-        image_id: next_image_id,
+        image_id,
         src_img_size: record.src_img_size,
         child_count,
         mhod_children,
@@ -732,9 +730,32 @@ fn resolve_reused_artwork(device: &Device, track: &TrackToAdd) -> Result<Option<
     }))
 }
 
+/// The next free `mhii` image ID on the device.
+fn base_image_id(device: &Device) -> Result<u32> {
+    let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
+    let artwork_path = device.mount().resolve_existing(&relative)?;
+    let bytes = read_limited(&artwork_path, MAX_ARTWORK_BYTES, "ArtworkDB")?;
+    let records = crate::artwork::parse_artwork_records(&bytes)?;
+    records
+        .iter()
+        .map(|record| record.image_id)
+        .max()
+        .unwrap_or(99)
+        .checked_add(1)
+        .ok_or_else(|| Error::Verification {
+            format: "artwork encoding",
+            reason: "image ID overflow".to_owned(),
+        })
+}
+
 /// Decodes a source image, encodes the four Nano 7G cover formats, and
-/// allocates a fresh `.ithmb` slot at the end of each format file.
-fn resolve_new_artwork(device: &Device, track: &TrackToAdd) -> Result<Option<ArtworkLink>> {
+/// allocates a fresh `.ithmb` slot after the running end of each format file.
+fn resolve_new_artwork(
+    device: &Device,
+    track: &TrackToAdd,
+    running_sizes: &mut std::collections::HashMap<String, u64>,
+    next_image_id: &mut u32,
+) -> Result<Option<ArtworkLink>> {
     let source = track.artwork_source.as_ref().expect("checked by caller");
     let source_bytes =
         fs::read(source).map_err(|error| io_error("read artwork source", source, error))?;
@@ -750,20 +771,24 @@ fn resolve_new_artwork(device: &Device, track: &TrackToAdd) -> Result<Option<Art
     for frame in &frames {
         let relative = IpodPath::new(format!("iPod_Control/Artwork/{}", frame.filename))?;
         let path = device.mount().resolve_existing(&relative)?;
-        let current = fs::metadata(&path)
+        let device_size = fs::metadata(&path)
             .map_err(|error| io_error("inspect artwork frame file", &path, error))?
             .len();
         let slot_bytes = frame.slot_bytes();
-        if current % slot_bytes != 0 {
+        if device_size % slot_bytes != 0 {
             return Err(Error::Verification {
                 format: "artwork encoding",
                 reason: format!("{} is not a whole number of slots", frame.filename),
             });
         }
-        let offset = u32::try_from(current).map_err(|_| Error::Verification {
+        let running = running_sizes
+            .entry(frame.filename.to_owned())
+            .or_insert(device_size);
+        let offset = u32::try_from(*running).map_err(|_| Error::Verification {
             format: "artwork encoding",
             reason: "ithmb file exceeds 4 GiB".to_owned(),
         })?;
+        *running = running.saturating_add(slot_bytes);
         refs.push(crate::artwork::ArtworkFormatRef {
             format_id: frame.format_id,
             ithmb_offset: offset,
@@ -779,22 +804,10 @@ fn resolve_new_artwork(device: &Device, track: &TrackToAdd) -> Result<Option<Art
         });
     }
     let (mhod_children, child_count) = crate::artwork::build_reused_children(&refs);
-    let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
-    let artwork_path = device.mount().resolve_existing(&relative)?;
-    let artwork_bytes = read_limited(&artwork_path, MAX_ARTWORK_BYTES, "ArtworkDB")?;
-    let records = crate::artwork::parse_artwork_records(&artwork_bytes)?;
-    let next_image_id = records
-        .iter()
-        .map(|record| record.image_id)
-        .max()
-        .unwrap_or(99)
-        .checked_add(1)
-        .ok_or_else(|| Error::Verification {
-            format: "artwork encoding",
-            reason: "image ID overflow".to_owned(),
-        })?;
+    let image_id = *next_image_id;
+    *next_image_id = next_image_id.saturating_add(1);
     Ok(Some(ArtworkLink {
-        image_id: next_image_id,
+        image_id,
         src_img_size: u32::try_from(source_bytes.len()).unwrap_or(u32::MAX),
         child_count,
         mhod_children,
@@ -1317,16 +1330,26 @@ fn write_artwork_frames(
     }
     for frame in frames {
         let relative = IpodPath::new(format!("iPod_Control/Artwork/{}", frame.filename))?;
-        let path = device.mount().resolve_existing(&relative)?;
-        let current =
-            fs::read(&path).map_err(|error| io_error("read artwork frame file", &path, error))?;
-        if u64::try_from(current.len()).unwrap_or(u64::MAX) != u64::from(frame.ithmb_offset) {
+        let output = directory
+            .join("iPod_Control")
+            .join("Artwork")
+            .join(&frame.filename);
+        // Chain against the already-staged file when present so multiple
+        // additions append into distinct slots.
+        let base = if output.exists() {
+            fs::read(&output)
+                .map_err(|error| io_error("read staged artwork frame", &output, error))?
+        } else {
+            let path = device.mount().resolve_existing(&relative)?;
+            fs::read(&path).map_err(|error| io_error("read artwork frame file", &path, error))?
+        };
+        if u64::try_from(base.len()).unwrap_or(u64::MAX) != u64::from(frame.ithmb_offset) {
             return Err(Error::Verification {
                 format: "staged artwork frames",
                 reason: format!("{} changed since slot allocation", frame.filename),
             });
         }
-        let mut updated = current;
+        let mut updated = base;
         updated.extend_from_slice(&frame.frame);
         let output = directory
             .join("iPod_Control")

@@ -859,12 +859,16 @@ fn build_mhod_string(mhod_type: u32, text: &str) -> Vec<u8> {
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
+    // Header (24): magic, header_length, total_length, type, then 8 zero
+    // bytes; body (16): encoding=1, string_length, unk, unk; then UTF-16 data.
     let total = 24 + 16 + encoded.len();
     let mut output = Vec::with_capacity(total);
     output.extend_from_slice(b"mhod");
     output.extend_from_slice(&24_u32.to_le_bytes());
     output.extend_from_slice(&u32::try_from(total).unwrap_or(u32::MAX).to_le_bytes());
     output.extend_from_slice(&mhod_type.to_le_bytes());
+    output.extend_from_slice(&0_u32.to_le_bytes());
+    output.extend_from_slice(&0_u32.to_le_bytes());
     output.extend_from_slice(&1_u32.to_le_bytes());
     output.extend_from_slice(
         &u32::try_from(encoded.len())
@@ -874,6 +878,7 @@ fn build_mhod_string(mhod_type: u32, text: &str) -> Vec<u8> {
     output.extend_from_slice(&1_u32.to_le_bytes());
     output.extend_from_slice(&0_u32.to_le_bytes());
     output.extend_from_slice(&encoded);
+    debug_assert_eq!(output.len(), total);
     output
 }
 

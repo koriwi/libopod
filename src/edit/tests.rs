@@ -253,6 +253,16 @@ mod tests {
         assert_eq!(staged.remaining_tracks(), 727);
         assert_eq!(staged.added_media().len(), 1);
         assert!(staged.added_media()[0].as_str().starts_with("iPod_Control/Music/"));
+        // Regression: the new track's CDB title and location strings must
+        // round-trip through the exact MHOD string layout (8-byte header gap).
+        let cdb = std::fs::read(bundle.path().join("iTunesCDB")).unwrap();
+        let (title, location) = cdb_track_strings(
+            &cdb,
+            staged_pid(&staged, "LibOpod Fixture Addition"),
+        )
+        .expect("new track present in staged CDB");
+        assert_eq!(title, "LibOpod Fixture Addition");
+        assert!(location.starts_with(":iPod_Control:Music:"));
         verify_staged_addition(&bundle, &staged);
 
         let virtual_root = bundle.path().join("original");
@@ -428,6 +438,69 @@ mod tests {
         assert_eq!(reopened.library().unwrap().track_count(), 727);
     }
 
+    /// Decodes the CDB and returns (title, location) for the track with the
+    /// given persistent ID, using the exact MHOD string layout.
+    fn cdb_track_strings(cdb: &[u8], pid: PersistentId) -> Option<(String, String)> {
+        let header_length = u32::from_le_bytes(cdb[4..8].try_into().unwrap()) as usize;
+        let mut decoder = flate2::read::ZlibDecoder::new(&cdb[header_length..]);
+        let mut payload = Vec::new();
+        decoder.read_to_end(&mut payload).unwrap();
+        let datasets = u32::from_le_bytes(cdb[0x14..0x18].try_into().unwrap());
+        let mut offset = 0;
+        for _ in 0..datasets {
+            let hdr = u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let total = u32::from_le_bytes(payload[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let kind = u32::from_le_bytes(payload[offset + 12..offset + 16].try_into().unwrap());
+            if kind == 1 {
+                let list = offset + hdr;
+                let lh = u32::from_le_bytes(payload[list + 4..list + 8].try_into().unwrap()) as usize;
+                let count = u32::from_le_bytes(payload[list + 8..list + 12].try_into().unwrap());
+                let mut toff = list + lh;
+                for _ in 0..count {
+                    let hh = u32::from_le_bytes(payload[toff + 4..toff + 8].try_into().unwrap()) as usize;
+                    let tt = u32::from_le_bytes(payload[toff + 8..toff + 12].try_into().unwrap()) as usize;
+                    let track_pid =
+                        u64::from_le_bytes(payload[toff + 0x70..toff + 0x78].try_into().unwrap());
+                    if PersistentId::from_bits(track_pid) == pid {
+                        let mut title = String::new();
+                        let mut location = String::new();
+                        let cc =
+                            u32::from_le_bytes(payload[toff + 0x0c..toff + 0x10].try_into().unwrap());
+                        let mut coff = toff + hh;
+                        for _ in 0..cc {
+                            let ch = u32::from_le_bytes(payload[coff + 4..coff + 8].try_into().unwrap()) as usize;
+                            let ct = u32::from_le_bytes(payload[coff + 8..coff + 12].try_into().unwrap()) as usize;
+                            let mhod_type =
+                                u32::from_le_bytes(payload[coff + 12..coff + 16].try_into().unwrap());
+                            if mhod_type == 1 || mhod_type == 2 {
+                                let body = coff + 24;
+                                let byte_len = u32::from_le_bytes(
+                                    payload[body + 4..body + 8].try_into().unwrap(),
+                                ) as usize;
+                                let mut units = Vec::new();
+                                for pair in payload[body + 16..body + 16 + byte_len].chunks_exact(2)
+                                {
+                                    units.push(u16::from_le_bytes([pair[0], pair[1]]));
+                                }
+                                let text = String::from_utf16_lossy(&units);
+                                if mhod_type == 1 {
+                                    title = text;
+                                } else {
+                                    location = text;
+                                }
+                            }
+                            coff += ct;
+                        }
+                        return Some((title, location));
+                    }
+                    toff += tt;
+                }
+            }
+            offset += total;
+        }
+        None
+    }
+
     fn staged_pid(staged: &super::StagedSqliteEdit, title: &str) -> PersistentId {
         let library = rusqlite::Connection::open(
             staged.directory().join(SqliteLibraryFile::Library.file_name()),
@@ -581,6 +654,84 @@ mod tests {
         }
         let reopened = Device::open(&virtual_root).unwrap();
         assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn stages_two_new_art_additions_into_distinct_slots() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let source = fixture.join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return;
+        }
+        let art_dir = tempdir().unwrap();
+        let art_path = art_dir.path().join("cover.png");
+        let mut buffer = Vec::new();
+        let rgba = image::RgbaImage::from_pixel(256, 256, image::Rgba([10, 200, 90, 255]));
+        let encoder = image::codecs::png::PngEncoder::new(&mut buffer);
+        image::ImageEncoder::write_image(
+            encoder,
+            rgba.as_raw(),
+            256,
+            256,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        std::fs::write(&art_path, &buffer).unwrap();
+        let mut edit = device.edit().unwrap();
+        for (title, artist) in [("Multi Art One", "Multi One"), ("Multi Art Two", "Multi Two")] {
+            edit.add_track(TrackToAdd {
+                source_path: source.clone(),
+                title: title.to_owned(),
+                artist: Some(artist.to_owned()),
+                album: Some(format!("{artist} Album")),
+                album_artist: None,
+                genre: None,
+                composer: None,
+                year: 2024,
+                track_number: 1,
+                total_tracks: 1,
+                disc_number: 1,
+                total_discs: 1,
+                bitrate: 192,
+                sample_rate: 44100,
+                length_ms: 155_742,
+                compilation: false,
+                reuse_album_art: false,
+                artwork_source: Some(art_path.clone()),
+            })
+            .unwrap();
+        }
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.added_tracks(), 2);
+        assert_eq!(staged.added_artwork_tracks(), 2);
+        assert_eq!(staged.added_ithmb().len(), 4);
+        assert_eq!(staged.remaining_tracks(), 728);
+        let artwork_bytes = std::fs::read(bundle.path().join("ArtworkDB")).unwrap();
+        let records = crate::artwork::parse_artwork_records(&artwork_bytes).unwrap();
+        assert_eq!(records.len(), 706);
+        let new_ids: Vec<u32> = records
+            .iter()
+            .filter(|record| record.image_id >= 804)
+            .map(|record| record.image_id)
+            .collect();
+        assert_eq!(new_ids, vec![804, 805]);
+        // Each ithmb file grew by exactly two slots.
+        for ithmb in staged.added_ithmb() {
+            let grown =
+                std::fs::metadata(bundle.path().join(ithmb.as_str())).unwrap().len();
+            let before = std::fs::metadata(
+                bundle.path().join("original").join(ithmb.as_str()),
+            )
+            .unwrap()
+            .len();
+            let slot = (grown - before) / 2;
+            assert!(slot > 0);
+        }
     }
 
     fn stage_private_new_art_addition() -> Option<(TempDir, super::StagedSqliteEdit)> {
