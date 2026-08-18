@@ -206,6 +206,46 @@ fn insert_track(
         composer_pid,
         genre_id,
     )?;
+    link_artwork_rows(transaction, path, addition, pid, album_pid, artist_pid)?;
+    Ok(())
+}
+
+/// Sets the album/artist artwork references after a track with artwork is
+/// inserted.
+///
+/// Apple writes `album.artwork_item_pid` (a representative item) and
+/// `artist.artwork_album_pid` (a representative album) so the browse rows
+/// carry art; the artist row has no item-level fallback on the Nano 7G, so it
+/// stays blank unless the reference is set. Existing art is never overwritten.
+fn link_artwork_rows(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    addition: &ResolvedAddition,
+    item_pid: i64,
+    album_pid: i64,
+    artist_pid: i64,
+) -> Result<()> {
+    if addition.artwork.is_none() {
+        return Ok(());
+    }
+    if album_pid != 0 {
+        transaction
+            .execute(
+                "UPDATE album SET artwork_status = 1, artwork_item_pid = ?2 \
+                 WHERE pid = ?1 AND artwork_status = 0",
+                rusqlite::params![album_pid, item_pid],
+            )
+            .map_err(|source| sqlite_error("link album artwork", path, source))?;
+    }
+    if artist_pid != 0 {
+        transaction
+            .execute(
+                "UPDATE artist SET artwork_status = 1, artwork_album_pid = ?2 \
+                 WHERE pid = ?1 AND artwork_status = 0",
+                rusqlite::params![artist_pid, album_pid],
+            )
+            .map_err(|source| sqlite_error("link artist artwork", path, source))?;
+    }
     Ok(())
 }
 

@@ -577,6 +577,37 @@ mod tests {
             .unwrap();
         assert_eq!(status, 1);
         assert_eq!(cache_id, 804);
+        let (item_pid, album_pid, artist_pid): (i64, i64, i64) = library
+            .query_row(
+                "SELECT item.pid, album.pid, artist.pid FROM item \
+                 JOIN album ON album.pid = item.album_pid \
+                 JOIN artist ON artist.pid = album.artist_pid \
+                 WHERE item.title = 'LibOpod New Art'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        // Apple's browse-level artwork linkage: the album names a
+        // representative item and the artist names a representative album (the
+        // artist row has no item fallback, so it stays blank without this).
+        let (album_status, album_item_pid): (i64, i64) = library
+            .query_row(
+                "SELECT artwork_status, artwork_item_pid FROM album WHERE pid = ?1",
+                [album_pid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(album_status, 1);
+        assert_eq!(album_item_pid, item_pid);
+        let (artist_status, artist_album_pid): (i64, i64) = library
+            .query_row(
+                "SELECT artwork_status, artwork_album_pid FROM artist WHERE pid = ?1",
+                [artist_pid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(artist_status, 1);
+        assert_eq!(artist_album_pid, album_pid);
         let artwork_bytes = std::fs::read(directory.join("ArtworkDB")).unwrap();
         let records = crate::artwork::parse_artwork_records(&artwork_bytes).unwrap();
         assert_eq!(records.len(), 705);

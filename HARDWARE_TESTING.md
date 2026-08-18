@@ -249,3 +249,24 @@ cargo run --release --example opod-hardware-test -- \
 Expect one more track (727 total, 726 + 1), 705 ArtworkDB records (704 + 1),
 the four `.ithmb` files each one slot longer, the new artwork visible in Now
 Playing/browse, valid signatures, and no restore warning after reboot.
+
+### Gate 6 result
+
+Passed on hardware 2025-08-18: one track added with fresh encoded cover art.
+Tracks 726 → 727, ArtworkDB records 704 → 705, all four `.ithmb` files grew
+by one slot, the new album displays its artwork and the track is playable.
+Signatures valid, no restore warning after reboot.
+
+All six Nano 7G qualification gates (no-op, no-artwork removal, no-artwork
+addition, artwork-bearing removal, reused-art addition, new-art addition)
+have now passed on hardware.
+
+Observed gap (artist browse art): the new artist row showed no artwork at the
+artist browse level, even though its album displayed art. Apple's data sets
+`artist.artwork_album_pid` (a representative album) and `album.artwork_item_pid`
+(a representative item) for browse-level art; libopod wrote only the item's
+`artwork_cache_id`, which the firmware derives for album art but not for the
+artist row. Fixed in the SQLite add path (`link_artwork_rows`): when a track
+with artwork is inserted, the album and artist rows get their artwork
+references set unless already present. Virtual tests assert the linkage; a
+future hardware add should show artist-level art.
