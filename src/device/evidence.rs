@@ -12,6 +12,10 @@ const MAX_EXTENDED_BYTES: u64 = 4 * 1024 * 1024;
 pub enum EvidenceSource {
     SysInfo,
     SysInfoExtended,
+    /// Read from the Linux USB hierarchy (`sysfs`) when the files carry no
+    /// identity (e.g. Nano 1G/2G with an empty `SysInfo` and no
+    /// `SysInfoExtended`).
+    Usb,
 }
 
 /// A value retained together with its on-device source.
@@ -76,7 +80,32 @@ impl IdentityEvidence {
         )? {
             evidence.parse_extended(&bytes)?;
         }
+        #[cfg(target_os = "linux")]
+        evidence.read_usb_identity(mount);
         Ok(evidence)
+    }
+
+    /// Fills identity gaps from the Linux USB hierarchy: the product ID and
+    /// the USB serial (the `FireWire` GUID on iPods) of the backing USB device.
+    /// Strictly additive; failures leave the existing values untouched.
+    #[cfg(target_os = "linux")]
+    fn read_usb_identity(&mut self, mount: &MountRoot) {
+        let identity = crate::fs::probe_usb_identity(mount.as_path());
+        if self.usb_product_id.is_none() {
+            if let Some(product_id) = identity.product_id {
+                self.usb_product_id = Some(Sourced {
+                    value: product_id,
+                    source: EvidenceSource::Usb,
+                });
+            }
+        }
+        if self.firewire_guid.is_none() {
+            if let Some(serial) = identity.serial {
+                if let Some(guid) = parse_guid(serial.trim_start_matches("0x").trim()) {
+                    self.firewire_guid = Some(guid);
+                }
+            }
+        }
     }
 
     fn empty() -> Self {
