@@ -185,3 +185,35 @@ and run `opod-inspect`: expect one fewer track, valid SQLite and CBK,
 Stop if the firmware or Apple software requests a restore. Media and artwork
 slot deletion remain disabled until later gates pass. The full matrix is
 specified in `plan.md` sections 10 and 12.
+
+## Nano 7G gate 5: addition with reused album artwork
+
+Adds one track whose album already exists on the device with artwork; the new
+track inherits the album's existing `.ithmb` slots (no image decoding).
+
+```console
+cargo run --release --example opod-hardware-test -- \
+  add-reuse /path/to/ipod /path/to/source.mp3 'TITLE' 'ARTIST' 'ALBUM' LENGTH_MS \
+  /path/to/empty-host-directory \
+  'I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH REUSED ALBUM ART'
+```
+
+ALBUM must already exist on the device with artwork (e.g. any existing album).
+Expect one more track, the same artwork as its album-mates, 705 ArtworkDB
+records, valid signatures, and no restore warning after reboot.
+
+## Nano 7G gate 6: addition with new encoded cover art
+
+Adds one track with a fresh cover image (JPEG/PNG) encoded into all four Nano
+7G cover formats and written into new `.ithmb` slots.
+
+```console
+cargo run --release --example opod-hardware-test -- \
+  add-art /path/to/ipod /path/to/source.mp3 /path/to/cover.png \
+  'TITLE' 'ARTIST' 'ALBUM' LENGTH_MS /path/to/empty-host-directory \
+  'I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH NEW COVER ART'
+```
+
+Expect one more track, 705 ArtworkDB records, the four `.ithmb` files each one
+slot longer, the new artwork visible in Now Playing/browse, valid signatures,
+and no restore warning after reboot.
