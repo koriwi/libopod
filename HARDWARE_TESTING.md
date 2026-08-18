@@ -153,3 +153,35 @@ resolution, the rebuilt CBK, the new CDB MHIT with rebuilt type-52/53 library
 indices and master-playlist MHIP, and the exact-final-byte HASHAB signature on
 real firmware. All three Nano 7G qualification gates (no-op, removal,
 addition) have now passed on hardware.
+
+## Nano 7G gate 4: one artwork-bearing database removal
+
+This gate removes exactly one track that has artwork. The matching `mhii`
+record is dropped from `ArtworkDB`, while `.ithmb` slot payloads stay in place
+as unreferenced data (mirroring the orphaned-media policy). SQLite, CBK, and
+CDB behave exactly as in gate 2. Keep both the complete external backup and
+the new host transaction bundle.
+
+Choose an index whose artwork column is `yes`:
+
+```console
+cargo run --release --example opod-stage-remove -- /path/to/ipod list
+```
+
+Create another empty host directory and run with the artwork confirmation:
+
+```console
+cargo run --release --example opod-hardware-test -- \
+  remove /path/to/ipod TRACK_INDEX /path/to/empty-host-directory \
+  'I HAVE A VERIFIED BACKUP; REMOVE ONE ARTWORK-BEARING TRACK AND KEEP ITS MEDIA FILE'
+```
+
+The same `recover` command applies if interrupted. On success, safely eject and
+reboot. Confirm the library has one fewer track, browse the remaining tracks of
+the removed track's album (their shared art should still display), reconnect,
+and run `opod-inspect`: expect one fewer track, valid SQLite and CBK,
+`Some(Valid)` for the CDB HASHAB signature, and 703 `ArtworkDB` records.
+
+Stop if the firmware or Apple software requests a restore. Media and artwork
+slot deletion remain disabled until later gates pass. The full matrix is
+specified in `plan.md` sections 10 and 12.
