@@ -138,3 +138,15 @@ Stop if the firmware or Apple software requests a restore. Do not run copyPod
 or repeat the gate until the reboot checks pass. CopyPod synchronization
 remains disabled until this addition gate and subsequent artwork gates pass.
 The full matrix is specified in `plan.md` sections 10 and 12.
+
+### Gate 3 result
+
+The real Nano 7G addition transaction completed, read back successfully, and
+survived safe eject/reboot: the operator found the newly added track
+immediately in the browse lists and played it without issue. This qualifies
+the staged media allocation and installation, the SQLite `item`/
+`avformat_info`/`location`/container insertion, album/artist/composer/genre
+resolution, the rebuilt CBK, the new CDB MHIT with rebuilt type-52/53 library
+indices and master-playlist MHIP, and the exact-final-byte HASHAB signature on
+real firmware. All three Nano 7G qualification gates (no-op, removal,
+addition) have now passed on hardware.

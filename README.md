@@ -14,9 +14,10 @@ these previews deliberately cannot be installed manually. The enabled device
 mutations are explicitly confirmed Nano 7G qualification gates: a
 byte-identical transaction, one no-artwork removal that retains its media
 file, and one no-artwork MP3 addition. All three have passed their virtual
-read-back and recovery tests; the no-op and removal gates have additionally
-passed on real hardware. General semantic writes and synchronization remain
-disabled.
+read-back and recovery tests **and have qualified on real Nano 7G hardware**
+(byte-identical transaction, one-track removal with media retained, and
+one-track addition that was immediately browsable and playable after reboot).
+General semantic writes and synchronization remain disabled.
 
 See [`plan.md`](plan.md) for scope, architecture, safety rules, and the hardware
 qualification matrix.

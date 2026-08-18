@@ -634,6 +634,15 @@ qualifies the schema-preserving SQLite removal, the CBK rebuild, and the
 corrected exact-final-byte HASHAB CDB signature on real firmware. The orphaned
 MP3 remains on disk as intended.
 
+The third gate then validated the first media-installing mutation on
+hardware: the explicitly confirmed one-track no-artwork addition completed,
+read back, and the new track was immediately findable in the browse lists and
+played after reboot. This qualifies staged media allocation and installation,
+the SQLite `item`/`avformat_info`/`location`/container insertion,
+album/artist/composer/genre resolution, the rebuilt CBK, the new CDB MHIT
+with rebuilt type-52/53 library indices and master-playlist MHIP, and the
+exact-final-byte HASHAB signature on real firmware.
+
 The private tests verify all structural observations in section 15 and stage a
 one-track removal into a temporary host directory. The staged set has 725
 tracks, all five schemas remain identical, every database passes
@@ -646,13 +655,11 @@ only opened read-only; its essential file hashes remain unchanged.
 Next implementation work:
 
 1. Treat `backup_7g/` as immutable and private; confirm it remains ignored.
-2. Run the now-exposed, explicitly confirmed one-track no-artwork addition gate
-   on the real Nano 7G (`opod-hardware-test add`), leave the media file in its
-   allocated `Music/Fxx` directory, then eject/reboot/play/reconnect and record
-   results. Expected: 727 tracks, valid signatures, no restore warning.
-3. Implement ArtworkDB/ithmb updates (needed before removal of artwork-bearing
-   tracks and before artwork-bearing additions), then connect copyPod. Defer
-   HASH58/HASH72 and legacy writers until this Nano 7G path is qualified.
+2. All three Nano 7G qualification gates (no-op, removal, addition) have now
+   passed on hardware. Next: ArtworkDB/ithmb updates (needed before removing or
+   adding artwork-bearing tracks and before cover-art sync), then connect
+   copyPod mutation methods. Defer HASH58/HASH72 and legacy writers until this
+   Nano 7G path is fully qualified.
 
 ## 17. copyPod migration spike
 
