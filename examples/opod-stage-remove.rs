@@ -39,12 +39,15 @@ fn list(mount: &OsString) -> CliResult<()> {
     let library = device
         .library()
         .ok_or_else(|| invalid_input("the authoritative library is unavailable"))?;
-    println!("index\tartwork\tbytes");
+    println!("index\tartwork\tbytes\ttitle\tartist\talbum");
     for (index, track) in library.tracks().iter().enumerate() {
         println!(
-            "{index}\t{}\t{}",
+            "{index}\t{}\t{}\t{}\t{}\t{}",
             if track.has_artwork { "yes" } else { "no" },
-            track.size
+            track.size,
+            track.title,
+            track.artist,
+            track.album,
         );
     }
     Ok(())
