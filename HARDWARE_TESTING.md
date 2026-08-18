@@ -6,12 +6,25 @@ operator confirmation that identifies the mounted volume.
 The initial Nano 7G backup at `backup_7g/` is private and immutable. It is a
 file-level development input, not a write target.
 
-## Current gate: new-cover-art addition (gate 6)
+## Current gate: media-deletion removal (gate 7) and artwork-delete removal (gate 8)
 
-Gates 1–5 (no-op, no-artwork removal, no-artwork addition, artwork-bearing
-removal, reused-art addition) have passed on hardware. The device is at 726
-tracks / 704 ArtworkDB records. Gate 6 adds one track with a fresh encoded
-cover and validates the full new-art path end to end.
+Gates 1–6 (no-op, both removals, both additions, both artwork paths) have
+passed on hardware. The device is at 727 tracks / 705 ArtworkDB records.
+
+The media-deletion policy: when the operator asks for a delete (distinct
+confirmation phrase), the media file is deleted **as part of the removal
+transaction** — no post-reboot confirmation phase, mirroring iTunes. The file
+is backed up inside the transaction and restored on rollback, so a failed or
+interrupted commit never loses it.
+
+Artwork-bearing removals now **rewrite and reindex the `.ithmb` files**
+instead of leaving unreferenced slots: the remaining images are packed into
+fresh contiguous slots (shared slots deduplicated) and every `mhii` record is
+repointed. This applies to both the keep-orphan and delete variants.
+
+- Gate 7: remove one no-artwork track and delete its media file.
+- Gate 8: remove one artwork-bearing track, delete its media, and reindex
+  the four `.ithmb` files.
 
 The edit stage can read a mounted iPod and write modified SQLite and signed
 CDB copies to separate host storage. It does not write to the iPod unless an
@@ -270,3 +283,36 @@ artist row. Fixed in the SQLite add path (`link_artwork_rows`): when a track
 with artwork is inserted, the album and artist rows get their artwork
 references set unless already present. Virtual tests assert the linkage; a
 future hardware add should show artist-level art.
+
+## Nano 7G gate 7: no-artwork removal with immediate media deletion
+
+Removes exactly one no-artwork track and deletes its media file inside the
+same transaction (no post-reboot confirmation). Pick a no-artwork index from
+`opod-stage-remove list`, then:
+
+```console
+cargo run --release --example opod-hardware-test -- \
+  remove /path/to/ipod TRACK_INDEX /path/to/empty-host-directory \
+  'I HAVE A VERIFIED BACKUP; REMOVE ONE NO-ARTWORK TRACK AND DELETE ITS MEDIA FILE'
+```
+
+Expect: one fewer track (727 → 726), the media file gone from
+`iPod_Control/Music/`, valid signatures, no restore warning after reboot. An
+interrupted install restores the file (transaction rollback).
+
+## Nano 7G gate 8: artwork-bearing removal with media deletion and reindex
+
+Removes exactly one artwork-bearing track, deletes its media, drops its `mhii`
+record, and rebuilds all four `.ithmb` files with the remaining images packed
+into contiguous slots (shared slots deduplicated):
+
+```console
+cargo run --release --example opod-hardware-test -- \
+  remove /path/to/ipod TRACK_INDEX /path/to/empty-host-directory \
+  'I HAVE A VERIFIED BACKUP; REMOVE ONE ARTWORK-BEARING TRACK AND DELETE ITS MEDIA FILE'
+```
+
+Expect: one fewer track (727 → 725), ArtworkDB records 705 → 704, the four
+`.ithmb` files whole slots and no larger than before, the media file gone,
+remaining albums still display their artwork, valid signatures, no restore
+warning after reboot.

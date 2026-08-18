@@ -14,9 +14,9 @@ mod tests {
         edit_staged_databases, TrackToAdd,
     };
     use crate::{
-        artwork::parse_artwork_records,
-        Device, Error, MountRoot, PersistentId, SqliteLibraryFile,
-        NANO7_NOOP_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
+        artwork::parse_artwork_records, Device, Error, MediaDeletionPolicy, MountRoot,
+        PersistentId, SqliteLibraryFile, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+        NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
     };
     use std::io::Read as _;
 
@@ -88,6 +88,94 @@ mod tests {
         assert!(!virtual_root.join(TRANSACTION_PATH).exists());
         let reopened = Device::open(&virtual_root).unwrap();
         assert_eq!(reopened.library().unwrap().track_count(), 725);
+    }
+
+    #[test]
+    fn deletes_media_on_install_and_restores_it_on_rollback() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let track = device
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| !track.has_artwork)
+            .unwrap()
+            .clone();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        edit.set_media_policy(MediaDeletionPolicy::Delete);
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        // The staging manifest records the deletion with the live fingerprint.
+        assert_eq!(staged.deletions().len(), 1);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
+        let deletions = manifest["deletions"].as_array().unwrap();
+        assert_eq!(deletions.len(), 1);
+        assert_eq!(
+            deletions[0]["target"],
+            serde_json::Value::String(track.location.to_string())
+        );
+
+        let virtual_root = bundle.path().join("original");
+        let media = virtual_root.join(track.location.as_str());
+        fs::create_dir_all(media.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(track.location.as_str()), &media).unwrap();
+        assert!(media.is_file(), "media must exist before install");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        // The keep-media confirmation must not match a delete staging.
+        assert!(virtual_device
+            .install_single_removal_hardware_test(
+                &staged,
+                NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
+            )
+            .is_err());
+        virtual_device
+            .install_single_removal_hardware_test(
+                &staged,
+                NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION,
+            )
+            .unwrap();
+        assert!(!media.exists(), "media file must be deleted on install");
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+
+        // An interrupted install must roll the media file back.
+        let device = Device::open(&fixture).unwrap();
+        let track = device
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| !track.has_artwork)
+            .unwrap()
+            .clone();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        edit.set_media_policy(MediaDeletionPolicy::Delete);
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        let virtual_root = bundle.path().join("original");
+        let media = virtual_root.join(track.location.as_str());
+        fs::create_dir_all(media.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(track.location.as_str()), &media).unwrap();
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(3),
+        )
+        .unwrap_err();
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        assert!(media.is_file(), "media file must be restored on rollback");
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
     }
 
     #[test]
@@ -363,6 +451,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parse_artwork_records(&installed).unwrap().len(), 703);
+        // The ithmb files were reindexed: no growth, whole slots, and the
+        // installed ArtworkDB record offsets stay in range.
+        for name in [
+            "F1010_1.ithmb",
+            "F1013_1.ithmb",
+            "F1015_1.ithmb",
+            "F1016_1.ithmb",
+        ] {
+            let path = virtual_root.join("iPod_Control/Artwork").join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            let original = bundle
+                .path()
+                .join("original/iPod_Control/Artwork")
+                .join(name);
+            let before = std::fs::metadata(original).unwrap().len();
+            assert!(
+                (bytes.len() as u64) <= before,
+                "{name} grew during reindex"
+            );
+            let slot = match name {
+                "F1010_1.ithmb" => 115_200u64,
+                "F1013_1.ithmb" => 5_000,
+                "F1015_1.ithmb" => 6_728,
+                _ => 6_612,
+            };
+            assert_eq!(bytes.len() as u64 % slot, 0, "{name} is not whole slots");
+        }
         let reopened = Device::open(&virtual_root).unwrap();
         assert_eq!(reopened.library().unwrap().track_count(), 725);
 

@@ -19,6 +19,10 @@ pub(crate) const REMOVAL_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; REMOVE ONE NO-ARTWORK TRACK AND KEEP ITS MEDIA FILE";
 pub(crate) const ARTWORK_REMOVAL_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; REMOVE ONE ARTWORK-BEARING TRACK AND KEEP ITS MEDIA FILE";
+pub(crate) const REMOVAL_DELETE_CONFIRMATION: &str =
+    "I HAVE A VERIFIED BACKUP; REMOVE ONE NO-ARTWORK TRACK AND DELETE ITS MEDIA FILE";
+pub(crate) const ARTWORK_REMOVAL_DELETE_CONFIRMATION: &str =
+    "I HAVE A VERIFIED BACKUP; REMOVE ONE ARTWORK-BEARING TRACK AND DELETE ITS MEDIA FILE";
 pub(crate) const ADDITION_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; ADD ONE NO-ARTWORK MP3 TRACK";
 pub(crate) const ARTWORK_REUSE_ADDITION_CONFIRMATION: &str =
@@ -85,12 +89,18 @@ pub(crate) fn install_single_removal_hardware_test(
     staged: &StagedSqliteEdit,
     confirmation: &str,
 ) -> Result<()> {
-    if confirmation != REMOVAL_CONFIRMATION {
-        return Err(Error::Unsupported {
-            feature: "Nano 7G removal hardware test confirmation",
-            reason: format!("confirmation must exactly equal: {REMOVAL_CONFIRMATION}"),
-        });
-    }
+    let delete = match confirmation {
+        REMOVAL_CONFIRMATION => false,
+        REMOVAL_DELETE_CONFIRMATION => true,
+        _ => {
+            return Err(Error::Unsupported {
+                feature: "Nano 7G removal hardware test confirmation",
+                reason: format!(
+                    "confirmation must exactly equal: {REMOVAL_CONFIRMATION} or {REMOVAL_DELETE_CONFIRMATION}"
+                ),
+            });
+        }
+    };
     if device.profile().map(crate::DeviceProfile::key) != Some("nano-7g")
         || staged.removed_tracks() != 1
         || staged.removed_artwork_tracks() != 0
@@ -98,6 +108,12 @@ pub(crate) fn install_single_removal_hardware_test(
         return Err(Error::Unsupported {
             feature: "Nano 7G single-track removal hardware test",
             reason: "exactly one no-artwork track on a resolved Nano 7G is required".to_owned(),
+        });
+    }
+    if delete == staged.deletions().is_empty() {
+        return Err(Error::Unsupported {
+            feature: "Nano 7G removal hardware test",
+            reason: "the confirmation must match the staged media deletion policy".to_owned(),
         });
     }
     install_staged_removal(device, staged, FailureMode::RollBack)
@@ -108,12 +124,18 @@ pub(crate) fn install_single_artwork_removal_hardware_test(
     staged: &StagedSqliteEdit,
     confirmation: &str,
 ) -> Result<()> {
-    if confirmation != ARTWORK_REMOVAL_CONFIRMATION {
-        return Err(Error::Unsupported {
-            feature: "Nano 7G artwork-removal hardware test confirmation",
-            reason: format!("confirmation must exactly equal: {ARTWORK_REMOVAL_CONFIRMATION}"),
-        });
-    }
+    let delete = match confirmation {
+        ARTWORK_REMOVAL_CONFIRMATION => false,
+        ARTWORK_REMOVAL_DELETE_CONFIRMATION => true,
+        _ => {
+            return Err(Error::Unsupported {
+                feature: "Nano 7G artwork-removal hardware test confirmation",
+                reason: format!(
+                    "confirmation must exactly equal: {ARTWORK_REMOVAL_CONFIRMATION} or {ARTWORK_REMOVAL_DELETE_CONFIRMATION}"
+                ),
+            });
+        }
+    };
     if device.profile().map(crate::DeviceProfile::key) != Some("nano-7g")
         || staged.removed_tracks() != 1
         || staged.removed_artwork_tracks() != 1
@@ -122,6 +144,12 @@ pub(crate) fn install_single_artwork_removal_hardware_test(
             feature: "Nano 7G artwork-removal hardware test",
             reason: "exactly one artwork-bearing track on a resolved Nano 7G is required"
                 .to_owned(),
+        });
+    }
+    if delete == staged.deletions().is_empty() {
+        return Err(Error::Unsupported {
+            feature: "Nano 7G artwork-removal hardware test",
+            reason: "the confirmation must match the staged media deletion policy".to_owned(),
         });
     }
     install_staged_removal(device, staged, FailureMode::RollBack)
@@ -290,6 +318,22 @@ fn install_inner(
             });
         }
     }
+    for deletion in &journal.staging.deletions {
+        let relative = IpodPath::new(deletion.target.clone())?;
+        let target = device.mount().resolve_existing(&relative)?;
+        verify_file(
+            &target,
+            deletion.bytes,
+            &deletion.sha256,
+            "live deletion input",
+        )?;
+        let backup_file = backup.join("deletions").join(relative.as_str());
+        if let Some(parent) = backup_file.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|source| io_error("create deletion backup parent", parent, source))?;
+        }
+        copy_new_verified(&target, &backup_file, deletion.bytes, &deletion.sha256)?;
+    }
     sync_directory(&backup)?;
     staged
         .source_generation
@@ -324,6 +368,14 @@ fn install_inner(
         install_file(&staged_file, &target, index)?;
     }
 
+    for deletion in &journal.staging.deletions {
+        let relative = IpodPath::new(deletion.target.clone())?;
+        let target = device.mount().resolve_existing(&relative)?;
+        fs::remove_file(&target)
+            .map_err(|source| io_error("delete removed media", &target, source))?;
+        sync_directory(target.parent().unwrap_or(device.mount().as_path()))?;
+    }
+
     journal.phase = TransactionPhase::Validating;
     write_journal(transaction, &journal)?;
     for output in &journal.staging.outputs {
@@ -343,6 +395,11 @@ fn install_inner(
                 reason: "stopped during output validation".to_owned(),
             });
         }
+    }
+    for deletion in &journal.staging.deletions {
+        let relative = IpodPath::new(deletion.target.clone())?;
+        let target = device.mount().resolve_possible(&relative)?;
+        verify_absent(&target, "deleted output")?;
     }
     let reopened = Device::open_during_transaction(device.mount().as_path())?;
     if reopened.library().map_or(0, crate::Library::track_count) != staged.remaining_tracks() {
@@ -429,6 +486,21 @@ pub(crate) fn recover_transaction(mount: &MountRoot) -> Result<()> {
                     });
                 }
             }
+        }
+        for deletion in &journal.staging.deletions {
+            let relative = IpodPath::new(deletion.target.clone())?;
+            let target = mount.resolve_possible(&relative)?;
+            let backup = transaction
+                .join("backup")
+                .join("deletions")
+                .join(deletion.target.as_str());
+            install_file(&backup, &target, 0)?;
+            verify_file(
+                &target,
+                deletion.bytes,
+                &deletion.sha256,
+                "restored deletion",
+            )?;
         }
     }
     remove_transaction_directory(&transaction)
@@ -616,7 +688,8 @@ fn verify_bundle(
     })?;
     let artwork_outputs =
         usize::from(staged.removed_artwork_tracks() > 0 || staged.added_artwork_tracks() > 0)
-            + staged.added_ithmb().len();
+            + staged.added_ithmb().len()
+            + staged.removed_ithmb().len();
     if manifest.profile != profile.key()
         || manifest.removed_tracks != staged.removed_tracks()
         || manifest.added_tracks != staged.added_tracks()
@@ -674,8 +747,20 @@ fn require_transaction_space(mount: &MountRoot, manifest: &StagingManifest) -> R
         .map(|output| output.bytes)
         .max()
         .unwrap_or(0);
+    let deletion_bytes = manifest
+        .deletions
+        .iter()
+        .try_fold(0_u64, |total, deletion| {
+            total
+                .checked_add(deletion.bytes)
+                .ok_or_else(|| Error::Verification {
+                    format: "device transaction",
+                    reason: "required deletion backup space overflowed u64".to_owned(),
+                })
+        })?;
     let required = backup_bytes
-        .checked_add(temporary_bytes)
+        .checked_add(deletion_bytes)
+        .and_then(|bytes| bytes.checked_add(temporary_bytes))
         .and_then(|bytes| bytes.checked_add(4 * 1024 * 1024))
         .ok_or_else(|| Error::Verification {
             format: "device transaction",

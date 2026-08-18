@@ -25,7 +25,7 @@ pub(crate) use commit::{
 };
 
 use self::generation::fingerprint_host_file;
-use self::manifest::{back_up_generation, write_staging_manifest};
+use self::manifest::{back_up_generation, write_staging_manifest, ManifestDeletionFile};
 use crate::{
     error::io_error,
     fs::read_limited,
@@ -46,9 +46,19 @@ pub const NANO7_NOOP_HARDWARE_TEST_CONFIRMATION: &str = commit::NOOP_CONFIRMATIO
 /// Exact acknowledgement required by the single no-artwork removal gate.
 pub const NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION: &str = commit::REMOVAL_CONFIRMATION;
 
+/// Exact acknowledgement required by the single no-artwork removal gate with
+/// immediate media deletion.
+pub const NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION: &str =
+    commit::REMOVAL_DELETE_CONFIRMATION;
+
 /// Exact acknowledgement required by the single artwork-bearing removal gate.
 pub const NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION: &str =
     commit::ARTWORK_REMOVAL_CONFIRMATION;
+
+/// Exact acknowledgement required by the single artwork-bearing removal gate
+/// with immediate media deletion and `.ithmb` reindexing.
+pub const NANO7_ARTWORK_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION: &str =
+    commit::ARTWORK_REMOVAL_DELETE_CONFIRMATION;
 
 /// Exact acknowledgement required by the single no-artwork addition gate.
 pub const NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION: &str = commit::ADDITION_CONFIRMATION;
@@ -117,6 +127,17 @@ const SQLITE_FILES: [SqliteLibraryFile; 5] = [
     SqliteLibraryFile::Genius,
 ];
 
+/// How a removal treats the media file on the device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaDeletionPolicy {
+    /// Leave the media file on the device as an unreferenced orphan.
+    KeepOrphan,
+    /// Delete the media file as part of the removal transaction. The file is
+    /// backed up during the transaction and restored on rollback, so an
+    /// interrupted or failed commit never loses the file.
+    Delete,
+}
+
 /// An in-memory set of requested library changes.
 ///
 /// Sessions never modify the opened mount. The current preview staging method
@@ -127,6 +148,7 @@ pub struct EditSession<'device> {
     device: &'device Device,
     removals: BTreeSet<PersistentId>,
     additions: Vec<TrackToAdd>,
+    media_policy: MediaDeletionPolicy,
 }
 
 impl<'device> EditSession<'device> {
@@ -157,7 +179,20 @@ impl<'device> EditSession<'device> {
             device,
             removals: BTreeSet::new(),
             additions: Vec::new(),
+            media_policy: MediaDeletionPolicy::KeepOrphan,
         })
+    }
+
+    /// Sets how queued removals treat the media file. The default is
+    /// [`MediaDeletionPolicy::KeepOrphan`].
+    pub fn set_media_policy(&mut self, policy: MediaDeletionPolicy) {
+        self.media_policy = policy;
+    }
+
+    /// Returns the current media deletion policy.
+    #[must_use]
+    pub fn media_policy(&self) -> MediaDeletionPolicy {
+        self.media_policy
     }
 
     /// Queues a track for removal without changing any files.
@@ -258,6 +293,7 @@ impl<'device> EditSession<'device> {
         self.stage_preview(destination.as_ref())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn stage_preview(&self, destination: &Path) -> Result<StagedSqliteEdit> {
         self.device
             .generation()
@@ -333,12 +369,29 @@ impl<'device> EditSession<'device> {
                 IpodPath::new(format!("iPod_Control/Music/{}", addition.media_relative))
             })
             .collect::<Result<_>>()?;
+        let deletions = if self.media_policy == MediaDeletionPolicy::Delete {
+            let mut deletions = Vec::new();
+            for track in &removed_tracks {
+                let relative = track.location.clone();
+                let target = self.device.mount().resolve_existing(&relative)?;
+                let (bytes, digest) = fingerprint_host_file(&target)?;
+                deletions.push(ManifestDeletionFile {
+                    target: relative.to_string(),
+                    bytes,
+                    sha256: hex(&digest),
+                });
+            }
+            deletions
+        } else {
+            Vec::new()
+        };
         let manifest = write_staging_manifest(
             self.device,
             &destination,
             self.device.generation(),
             self.removals.len(),
             &added_targets,
+            &deletions,
         )?;
         Ok(StagedSqliteEdit {
             directory: destination,
@@ -346,10 +399,12 @@ impl<'device> EditSession<'device> {
             added_tracks: resolved.len(),
             added_artwork_tracks: resolved.iter().filter(|add| add.artwork.is_some()).count(),
             added_ithmb: added_ithmb_targets(&resolved)?,
+            removed_ithmb: removed_ithmb_targets(self.device, &self.removals)?,
             remaining_tracks: after.track_count(),
             removed_media,
             removed_artwork_tracks,
             added_media: added_targets,
+            deletions,
             source_generation: self.device.generation().clone(),
             manifest,
         })
@@ -433,10 +488,12 @@ pub struct StagedSqliteEdit {
     added_tracks: usize,
     added_artwork_tracks: usize,
     added_ithmb: Vec<IpodPath>,
+    removed_ithmb: Vec<IpodPath>,
     remaining_tracks: usize,
     removed_media: Vec<IpodPath>,
     removed_artwork_tracks: usize,
     added_media: Vec<IpodPath>,
+    deletions: Vec<ManifestDeletionFile>,
     source_generation: GenerationFingerprint,
     manifest: PathBuf,
 }
@@ -472,6 +529,13 @@ impl StagedSqliteEdit {
         &self.added_ithmb
     }
 
+    /// Returns the `.ithmb` files that the removal reindexes (empty when no
+    /// artwork-bearing track is removed).
+    #[must_use]
+    pub fn removed_ithmb(&self) -> &[IpodPath] {
+        &self.removed_ithmb
+    }
+
     /// Returns media targets that a future completed commit would install.
     #[must_use]
     pub fn added_media(&self) -> &[IpodPath] {
@@ -489,6 +553,12 @@ impl StagedSqliteEdit {
     #[must_use]
     pub fn removed_media(&self) -> &[IpodPath] {
         &self.removed_media
+    }
+
+    /// Returns the media deletions recorded in the staging manifest (empty
+    /// unless the session used [`MediaDeletionPolicy::Delete`]).
+    pub(crate) fn deletions(&self) -> &[ManifestDeletionFile] {
+        &self.deletions
     }
 
     /// Returns how many removals still require `ArtworkDB` handling.
@@ -813,6 +883,41 @@ fn resolve_new_artwork(
         mhod_children,
         frames: out_frames,
     }))
+}
+
+/// The `.ithmb` files a removal rewrites: every profile format when at least
+/// one removed track carries artwork, otherwise none.
+fn removed_ithmb_targets(
+    device: &Device,
+    removals: &BTreeSet<PersistentId>,
+) -> Result<Vec<IpodPath>> {
+    if removals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let has_artwork = device.library().is_some_and(|library| {
+        library
+            .tracks()
+            .iter()
+            .any(|track| removals.contains(&track.id) && track.has_artwork)
+    });
+    if !has_artwork {
+        return Ok(Vec::new());
+    }
+    let profile = device.profile().ok_or_else(|| Error::Unsupported {
+        feature: "artwork reindex",
+        reason: "the device profile is unknown".to_owned(),
+    })?;
+    profile
+        .capabilities()
+        .artwork_formats
+        .iter()
+        .map(|format| {
+            IpodPath::new(format!(
+                "iPod_Control/Artwork/F{}_1.ithmb",
+                format.format_id
+            ))
+        })
+        .collect()
 }
 
 fn added_ithmb_targets(resolved: &[ResolvedAddition]) -> Result<Vec<IpodPath>> {
@@ -1204,11 +1309,25 @@ fn write_cdb_additions(
     Ok(())
 }
 
-/// Removes the `ArtworkDB` records of every removed track that has one.
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+/// Rewrites `ArtworkDB` and rebuilds the `.ithmb` files after removals that
+/// reference artwork.
 ///
 /// A no-op when none of the removals reference artwork, so no-artwork
-/// removals keep an unchanged `ArtworkDB`. `.ithmb` slot payloads are left in
-/// place as unreferenced data.
+/// removals keep the artwork set untouched. Artwork-bearing removals drop the
+/// matching `mhii` records and pack the remaining images into fresh,
+/// contiguous `.ithmb` slots (shared slots are deduplicated), so no
+/// unreferenced slot data remains.
+#[allow(clippy::too_many_lines)]
 fn write_artwork_preview(
     device: &Device,
     directory: &Path,
@@ -1226,7 +1345,23 @@ fn write_artwork_preview(
     if requested.is_empty() {
         return Ok(());
     }
-    let rewritten = crate::artwork::remove_tracks_from_artworkdb(&bytes, &requested)?;
+    let profile = device.profile().ok_or_else(|| Error::Unsupported {
+        feature: "artwork reindex",
+        reason: "the device profile is unknown".to_owned(),
+    })?;
+    let mut files = std::collections::BTreeMap::new();
+    let mut slot_bytes = std::collections::BTreeMap::new();
+    for format in &profile.capabilities().artwork_formats {
+        let name = format!("F{}_1.ithmb", format.format_id);
+        let file_relative = IpodPath::new(format!("iPod_Control/Artwork/{name}"))?;
+        let file_path = device.mount().resolve_existing(&file_relative)?;
+        let file_bytes = fs::read(&file_path)
+            .map_err(|source| io_error("read on-device ithmb file", &file_path, source))?;
+        files.insert(name.clone(), file_bytes);
+        slot_bytes.insert(name, format.slot_bytes);
+    }
+    let (rewritten, new_files) =
+        crate::artwork::reindex_artwork_removals(&bytes, &requested, &files, &slot_bytes)?;
     let remaining = crate::artwork::parse_artwork_records(&rewritten)?;
     if remaining
         .iter()
@@ -1237,13 +1372,26 @@ fn write_artwork_preview(
             reason: "removed artwork records remain in the rewritten ArtworkDB".to_owned(),
         });
     }
-    let output = directory.join("ArtworkDB");
-    let mut file = File::create(&output)
-        .map_err(|source| io_error("create staged ArtworkDB", &output, source))?;
+    let artwork_output = directory.join("ArtworkDB");
+    let mut file = File::create(&artwork_output)
+        .map_err(|source| io_error("create staged ArtworkDB", &artwork_output, source))?;
     file.write_all(&rewritten)
-        .map_err(|source| io_error("write staged ArtworkDB", &output, source))?;
+        .map_err(|source| io_error("write staged ArtworkDB", &artwork_output, source))?;
     file.sync_all()
-        .map_err(|source| io_error("flush staged ArtworkDB", &output, source))?;
+        .map_err(|source| io_error("flush staged ArtworkDB", &artwork_output, source))?;
+    for (name, content) in new_files {
+        let output = directory.join("iPod_Control").join("Artwork").join(&name);
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| io_error("create staged artwork directory", parent, error))?;
+        }
+        let mut file = File::create(&output)
+            .map_err(|source| io_error("create staged ithmb file", &output, source))?;
+        file.write_all(&content)
+            .map_err(|source| io_error("write staged ithmb file", &output, source))?;
+        file.sync_all()
+            .map_err(|source| io_error("flush staged ithmb file", &output, source))?;
+    }
     Ok(())
 }
 

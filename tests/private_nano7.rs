@@ -185,13 +185,26 @@ fn stages_a_schema_preserving_removal_outside_the_private_fixture() {
     assert_eq!(manifest["removed_tracks"], 1);
     assert_eq!(manifest["source"].as_array().unwrap().len(), 15);
     // The first track of the fixture has artwork, so the preview rewrites
-    // ArtworkDB as an eighth output and leaves the ithmb slots untouched.
-    assert_eq!(manifest["outputs"].as_array().unwrap().len(), 8);
+    // ArtworkDB and reindexes all four ithmb files (7 + 1 + 4 outputs).
+    assert_eq!(manifest["outputs"].as_array().unwrap().len(), 12);
     assert!(manifest["outputs"]
         .as_array()
         .unwrap()
         .iter()
         .any(|output| output["target"] == "iPod_Control/Artwork/ArtworkDB"));
+    for format in [
+        "F1010_1.ithmb",
+        "F1013_1.ithmb",
+        "F1015_1.ithmb",
+        "F1016_1.ithmb",
+    ] {
+        assert!(manifest["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|output| output["target"]
+                == serde_json::Value::String(format!("iPod_Control/Artwork/{format}"))));
+    }
     let staged_artwork = staging.path().join("ArtworkDB");
     assert!(staged_artwork.is_file());
     let artwork_bytes = std::fs::read(&staged_artwork).unwrap();

@@ -23,6 +23,17 @@ pub(crate) struct StagingManifest {
     pub added_tracks: usize,
     pub source: Vec<ManifestSourceFile>,
     pub outputs: Vec<ManifestOutputFile>,
+    /// Files that the install deletes from the device (e.g. removed media).
+    /// Kept empty for older manifests and for keep-orphan removals.
+    #[serde(default)]
+    pub deletions: Vec<ManifestDeletionFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ManifestDeletionFile {
+    pub target: String,
+    pub bytes: u64,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,6 +105,7 @@ pub(crate) fn write_staging_manifest(
     generation: &GenerationFingerprint,
     removed_tracks: usize,
     added_targets: &[IpodPath],
+    deletions: &[ManifestDeletionFile],
 ) -> Result<PathBuf> {
     let profile = device.profile().ok_or_else(|| Error::Unsupported {
         feature: "staging manifest",
@@ -162,6 +174,7 @@ pub(crate) fn write_staging_manifest(
         added_tracks: added_targets.len(),
         source,
         outputs,
+        deletions: deletions.to_vec(),
     };
     let encoded = serde_json::to_vec_pretty(&manifest).map_err(|source| Error::Malformed {
         format: "libopod staging manifest",
