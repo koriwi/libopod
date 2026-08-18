@@ -36,7 +36,7 @@ use crate::{
         },
         sqlite::inspect_sqlite_database,
     },
-    BackendKind, Device, Error, IpodPath, Library, MountRoot, PersistentId, Result,
+    BackendKind, ChecksumKind, Device, Error, IpodPath, Library, MountRoot, PersistentId, Result,
     SqliteLibraryFile,
 };
 
@@ -119,6 +119,7 @@ const ITLP_PATH: &str = "iPod_Control/iTunes/iTunes Library.itlp";
 const MAX_LOCATIONS_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CDB_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARTWORK_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CLASSIC_DATABASE_BYTES: u64 = 512 * 1024 * 1024;
 const SQLITE_FILES: [SqliteLibraryFile; 5] = [
     SqliteLibraryFile::Library,
     SqliteLibraryFile::Locations,
@@ -157,23 +158,37 @@ impl<'device> EditSession<'device> {
             feature: "edit sessions",
             reason: "the device profile is unknown".to_owned(),
         })?;
-        if profile.capabilities().backend != BackendKind::SqliteWithBinaryCompanion {
-            return Err(Error::Unsupported {
-                feature: "edit sessions",
-                reason: "only the staged SQLite preview backend is implemented".to_owned(),
-            });
-        }
-        if device.library().is_none() {
-            return Err(Error::Unsupported {
-                feature: "edit sessions",
-                reason: "the authoritative SQLite library is unavailable".to_owned(),
-            });
-        }
-        if !device.evidence().has_firewire_guid() {
-            return Err(Error::Unsupported {
-                feature: "HASHAB staging",
-                reason: "the required signing identity is unavailable".to_owned(),
-            });
+        match profile.capabilities().backend {
+            BackendKind::SqliteWithBinaryCompanion => {
+                if device.library().is_none() {
+                    return Err(Error::Unsupported {
+                        feature: "edit sessions",
+                        reason: "the authoritative SQLite library is unavailable".to_owned(),
+                    });
+                }
+                if !device.evidence().has_firewire_guid() {
+                    return Err(Error::Unsupported {
+                        feature: "HASHAB staging",
+                        reason: "the required signing identity is unavailable".to_owned(),
+                    });
+                }
+            }
+            BackendKind::Binary => {
+                if device.library().is_none() {
+                    return Err(Error::Unsupported {
+                        feature: "edit sessions",
+                        reason: "the classic iTunesDB library is unavailable".to_owned(),
+                    });
+                }
+                if profile.capabilities().checksum == ChecksumKind::Hash58
+                    && !device.evidence().has_firewire_guid()
+                {
+                    return Err(Error::Unsupported {
+                        feature: "HASH58 staging",
+                        reason: "the required signing identity is unavailable".to_owned(),
+                    });
+                }
+            }
         }
         Ok(Self {
             device,
@@ -293,8 +308,150 @@ impl<'device> EditSession<'device> {
         self.stage_preview(destination.as_ref())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn stage_preview(&self, destination: &Path) -> Result<StagedSqliteEdit> {
+        match self
+            .device
+            .profile()
+            .map(|profile| profile.capabilities().backend)
+        {
+            Some(BackendKind::SqliteWithBinaryCompanion) => self.stage_sqlite(destination),
+            Some(BackendKind::Binary) => self.stage_classic(destination),
+            None => Err(Error::Unsupported {
+                feature: "edit staging",
+                reason: "the device profile is unknown".to_owned(),
+            }),
+        }
+    }
+
+    /// Stages a classic (binary `iTunesDB`) edit: copies the database, applies
+    /// the queued removals/additions, re-signs with the profile scheme, and
+    /// writes a manifest whose only output is the `iTunesDB`.
+    #[allow(clippy::too_many_lines)]
+    fn stage_classic(&self, destination: &Path) -> Result<StagedSqliteEdit> {
+        self.device
+            .generation()
+            .verify_unchanged(self.device.mount(), self.device.profile())?;
+        let destination = validate_destination(self.device, destination)?;
+        back_up_generation(self.device, &destination, self.device.generation())?;
+
+        let profile = self.device.profile().ok_or_else(|| Error::Unsupported {
+            feature: "classic staging",
+            reason: "the device profile is unknown".to_owned(),
+        })?;
+        let checksum = profile.capabilities().checksum;
+        let guid = self.device.evidence().firewire_guid();
+
+        let relative = IpodPath::new("iPod_Control/iTunes/iTunesDB")?;
+        let source = self.device.mount().resolve_existing(&relative)?;
+        let mut database = read_limited(&source, MAX_CLASSIC_DATABASE_BYTES, "classic iTunesDB")?;
+
+        let before = self.device.library().ok_or_else(|| Error::Unsupported {
+            feature: "classic staging",
+            reason: "the classic iTunesDB library is unavailable".to_owned(),
+        })?;
+        let resolved = self.resolve_additions(&destination)?;
+        if !self.removals.is_empty() {
+            let removals: Vec<PersistentId> = self.removals.iter().copied().collect();
+            database = crate::storage::binary::remove_classic_tracks(
+                &database,
+                checksum,
+                guid.as_ref(),
+                &removals,
+            )?;
+        }
+        for addition in &resolved {
+            database = crate::storage::binary::add_classic_track(
+                &database,
+                checksum,
+                guid.as_ref(),
+                &classic_addition(addition),
+            )?;
+        }
+
+        let output = destination.join("iTunesDB");
+        write_file_sync(&output, &database)?;
+        let staged_bytes = fs::read(&output)
+            .map_err(|source| io_error("read staged iTunesDB", &output, source))?;
+        let after = Library::read_binary(&staged_bytes, None)?;
+        validate_semantics(before, &after, &self.removals, &resolved)?;
+        if checksum == ChecksumKind::Hash58 {
+            let guid = guid.ok_or_else(|| Error::Unsupported {
+                feature: "HASH58 staging",
+                reason: "the device FireWire GUID is required".to_owned(),
+            })?;
+            if !crate::crypto::hash58::verify(&guid, &staged_bytes) {
+                return Err(Error::Verification {
+                    format: "staged iTunesDB",
+                    reason: "the re-signed HASH58 signature did not verify".to_owned(),
+                });
+            }
+        }
+        self.device
+            .generation()
+            .verify_unchanged(self.device.mount(), self.device.profile())?;
+
+        let removed_tracks: Vec<_> = before
+            .tracks()
+            .iter()
+            .filter(|track| self.removals.contains(&track.id))
+            .collect();
+        let removed_media = removed_tracks
+            .iter()
+            .map(|track| track.location.clone())
+            .collect();
+        let removed_artwork_tracks = removed_tracks
+            .iter()
+            .filter(|track| track.has_artwork)
+            .count();
+        let added_targets: Vec<IpodPath> = resolved
+            .iter()
+            .map(|addition| {
+                IpodPath::new(format!("iPod_Control/Music/{}", addition.media_relative))
+            })
+            .collect::<Result<_>>()?;
+        let deletions = if self.media_policy == MediaDeletionPolicy::Delete {
+            let mut deletions = Vec::new();
+            for track in &removed_tracks {
+                let relative = track.location.clone();
+                let target = self.device.mount().resolve_existing(&relative)?;
+                let (bytes, digest) = fingerprint_host_file(&target)?;
+                deletions.push(ManifestDeletionFile {
+                    target: relative.to_string(),
+                    bytes,
+                    sha256: hex(&digest),
+                });
+            }
+            deletions
+        } else {
+            Vec::new()
+        };
+        let manifest = write_staging_manifest(
+            self.device,
+            &destination,
+            self.device.generation(),
+            self.removals.len(),
+            &added_targets,
+            &deletions,
+        )?;
+        Ok(StagedSqliteEdit {
+            directory: destination,
+            removed_tracks: self.removals.len(),
+            added_tracks: resolved.len(),
+            added_artwork_tracks: 0,
+            added_ithmb: Vec::new(),
+            removed_ithmb: Vec::new(),
+            remaining_tracks: after.track_count(),
+            removed_media,
+            removed_artwork_tracks,
+            added_media: added_targets,
+            deletions,
+            source_generation: self.device.generation().clone(),
+            manifest,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn stage_sqlite(&self, destination: &Path) -> Result<StagedSqliteEdit> {
         self.device
             .generation()
             .verify_unchanged(self.device.mount(), self.device.profile())?;
@@ -415,6 +572,21 @@ impl<'device> EditSession<'device> {
     fn resolve_additions(&self, destination: &Path) -> Result<Vec<ResolvedAddition>> {
         if self.additions.is_empty() {
             return Ok(Vec::new());
+        }
+        let classic = self
+            .device
+            .profile()
+            .is_some_and(|profile| profile.capabilities().backend == BackendKind::Binary);
+        if classic
+            && self
+                .additions
+                .iter()
+                .any(|track| track.reuse_album_art || track.artwork_source.is_some())
+        {
+            return Err(Error::Unsupported {
+                feature: "classic artwork encoding",
+                reason: "classic cover artwork is preserved but not yet written; add tracks without artwork".to_owned(),
+            });
         }
         let existing_pids: BTreeSet<PersistentId> =
             self.device.library().map_or_else(BTreeSet::new, |library| {
@@ -1535,6 +1707,45 @@ fn write_artwork_frames(
         file.sync_all()
             .map_err(|error| io_error("flush staged artwork frame", &output, error))?;
     }
+    Ok(())
+}
+
+/// Maps a resolved addition onto the binary `CdbTrackAddition` used by the
+/// shared `iTunesDB` dataset writers. Classic artwork encoding is not
+/// implemented yet, so `artwork` is always `None`.
+fn classic_addition(addition: &ResolvedAddition) -> CdbTrackAddition {
+    CdbTrackAddition {
+        persistent_id: addition.pid,
+        location: format!(":iPod_Control:Music:{}", addition.media_relative),
+        title: addition.title.clone(),
+        artist: addition.artist.clone(),
+        album: addition.album.clone(),
+        album_artist: addition.album_artist.clone(),
+        genre: addition.genre.clone(),
+        composer: addition.composer.clone(),
+        file_size: u32::try_from(addition.file_size).unwrap_or(u32::MAX),
+        length_ms: addition.length_ms,
+        bitrate: addition.bitrate,
+        sample_rate: addition.sample_rate,
+        track_number: addition.track_number,
+        total_tracks: addition.total_tracks,
+        disc_number: addition.disc_number,
+        total_discs: addition.total_discs,
+        year: addition.year,
+        compilation: addition.compilation,
+        date_mac: addition.date_mac,
+        artwork: None,
+    }
+}
+
+/// Writes a staged output file durably (create, write, sync).
+fn write_file_sync(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file =
+        File::create(path).map_err(|source| io_error("create staged file", path, source))?;
+    file.write_all(bytes)
+        .map_err(|source| io_error("write staged file", path, source))?;
+    file.sync_all()
+        .map_err(|source| io_error("flush staged file", path, source))?;
     Ok(())
 }
 

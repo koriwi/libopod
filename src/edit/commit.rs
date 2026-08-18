@@ -698,21 +698,28 @@ fn verify_bundle(
         feature: "device transaction",
         reason: "the device profile is unknown".to_owned(),
     })?;
-    let artwork_outputs =
-        usize::from(staged.removed_artwork_tracks() > 0 || staged.added_artwork_tracks() > 0)
-            + staged.added_ithmb().len()
-            + staged.removed_ithmb().len();
+    let backend = profile.capabilities().backend;
+    let database_outputs = if backend == crate::device::BackendKind::Binary {
+        // Classic devices: only the iTunesDB is rewritten.
+        1
+    } else {
+        let artwork_outputs =
+            usize::from(staged.removed_artwork_tracks() > 0 || staged.added_artwork_tracks() > 0)
+                + staged.added_ithmb().len()
+                + staged.removed_ithmb().len();
+        7 + artwork_outputs
+    };
     if manifest.profile != profile.key()
         || manifest.removed_tracks != staged.removed_tracks()
         || manifest.added_tracks != staged.added_tracks()
-        || manifest.outputs.len() != 7 + staged.added_tracks() + artwork_outputs
+        || manifest.outputs.len() != database_outputs + staged.added_tracks()
     {
         return Err(Error::Verification {
             format: "staging manifest",
             reason: "bundle profile, operation, or output count is inconsistent".to_owned(),
         });
     }
-    if manifest.outputs.len() != staged.added_media().len() + 7 + artwork_outputs {
+    if manifest.outputs.len() != staged.added_media().len() + database_outputs {
         return Err(Error::Verification {
             format: "staging manifest",
             reason: "media output count is inconsistent".to_owned(),

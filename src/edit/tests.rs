@@ -1181,4 +1181,120 @@ mod tests {
             )
             .unwrap();
     }
+
+    /// Builds a proper `iPod_Control` device tree from the attached Nano 3G
+    /// files (Device/iTunes/Artwork without the wrapper) in a tempdir.
+    fn build_classic_device_from_attachments() -> Option<TempDir> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("files_nano3");
+        if !source.join("iTunes/iTunesDB").is_file() {
+            return None;
+        }
+        let device_dir = tempdir().unwrap();
+        let root = device_dir.path().join("iPod_Control");
+        for folder in ["Device", "iTunes", "Artwork"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            for entry in std::fs::read_dir(source.join(folder)).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), root.join(folder).join(entry.file_name())).unwrap();
+            }
+        }
+        Some(device_dir)
+    }
+
+    #[test]
+    fn classic_removal_and_addition_round_trip_on_the_attached_nano3() {
+        let Some(device_dir) = build_classic_device_from_attachments() else {
+            return;
+        };
+        let device = Device::open(device_dir.path()).unwrap();
+        assert_eq!(device.profile().map(crate::DeviceProfile::key), Some("nano-3g"));
+        assert_eq!(device.library().unwrap().track_count(), 724);
+
+        // Removal staging produces only the iTunesDB output.
+        let track = device.library().unwrap().tracks()[0].clone();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.removed_tracks(), 1);
+        assert_eq!(staged.remaining_tracks(), 723);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
+        assert_eq!(manifest["outputs"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["outputs"][0]["target"], "iPod_Control/iTunes/iTunesDB");
+
+        // Install onto the virtual device (bundle/original) and read back.
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        staged.install(&virtual_device).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 723);
+        let installed = std::fs::read(virtual_root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        let guid = reopened.evidence().firewire_guid().expect("guid");
+        assert!(
+            crate::crypto::hash58::verify(&guid, &installed),
+            "installed classic iTunesDB does not verify with HASH58"
+        );
+
+        // Addition staging: one no-artwork track. The attached files carry no
+        // Music tree, so create the media directories the allocator scans.
+        let device = Device::open(device_dir.path()).unwrap();
+        for index in 0..40 {
+            std::fs::create_dir_all(
+                device_dir
+                    .path()
+                    .join(format!("iPod_Control/Music/F{index:02}")),
+            )
+            .unwrap();
+        }
+        let source = device_dir.path().join("source.mp3");
+        std::fs::write(&source, b"not a real mp3, but libpod does not decode audio").unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "Classic Added".to_owned(),
+            artist: Some("Classic Artist".to_owned()),
+            album: Some("Classic Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2007,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 128,
+            sample_rate: 44100,
+            length_ms: 60_000,
+            compilation: false,
+            reuse_album_art: false,
+            artwork_source: None,
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(staged.remaining_tracks(), 725);
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        staged.install(&virtual_device).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+        let installed = std::fs::read(virtual_root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        let guid = reopened.evidence().firewire_guid().expect("guid");
+        assert!(
+            crate::crypto::hash58::verify(&guid, &installed),
+            "installed classic iTunesDB (after add) does not verify with HASH58"
+        );
+        let added = reopened
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| track.title == "Classic Added")
+            .expect("added track present");
+        assert_eq!(added.artist, "Classic Artist");
+        assert!(added.location.as_str().starts_with("iPod_Control/Music/"));
+    }
 }

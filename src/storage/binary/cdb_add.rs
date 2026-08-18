@@ -130,8 +130,13 @@ pub(crate) fn add_track_to_cdb(
 
     let (album_id, album_is_new) = resolve_album(&datasets[album_dataset], addition)?;
 
-    let (existing_tracks, rewritten_tracks, next_track_id, artist_id_ref) =
-        rewrite_track_dataset(&datasets[track_dataset], addition, db_id_2, album_id)?;
+    let (existing_tracks, rewritten_tracks, next_track_id, artist_id_ref) = rewrite_track_dataset(
+        &datasets[track_dataset],
+        addition,
+        db_id_2,
+        album_id,
+        MHIT_HEADER_SIZE,
+    )?;
     datasets[track_dataset] = rewritten_tracks;
 
     if album_is_new {
@@ -152,7 +157,7 @@ pub(crate) fn add_track_to_cdb(
 
 /// A parsed existing track with everything needed for index rebuilds.
 #[derive(Clone, Debug)]
-struct ParsedTrack {
+pub(super) struct ParsedTrack {
     position: u32,
     persistent_id: PersistentId,
     track_id: u32,
@@ -185,7 +190,9 @@ enum SortField {
 
 fn parse_track(chunk: &[u8], position: u32) -> Result<ParsedTrack> {
     let header = chunk_header(chunk, 0, b"mhit")?;
-    if header.header_length < MHIT_HEADER_SIZE {
+    // The header size varies by firmware version (Nano 7G 0x270, classic
+    // 0x248); require only the highest field read below (artist id ref).
+    if header.header_length < MHIT_ARTIST_ID_REF + 4 {
         return Err(malformed(
             4,
             "mhit header is too short for index rebuilding",
@@ -306,11 +313,12 @@ pub(super) fn parse_string_mhod(
     )))
 }
 
-fn rewrite_track_dataset(
+pub(super) fn rewrite_track_dataset(
     dataset: &[u8],
     addition: &CdbTrackAddition,
     db_id_2: u64,
     album_id: u32,
+    mhit_header_size: usize,
 ) -> Result<(Vec<ParsedTrack>, Vec<u8>, u32, u32)> {
     let header = chunk_header(dataset, 0, b"mhsd")?;
     let list = header.header_length;
@@ -354,6 +362,7 @@ fn rewrite_track_dataset(
         next_track_id,
         album_id,
         artist_id_ref,
+        mhit_header_size,
     ));
     write_u32(
         &mut output,
@@ -379,7 +388,7 @@ fn resolve_artist_id_ref(tracks: &[ParsedTrack], addition: &CdbTrackAddition) ->
     matching.unwrap_or_else(|| next.saturating_add(1))
 }
 
-fn resolve_album(dataset: &[u8], addition: &CdbTrackAddition) -> Result<(u32, bool)> {
+pub(super) fn resolve_album(dataset: &[u8], addition: &CdbTrackAddition) -> Result<(u32, bool)> {
     let albums = parse_albums(dataset)?;
     let album_name = addition.album.clone().unwrap_or_default();
     let album_artist = addition
@@ -421,7 +430,11 @@ fn parse_albums(dataset: &[u8]) -> Result<Vec<ParsedAlbum>> {
     Ok(albums)
 }
 
-fn append_album(dataset: &[u8], album_id: u32, addition: &CdbTrackAddition) -> Result<Vec<u8>> {
+pub(super) fn append_album(
+    dataset: &[u8],
+    album_id: u32,
+    addition: &CdbTrackAddition,
+) -> Result<Vec<u8>> {
     let header = chunk_header(dataset, 0, b"mhsd")?;
     let list = header.header_length;
     require_magic(dataset, list, b"mhla")?;
@@ -516,7 +529,7 @@ fn find_album<'a>(albums: &'a [ParsedAlbum], name: &str, artist: &str) -> Option
     }
 }
 
-fn rewrite_master_playlist_dataset(
+pub(super) fn rewrite_master_playlist_dataset(
     dataset: &[u8],
     tracks: &[ParsedTrack],
     addition: &CdbTrackAddition,
@@ -943,6 +956,7 @@ fn build_mhit(
     track_id: u32,
     album_id: u32,
     artist_id_ref: u32,
+    header_size: usize,
 ) -> Vec<u8> {
     let artwork = addition.artwork;
     let mhod_fields = [
@@ -967,13 +981,13 @@ fn build_mhit(
     if child_count < 2 {
         return Vec::new();
     }
-    let total = MHIT_HEADER_SIZE + mhods.len();
-    let mut header = vec![0_u8; MHIT_HEADER_SIZE];
+    let total = header_size + mhods.len();
+    let mut header = vec![0_u8; header_size];
     header[..4].copy_from_slice(b"mhit");
     write_u32(
         &mut header,
         4,
-        u32::try_from(MHIT_HEADER_SIZE).unwrap_or(u32::MAX),
+        u32::try_from(header_size).unwrap_or(u32::MAX),
     )
     .ok();
     write_u32(&mut header, 8, u32::try_from(total).unwrap_or(u32::MAX)).ok();

@@ -135,7 +135,7 @@ pub(crate) fn write_staging_manifest(
         });
     }
     let mut outputs = Vec::new();
-    for (staged, target) in output_targets(destination)? {
+    for (staged, target) in output_targets(destination, profile.capabilities().backend)? {
         let path = destination.join(&staged);
         let (bytes, digest) = fingerprint_host_file(&path)?;
         outputs.push(ManifestOutputFile {
@@ -218,7 +218,17 @@ pub(crate) fn read_staging_manifest(path: &Path) -> Result<StagingManifest> {
     Ok(manifest)
 }
 
-fn output_targets(destination: &Path) -> Result<Vec<(String, IpodPath)>> {
+fn output_targets(
+    destination: &Path,
+    backend: crate::device::BackendKind,
+) -> Result<Vec<(String, IpodPath)>> {
+    if backend == crate::device::BackendKind::Binary {
+        // Classic devices: the iTunesDB is the only rewritten database.
+        return Ok(vec![(
+            "iTunesDB".to_owned(),
+            IpodPath::new("iPod_Control/iTunes/iTunesDB")?,
+        )]);
+    }
     let mut targets = Vec::with_capacity(8);
     for file in SqliteLibraryFile::ALL {
         targets.push((

@@ -75,22 +75,23 @@ impl DeviceProfile {
 
 /// USB product IDs for the iPod Nano generations (fallback identity when
 /// `SysInfo` model fields are missing or ambiguous).
-const NANO_PRODUCT_IDS: [(u16, u8); 7] = [
-    (0x1240, 1),
-    (0x1242, 2),
-    (0x1260, 3),
-    (0x1262, 4),
-    (0x1263, 5),
-    (0x1265, 6),
-    (0x1267, 7),
+/// Normal-mode USB product IDs for the iPod Nano generations, per iOpenPod's
+/// `USB_PID_TO_MODEL` (verified on real devices where marked). Nano 1G has no
+/// clean normal-mode PID; it is identified via `SysInfo`/`FamilyID`/serial.
+const NANO_PRODUCT_IDS: [(u16, u8); 6] = [
+    (0x1260, 2),
+    (0x1262, 3), // verified: the operator's Nano 3G
+    (0x1263, 4),
+    (0x1265, 5),
+    (0x1266, 6),
+    (0x1267, 7), // verified: the Nano 7G backup
 ];
 
 /// `SysInfoExtended` `FamilyID` values for the Nano generations.
 ///
 /// Verified on real devices: 12 = Nano 3G, 18 = Nano 7G. The remaining
-/// entries come from the classic libgpod device table and are provisional
-/// until confirmed against hardware.
-const NANO_FAMILY_IDS: [(u16, u8); 6] = [(6, 1), (8, 2), (12, 3), (14, 4), (16, 5), (18, 7)];
+/// entries are provisional until confirmed against hardware.
+const NANO_FAMILY_IDS: [(u16, u8); 2] = [(12, 3), (14, 4)];
 
 /// Parses the `SysInfo` generation field into a Nano generation number.
 fn nano_generation(evidence: &IdentityEvidence) -> Option<u8> {

@@ -12,7 +12,7 @@ const MHIP_TRACK_ID: usize = 0x18;
 const MHIP_PERSISTENT_ID: usize = 0x2c;
 
 #[derive(Clone, Copy, Debug)]
-struct RemovedTrack {
+pub(super) struct RemovedTrack {
     persistent_id: PersistentId,
     track_id: u32,
     position: u32,
@@ -107,7 +107,7 @@ pub(super) fn split_datasets(payload: &[u8], expected: usize) -> Result<Vec<Vec<
     Ok(datasets)
 }
 
-fn rewrite_track_dataset(
+pub(super) fn rewrite_track_dataset(
     dataset: &[u8],
     removals: &[PersistentId],
 ) -> Result<(Vec<u8>, Vec<RemovedTrack>)> {
@@ -168,7 +168,10 @@ fn rewrite_track_dataset(
     Ok((output, removed))
 }
 
-fn rewrite_playlist_dataset(dataset: &[u8], removed: &[RemovedTrack]) -> Result<Vec<u8>> {
+pub(super) fn rewrite_playlist_dataset(
+    dataset: &[u8],
+    removed: &[RemovedTrack],
+) -> Result<Vec<u8>> {
     let header = chunk_header(dataset, 0, b"mhsd")?;
     let list = header.header_length;
     require_magic(dataset, list, b"mhlp")?;
