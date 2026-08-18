@@ -1,0 +1,13 @@
+# Build output
+/target/
+
+# Private real-device backups and fixtures (contain personal metadata/device IDs)
+/backup_7g/
+/tests/fixtures-private/
+
+# Local editor/OS files
+.DS_Store
+*.swp
+
+# Optional local environment overrides
+.env
