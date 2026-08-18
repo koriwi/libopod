@@ -1,13 +1,21 @@
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, path::Path};
 
     use rusqlite::Connection;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
-    use super::edit_staged_databases;
-    use crate::{PersistentId, SqliteLibraryFile};
+    use super::{
+        commit::{
+            install_staged_removal, recover_transaction, FailureMode, TRANSACTION_PATH,
+        },
+        edit_staged_databases, StagedSqliteEdit,
+    };
+    use crate::{
+        Device, Error, MountRoot, PersistentId, SqliteLibraryFile,
+        NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+    };
 
     #[test]
     fn removes_direct_references_and_repairs_derived_rows() {
@@ -32,6 +40,89 @@ mod tests {
         assert_eq!(scalar(&dynamic, "SELECT COUNT(*) FROM item_stats"), 1);
         let genius = Connection::open(directory.path().join("Genius.itdb")).unwrap();
         assert_eq!(scalar(&genius, "SELECT COUNT(*) FROM genius_metadata"), 0);
+    }
+
+    #[test]
+    fn installs_and_reads_back_a_virtual_nano_noop() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(fixture).unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = device.stage_noop_preview(bundle.path()).unwrap();
+        assert_eq!(staged.removed_tracks(), 0);
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        assert!(virtual_device
+            .install_noop_hardware_test(&staged, "not confirmed")
+            .is_err());
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        virtual_device
+            .install_noop_hardware_test(&staged, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION)
+            .unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn installs_and_reads_back_a_virtual_nano_removal() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(&virtual_device, &staged, FailureMode::RollBack).unwrap();
+
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+    }
+
+    #[test]
+    fn recovers_an_interrupted_virtual_nano_removal() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        let error = install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(3),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Verification { .. }));
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    fn stage_private_no_artwork_removal() -> Option<(TempDir, StagedSqliteEdit)> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return None;
+        }
+        let device = Device::open(fixture).unwrap();
+        let track = device
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| !track.has_artwork)
+            .unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.removed_artwork_tracks(), 0);
+        Some((bundle, staged))
     }
 
     fn scalar(connection: &Connection, sql: &str) -> i64 {

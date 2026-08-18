@@ -10,8 +10,9 @@ device evidence, safe mount-relative paths, structural inspection of
 a safe-Rust HASHAB implementation validated by all 100 public vectors and the
 private Nano's CBK signature. Playlist reading and schema-preserving
 `SQLite`-only removal previews are available in separate empty host directories;
-these previews deliberately cannot be installed or committed. libopod does not
-yet write to devices.
+these previews deliberately cannot be installed manually. The only enabled
+device mutation is an explicitly confirmed, byte-identical Nano 7G transaction
+qualification gate; semantic library writes remain disabled.
 
 See [`plan.md`](plan.md) for scope, architecture, safety rules, and the hardware
 qualification matrix.
@@ -25,9 +26,10 @@ cargo run --example opod-inspect -- /path/to/ipod/mount
 The inspector reports structural information and presence flags only. It does
 not print product serials, `FireWire` GUIDs, or track metadata.
 
-A mounted iPod can also drive a host-only removal preview. See
-[`HARDWARE_TESTING.md`](HARDWARE_TESTING.md). Never install the preview output
-on a device.
+A mounted iPod can also drive a host-only removal preview or the narrowly gated
+Nano 7G no-op transaction test. See
+[`HARDWARE_TESTING.md`](HARDWARE_TESTING.md). Never install preview output
+manually.
 
 ## License
 

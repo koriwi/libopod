@@ -177,8 +177,24 @@ fn stages_a_schema_preserving_removal_outside_the_private_fixture() {
     assert_eq!(staged.remaining_tracks(), 725);
     assert_eq!(staged.removed_media(), &[removed.location]);
     assert_eq!(staged.source_generation(), device.generation());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
+    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["profile"], "nano-7g");
+    assert_eq!(manifest["removed_tracks"], 1);
+    assert_eq!(manifest["source"].as_array().unwrap().len(), 15);
+    assert_eq!(manifest["outputs"].as_array().unwrap().len(), 7);
     let staged_cdb = staging.path().join("iTunesCDB");
     assert_eq!(cdb_track_count(&staged_cdb), 725);
+    assert_eq!(
+        std::fs::read(
+            staging
+                .path()
+                .join("original/iPod_Control/iTunes/iTunesCDB")
+        )
+        .unwrap(),
+        original_cdb
+    );
 
     for file in SqliteLibraryFile::ALL {
         let source = itlp.join(file.file_name());

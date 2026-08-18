@@ -15,7 +15,10 @@ pub use device::{
     ArtworkFormatProfile, BackendKind, ChecksumKind, Device, DeviceCapabilities, DeviceInspection,
     DeviceProfile, EvidenceSource, IdentityEvidence, Sourced, VolumeFormat,
 };
-pub use edit::{EditSession, FileFingerprint, GenerationFingerprint, StagedSqliteEdit};
+pub use edit::{
+    recover_interrupted_transaction, EditSession, FileFingerprint, GenerationFingerprint,
+    StagedSqliteEdit, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+};
 pub use error::{Error, Result};
 pub use fs::{IpodPath, MountRoot};
 pub use library::{Library, PersistentId, Playlist, Track};

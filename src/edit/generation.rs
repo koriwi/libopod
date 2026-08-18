@@ -52,33 +52,11 @@ impl GenerationFingerprint {
         for path in paths {
             if mount.contains(&path)? {
                 let host = mount.resolve_existing(&path)?;
-                let metadata = std::fs::metadata(&host)
-                    .map_err(|source| io_error("inspect generation input", &host, source))?;
-                if !metadata.is_file() {
-                    return Err(Error::Verification {
-                        format: "device generation",
-                        reason: format!("{} is not a regular file", path.as_str()),
-                    });
-                }
-                let mut reader = BufReader::new(
-                    File::open(&host)
-                        .map_err(|source| io_error("open generation input", &host, source))?,
-                );
-                let mut hasher = Sha256::new();
-                let mut buffer = vec![0_u8; 64 * 1024];
-                loop {
-                    let read = reader
-                        .read(&mut buffer)
-                        .map_err(|source| io_error("hash generation input", &host, source))?;
-                    if read == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..read]);
-                }
+                let (bytes, sha256) = fingerprint_host_file(&host)?;
                 files.push(FileFingerprint {
                     path,
-                    bytes: Some(metadata.len()),
-                    sha256: Some(hasher.finalize().into()),
+                    bytes: Some(bytes),
+                    sha256: Some(sha256),
                 });
             } else {
                 files.push(FileFingerprint {
@@ -111,6 +89,32 @@ impl GenerationFingerprint {
         }
         Ok(())
     }
+}
+
+pub(crate) fn fingerprint_host_file(path: &std::path::Path) -> Result<(u64, [u8; 32])> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|source| io_error("inspect fingerprint input", path, source))?;
+    if !metadata.is_file() {
+        return Err(Error::Verification {
+            format: "file fingerprint",
+            reason: format!("{} is not a regular file", path.display()),
+        });
+    }
+    let mut reader = BufReader::new(
+        File::open(path).map_err(|source| io_error("open fingerprint input", path, source))?,
+    );
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|source| io_error("hash fingerprint input", path, source))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((metadata.len(), hasher.finalize().into()))
 }
 
 fn required_paths(profile: Option<&DeviceProfile>) -> Result<Vec<IpodPath>> {

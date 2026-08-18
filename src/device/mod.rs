@@ -35,7 +35,20 @@ impl Device {
     /// is malformed or contradictory, or a detected database fails structural
     /// or integrity validation.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_impl(path.as_ref(), false)
+    }
+
+    pub(crate) fn open_during_transaction(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_impl(path.as_ref(), true)
+    }
+
+    fn open_impl(path: &Path, allow_transaction: bool) -> Result<Self> {
         let mount = MountRoot::open(path)?;
+        if !allow_transaction {
+            if let Some(path) = crate::edit::pending_transaction(&mount)? {
+                return Err(crate::Error::RecoveryRequired { path });
+            }
+        }
         let evidence = IdentityEvidence::read_from(&mount)?;
         let profile = profile::resolve(&evidence)?;
         let signing_guid = evidence.firewire_guid();
@@ -87,6 +100,43 @@ impl Device {
     #[must_use]
     pub const fn generation(&self) -> &GenerationFingerprint {
         &self.generation
+    }
+
+    /// Builds a byte-identical host bundle for exercising transaction safety.
+    ///
+    /// This method never modifies the device, and its output must not be
+    /// installed manually.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if staging preconditions, backups, fingerprints, or
+    /// output validation fail.
+    pub fn stage_noop_preview(
+        &self,
+        destination: impl AsRef<Path>,
+    ) -> Result<crate::StagedSqliteEdit> {
+        EditSession::new(self)?.stage_noop_preview(destination)
+    }
+
+    /// Installs a byte-identical Nano 7G bundle as a hardware safety test.
+    ///
+    /// This qualification gate creates verified on-device backups and a
+    /// transaction journal, replaces only the seven database companion files
+    /// with byte-identical copies, reads the library back, and rolls back a
+    /// reported failure. It does not add, remove, or alter music or artwork.
+    /// Use [`crate::recover_interrupted_transaction`] after a power loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before mutation unless `staged` is a verified no-op
+    /// bundle for this exact open generation and `confirmation` exactly equals
+    /// [`crate::NANO7_NOOP_HARDWARE_TEST_CONFIRMATION`].
+    pub fn install_noop_hardware_test(
+        &self,
+        staged: &crate::StagedSqliteEdit,
+        confirmation: &str,
+    ) -> Result<()> {
+        crate::edit::install_noop_hardware_test(self, staged, confirmation)
     }
 
     /// Starts an in-memory edit session without modifying the device.

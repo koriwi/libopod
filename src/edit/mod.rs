@@ -1,4 +1,6 @@
+mod commit;
 mod generation;
+mod manifest;
 
 pub use generation::{FileFingerprint, GenerationFingerprint};
 
@@ -11,6 +13,9 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, Transaction};
 
+pub(crate) use commit::{install_noop_hardware_test, pending_transaction};
+
+use self::manifest::{back_up_generation, write_staging_manifest};
 use crate::{
     error::io_error,
     fs::read_limited,
@@ -18,8 +23,12 @@ use crate::{
         binary::{build_hashab_cbk, remove_tracks_from_cdb, verify_cbk},
         sqlite::inspect_sqlite_database,
     },
-    BackendKind, Device, Error, IpodPath, Library, PersistentId, Result, SqliteLibraryFile,
+    BackendKind, Device, Error, IpodPath, Library, MountRoot, PersistentId, Result,
+    SqliteLibraryFile,
 };
+
+/// Exact acknowledgement required by the Nano 7G no-op hardware write gate.
+pub const NANO7_NOOP_HARDWARE_TEST_CONFIRMATION: &str = commit::NOOP_CONFIRMATION;
 
 const ITLP_PATH: &str = "iPod_Control/iTunes/iTunes Library.itlp";
 const MAX_LOCATIONS_BYTES: u64 = 512 * 1024 * 1024;
@@ -110,9 +119,10 @@ impl<'device> EditSession<'device> {
     /// Unknown `SQLite` schema objects and unrelated binary chunks remain in
     /// place. The result is reparsed and integrity checked.
     ///
-    /// This preview deliberately excludes `ArtworkDB`, media-file deletion,
-    /// manifests, and recovery state. It is therefore **not safe to install on
-    /// an iPod**.
+    /// The host bundle includes verified copies of every generation input and
+    /// a durable manifest. It deliberately excludes `ArtworkDB` mutation,
+    /// media-file deletion, an on-device transaction journal, and recovery.
+    /// It is therefore **not safe to install on an iPod**.
     ///
     /// # Errors
     ///
@@ -126,10 +136,22 @@ impl<'device> EditSession<'device> {
                 reason: "queue at least one removal before staging".to_owned(),
             });
         }
+        self.stage_preview(destination.as_ref())
+    }
+
+    pub(crate) fn stage_noop_preview(
+        &self,
+        destination: impl AsRef<Path>,
+    ) -> Result<StagedSqliteEdit> {
+        self.stage_preview(destination.as_ref())
+    }
+
+    fn stage_preview(&self, destination: &Path) -> Result<StagedSqliteEdit> {
         self.device
             .generation()
             .verify_unchanged(self.device.mount(), self.device.profile())?;
-        let destination = validate_destination(self.device, destination.as_ref())?;
+        let destination = validate_destination(self.device, destination)?;
+        back_up_generation(self.device, &destination, self.device.generation())?;
         let source = self
             .device
             .mount()
@@ -140,7 +162,9 @@ impl<'device> EditSession<'device> {
             feature: "SQLite staging",
             reason: "the source library is unavailable".to_owned(),
         })?;
-        edit_staged_databases(&destination, &self.removals)?;
+        if !self.removals.is_empty() {
+            edit_staged_databases(&destination, &self.removals)?;
+        }
 
         let guid = self
             .device
@@ -150,8 +174,12 @@ impl<'device> EditSession<'device> {
                 feature: "HASHAB staging",
                 reason: "the required signing identity is unavailable".to_owned(),
             })?;
-        write_and_verify_cbk(&destination, guid)?;
-        write_cdb_preview(self.device, &destination, guid, &self.removals)?;
+        if self.removals.is_empty() {
+            copy_unchanged_companions(&source, self.device, &destination)?;
+        } else {
+            write_and_verify_cbk(&destination, guid)?;
+            write_cdb_preview(self.device, &destination, guid, &self.removals)?;
+        }
         validate_staged_set(&destination)?;
 
         let after = Library::read_sqlite(
@@ -162,19 +190,34 @@ impl<'device> EditSession<'device> {
         self.device
             .generation()
             .verify_unchanged(self.device.mount(), self.device.profile())?;
+        let manifest = write_staging_manifest(
+            self.device,
+            &destination,
+            self.device.generation(),
+            self.removals.len(),
+        )?;
 
-        let removed_media = before
+        let removed_tracks: Vec<_> = before
             .tracks()
             .iter()
             .filter(|track| self.removals.contains(&track.id))
+            .collect();
+        let removed_media = removed_tracks
+            .iter()
             .map(|track| track.location.clone())
             .collect();
+        let removed_artwork_tracks = removed_tracks
+            .iter()
+            .filter(|track| track.has_artwork)
+            .count();
         Ok(StagedSqliteEdit {
             directory: destination,
             removed_tracks: self.removals.len(),
             remaining_tracks: after.track_count(),
             removed_media,
+            removed_artwork_tracks,
             source_generation: self.device.generation().clone(),
+            manifest,
         })
     }
 }
@@ -182,14 +225,16 @@ impl<'device> EditSession<'device> {
 /// Validated output from a SQLite/CDB edit preview.
 ///
 /// This output is intentionally incomplete and cannot be committed to a
-/// device until binary companion, artwork, and recovery support is added.
+/// device until artwork and on-device recovery support is added.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedSqliteEdit {
     directory: PathBuf,
     removed_tracks: usize,
     remaining_tracks: usize,
     removed_media: Vec<IpodPath>,
+    removed_artwork_tracks: usize,
     source_generation: GenerationFingerprint,
+    manifest: PathBuf,
 }
 
 impl StagedSqliteEdit {
@@ -218,12 +263,43 @@ impl StagedSqliteEdit {
         &self.removed_media
     }
 
+    /// Returns how many removals still require `ArtworkDB` handling.
+    #[must_use]
+    pub const fn removed_artwork_tracks(&self) -> usize {
+        self.removed_artwork_tracks
+    }
+
     /// Returns the exact source generation that must still match before any
     /// future installation attempt.
     #[must_use]
     pub const fn source_generation(&self) -> &GenerationFingerprint {
         &self.source_generation
     }
+
+    /// Returns the durable, self-verified host staging manifest.
+    #[must_use]
+    pub fn manifest(&self) -> &Path {
+        &self.manifest
+    }
+}
+
+/// Recovers or cleans up an interrupted libopod transaction.
+///
+/// This operation restores verified on-device backups when installation did
+/// not reach its committed state. A committed but interrupted cleanup only
+/// removes the verified transaction directory.
+///
+/// # Errors
+///
+/// Returns an error without changing live files if the journal, volume
+/// identity inputs, backups, or current interrupted state do not verify.
+pub fn recover_interrupted_transaction(path: impl AsRef<Path>) -> Result<bool> {
+    let mount = MountRoot::open(path)?;
+    if commit::pending_transaction(&mount)?.is_none() {
+        return Ok(false);
+    }
+    commit::recover_transaction(&mount)?;
+    Ok(true)
 }
 
 fn validate_destination(device: &Device, supplied: &Path) -> Result<PathBuf> {
@@ -273,6 +349,23 @@ fn copy_sqlite_set(source: &Path, destination: &Path) -> Result<()> {
         fs::copy(&source_file, &destination_file)
             .map_err(|error| io_error("copy SQLite file to staging", source_file, error))?;
     }
+    Ok(())
+}
+
+fn copy_unchanged_companions(
+    itlp_source: &Path,
+    device: &Device,
+    destination: &Path,
+) -> Result<()> {
+    let cbk_source = itlp_source.join("Locations.itdb.cbk");
+    let cbk_output = destination.join("Locations.itdb.cbk");
+    fs::copy(&cbk_source, &cbk_output)
+        .map_err(|source| io_error("copy unchanged CBK to staging", &cbk_source, source))?;
+    let cdb_relative = IpodPath::new("iPod_Control/iTunes/iTunesCDB")?;
+    let cdb_source = device.mount().resolve_existing(&cdb_relative)?;
+    let cdb_output = destination.join("iTunesCDB");
+    fs::copy(&cdb_source, &cdb_output)
+        .map_err(|source| io_error("copy unchanged CDB to staging", &cdb_source, source))?;
     Ok(())
 }
 

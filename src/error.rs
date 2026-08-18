@@ -59,6 +59,10 @@ pub enum Error {
         reason: String,
     },
 
+    /// An interrupted libopod transaction requires explicit recovery.
+    #[error("an interrupted libopod transaction exists at `{path}`; recover it before opening the device")]
+    RecoveryRequired { path: PathBuf },
+
     /// An edit referred to a track that is not in the opened library.
     #[error("the requested track is not present in the opened iPod library")]
     TrackNotFound,
