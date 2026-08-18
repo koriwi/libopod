@@ -6,11 +6,17 @@ operator confirmation that identifies the mounted volume.
 The initial Nano 7G backup at `backup_7g/` is private and immutable. It is a
 file-level development input, not a write target.
 
-## Current gate: host-only removal preview
+## Current gate: reused-album-art addition (gate 5)
 
-The current edit stage can read a mounted iPod and write modified SQLite and
-signed CDB copies to separate host storage. It does not write to the iPod.
-Prefer a read-only mount, create an empty directory outside the mount, and run:
+Gates 1–4 (no-op, no-artwork removal, no-artwork addition, artwork-bearing
+removal) have passed on hardware. The device is at 725 tracks / 703
+ArtworkDB records. Gate 5 adds one track whose album already has artwork and
+validates the reuse path end to end.
+
+The edit stage can read a mounted iPod and write modified SQLite and signed
+CDB copies to separate host storage. It does not write to the iPod unless an
+explicit hardware-gate command with the confirmation phrase is used.
+Prefer a read-only mount; create an empty directory outside the mount.
 
 ```console
 cargo run --release --example opod-stage-remove -- /path/to/ipod list
@@ -186,6 +192,24 @@ Stop if the firmware or Apple software requests a restore. Media and artwork
 slot deletion remain disabled until later gates pass. The full matrix is
 specified in `plan.md` sections 10 and 12.
 
+### Gate 4 result
+
+Passed on hardware 2025-08-18: one artwork-bearing track removed. `ArtworkDB`
+records 704 → 703, tracks 726 → 725, media file retained as an orphan, `.ithmb`
+slot payloads retained as unreferenced data. CLI and `opod-inspect` agreed;
+SQLite/CBK valid, CDB HASHAB signature `Some(Valid)`.
+
+Note: this run also exposed two device-state tolerances that were fixed
+before gate 5 could stage (both host-side; the device was never at risk):
+
+- The master playlist's firmware-rewritten mhips embed a type-100 position
+  mhod child; the firmware truncates the trailing mhip to 112 bytes while the
+  embedded mhod still claims 44. The mhip child walk now tolerates the
+  truncation and reads the position at +24 (standard) or +16 (truncated).
+- The gate-3-added album on the device still carries the pre-gap string mhod
+  layout (data at +32, claimed total 40+len vs 32+len actual). The string
+  mhod parser now detects both layouts and walks by the real end.
+
 ## Nano 7G gate 5: addition with reused album artwork
 
 Adds one track whose album already exists on the device with artwork; the new
@@ -199,8 +223,9 @@ cargo run --release --example opod-hardware-test -- \
 ```
 
 ALBUM must already exist on the device with artwork (e.g. any existing album).
-Expect one more track, the same artwork as its album-mates, 705 ArtworkDB
-records, valid signatures, and no restore warning after reboot.
+Expect one more track (726 total), the same artwork as its album-mates, 704
+ArtworkDB records (703 + the new track's reused record), valid signatures,
+and no restore warning after reboot.
 
 ## Nano 7G gate 6: addition with new encoded cover art
 
@@ -214,6 +239,6 @@ cargo run --release --example opod-hardware-test -- \
   'I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH NEW COVER ART'
 ```
 
-Expect one more track, 705 ArtworkDB records, the four `.ithmb` files each one
-slot longer, the new artwork visible in Now Playing/browse, valid signatures,
-and no restore warning after reboot.
+Expect one more track (726 total), 704 ArtworkDB records, the four `.ithmb`
+files each one slot longer, the new artwork visible in Now Playing/browse,
+valid signatures, and no restore warning after reboot.

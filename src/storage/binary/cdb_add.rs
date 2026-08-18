@@ -194,12 +194,14 @@ fn parse_track(chunk: &[u8], position: u32) -> Result<ParsedTrack> {
     let mut strings = HashMap::new();
     let mut offset = header.header_length;
     for _ in 0..usize_value(read_u32(chunk, MHIT_CHILD_COUNT)?, MHIT_CHILD_COUNT)? {
-        let child = chunk_header(chunk, offset, b"mhod")?;
-        let mhod_type = read_u32(chunk, offset + 12)?;
-        if let Some(text) = parse_string_mhod(chunk, offset)? {
-            strings.insert(mhod_type, text);
+        let (mhod_type, claimed_end, legacy) = mhod_child(chunk, offset)?;
+        match parse_string_mhod(chunk, offset, legacy)? {
+            Some((text, real_end)) => {
+                strings.insert(mhod_type, text);
+                offset = real_end;
+            }
+            None => offset = claimed_end,
         }
-        offset = child.end;
     }
     if offset != chunk.len() {
         return Err(malformed(offset, "trailing bytes after mhit children"));
@@ -233,25 +235,71 @@ fn string_or(strings: &HashMap<u32, String>, mhod_type: u32) -> String {
     strings.get(&mhod_type).cloned().unwrap_or_default()
 }
 
-fn parse_string_mhod(chunk: &[u8], offset: usize) -> Result<Option<String>> {
-    let header = chunk_header(chunk, offset, b"mhod")?;
-    let body = offset + header.header_length;
-    if chunk.len().saturating_sub(body) < 16 {
+/// Parses a string `mhod` at `offset`, returning the string and the mhod's
+/// real end.
+///
+/// The real end may be shorter than the claimed total: string mhods written
+/// by the pre-gap Nano 7G writer (before the 8-byte gap fix) claim
+/// `40 + len` bytes but store only `32 + len`, so walking by the claimed
+/// total misaligns the next child. Callers must advance by the returned end.
+/// Reads an `mhod` child at `offset` leniently, returning its type, its
+/// claimed end (which may exceed the parent for legacy string mhods), and
+/// whether it uses the legacy pre-gap string layout.
+fn mhod_child(chunk: &[u8], offset: usize) -> Result<(u32, usize, bool)> {
+    require_magic(chunk, offset, b"mhod")?;
+    let header_length = usize_value(read_u32(chunk, offset + 4)?, offset + 4)?;
+    let total_length = usize_value(read_u32(chunk, offset + 8)?, offset + 8)?;
+    if header_length < 12 || total_length < header_length {
+        return Err(malformed(offset + 4, "invalid chunk lengths"));
+    }
+    let mhod_type = read_u32(chunk, offset + 12)?;
+    // Legacy layout (pre-gap writer): encoding at +16 (and legacy unk at
+    // +24). Current layout: 8-byte gap at +16..+24, encoding at +24.
+    let legacy = read_u32(chunk, offset + 16).ok() == Some(1)
+        && read_u32(chunk, offset + 24).ok() == Some(1);
+    Ok((mhod_type, offset + total_length, legacy))
+}
+
+/// Parses a string `mhod` at `offset`, returning the string and the mhod's
+/// real end.
+///
+/// The real end may be shorter than the claimed total: string mhods written
+/// by the pre-gap Nano 7G writer claim `40 + len` bytes but store only
+/// `32 + len`, so walking by the claimed total misaligns the next child.
+/// Callers must advance by the returned end.
+fn parse_string_mhod(chunk: &[u8], offset: usize, legacy: bool) -> Result<Option<(String, usize)>> {
+    let (encoding_offset, length_offset, data_offset) = if legacy {
+        (offset + 16, offset + 20, offset + 32)
+    } else {
+        (offset + 24, offset + 28, offset + 40)
+    };
+    if chunk.len().saturating_sub(encoding_offset) < 4 {
         return Ok(None);
     }
-    let encoding = read_u32(chunk, body)?;
-    let byte_length = usize_value(read_u32(chunk, body + 4)?, body + 4)?;
+    let encoding = read_u32(chunk, encoding_offset)?;
     if encoding != 1 {
         return Ok(None);
     }
-    let data = chunk
-        .get(body + 16..body + 16 + byte_length)
-        .ok_or_else(|| malformed(body + 16, "string MHOD length exceeds its chunk"))?;
+    let byte_length = usize_value(read_u32(chunk, length_offset)?, length_offset)?;
+    let Some(data) = chunk.get(data_offset..data_offset + byte_length) else {
+        if legacy {
+            // An implausible length means a non-string mhod was misdetected;
+            // treat it as not a string instead of failing the parse.
+            return Ok(None);
+        }
+        return Err(malformed(
+            data_offset,
+            "string MHOD length exceeds its chunk",
+        ));
+    };
     let mut units = Vec::with_capacity(byte_length / 2);
     for pair in data.chunks_exact(2) {
         units.push(u16::from_le_bytes([pair[0], pair[1]]));
     }
-    Ok(Some(String::from_utf16_lossy(&units)))
+    Ok(Some((
+        String::from_utf16_lossy(&units),
+        data_offset + byte_length,
+    )))
 }
 
 fn rewrite_track_dataset(
@@ -423,16 +471,18 @@ fn parse_album(chunk: &[u8]) -> Result<ParsedAlbum> {
     let mut offset = header.header_length;
     let child_count = usize_value(read_u32(chunk, 12)?, 12)?;
     for _ in 0..child_count {
-        let child = chunk_header(chunk, offset, b"mhod")?;
-        let mhod_type = read_u32(chunk, offset + 12)?;
-        if let Some(text) = parse_string_mhod(chunk, offset)? {
-            if mhod_type == 200 {
-                name = text;
-            } else if mhod_type == 201 {
-                artist = text;
+        let (mhod_type, claimed_end, legacy) = mhod_child(chunk, offset)?;
+        match parse_string_mhod(chunk, offset, legacy)? {
+            Some((text, real_end)) => {
+                if mhod_type == 200 {
+                    name = text;
+                } else if mhod_type == 201 {
+                    artist = text;
+                }
+                offset = real_end;
             }
+            None => offset = claimed_end,
         }
-        offset = child.end;
     }
     if offset != chunk.len() {
         return Err(malformed(offset, "trailing bytes after mhia children"));
@@ -1112,5 +1162,75 @@ mod tests {
         };
         let fields = sort_fields(&CdbSortView::from_addition(&addition), SORT_TITLE);
         assert_eq!(fields.0[0], SortField::Text("same title".to_owned()));
+    }
+
+    #[test]
+    fn addition_round_trips_the_copied_device_cdb() {
+        // The copied device CDB contains the firmware-rewritten master
+        // playlist, including its truncated trailing mhip. The adder must
+        // append a new track without tripping over it, and the result must
+        // re-parse for a later removal.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("iTunesCDB");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let addition = CdbTrackAddition {
+            persistent_id: PersistentId::from_bits(0x7A11_0000_0000_0001),
+            location: "F00/ZZZZ.mp3".to_owned(),
+            title: "Device State Test".to_owned(),
+            artist: Some("Artist".to_owned()),
+            album: Some("Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            file_size: 1000,
+            length_ms: 60_000,
+            bitrate: 128,
+            sample_rate: 44_100,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            year: 2024,
+            compilation: false,
+            date_mac: 0,
+            artwork: None,
+        };
+        let added = super::add_track_to_cdb(&bytes, [0u8; 8], &addition)
+            .unwrap_or_else(|error| panic!("addition to the copied device CDB failed: {error:?}"));
+        // The rewritten CDB must re-parse: remove the track we just added.
+        let removed = super::super::cdb_edit::remove_tracks_from_cdb(
+            &added,
+            [0u8; 8],
+            &[addition.persistent_id],
+        );
+        assert!(
+            removed.is_ok(),
+            "removal from rewritten device CDB failed: {removed:?}"
+        );
+    }
+
+    #[test]
+    fn parses_legacy_pre_gap_string_mhods() {
+        // The pre-gap Nano 7G writer stored encoding at +16, length at +20,
+        // data at +32, and claimed `40 + len` total while writing only
+        // `32 + len` bytes. The parser must decode the string and return the
+        // real end so a child walk stays aligned.
+        let text = "AudioTestAlbum";
+        let mut chunk = vec![0u8; 32 + text.len() * 2];
+        chunk[0..4].copy_from_slice(b"mhod");
+        chunk[4..8].copy_from_slice(&24u32.to_le_bytes());
+        chunk[8..12].copy_from_slice(&u32::try_from(40 + text.len() * 2).unwrap().to_le_bytes());
+        chunk[12..16].copy_from_slice(&200u32.to_le_bytes());
+        chunk[16..20].copy_from_slice(&1u32.to_le_bytes()); // encoding
+        chunk[20..24].copy_from_slice(&u32::try_from(text.len() * 2).unwrap().to_le_bytes()); // length
+        chunk[24..28].copy_from_slice(&1u32.to_le_bytes()); // legacy unk
+        for (i, unit) in text.encode_utf16().enumerate() {
+            chunk[32 + i * 2..34 + i * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let parsed = parse_string_mhod(&chunk, 0, true).unwrap().unwrap();
+        assert_eq!(parsed.0, text);
+        assert_eq!(parsed.1, 32 + text.len() * 2);
     }
 }
