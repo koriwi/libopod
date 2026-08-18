@@ -691,3 +691,14 @@ not for synchronization. The remaining blocker is libopod's staged
 add/remove/artwork/commit implementation; do not reintroduce the old
 single-`iTunesDB` backup/write behavior because it is unsafe and incomplete for
 modern Nanos.
+
+Synchronization status (2025-08-18): complete for the Nano 7G. libopod now
+ships a public `StagedSqliteEdit::install()` commit entry point (no
+confirmation ceremony — the phrases only guard the raw hardware-gate example),
+and copyPod's `Database::write()` stages every queued change through it as one
+signed, recoverable transaction, reopening the device afterwards for
+multi-cycle mirrors. Validated end to end against a throwaway copy of
+`backup_7g`: a mirror with 726 deletions (media unlinked, `.ithmb` reindexed to
+empty) plus one addition installed, and the device re-read with the expected
+single track. Remaining hardware steps are the delete-path gates 7/8 on the
+real Nano 7G, and the non-Nano profiles (HASH58/HASH72, legacy generations).
