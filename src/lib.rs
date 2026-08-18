@@ -18,6 +18,7 @@ pub use device::{
 pub use edit::{
     recover_interrupted_transaction, EditSession, FileFingerprint, GenerationFingerprint,
     StagedSqliteEdit, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+    NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
 };
 pub use error::{Error, Result};
 pub use fs::{IpodPath, MountRoot};

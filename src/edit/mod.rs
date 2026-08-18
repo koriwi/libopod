@@ -13,7 +13,9 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, Transaction};
 
-pub(crate) use commit::{install_noop_hardware_test, pending_transaction};
+pub(crate) use commit::{
+    install_noop_hardware_test, install_single_removal_hardware_test, pending_transaction,
+};
 
 use self::manifest::{back_up_generation, write_staging_manifest};
 use crate::{
@@ -29,6 +31,9 @@ use crate::{
 
 /// Exact acknowledgement required by the Nano 7G no-op hardware write gate.
 pub const NANO7_NOOP_HARDWARE_TEST_CONFIRMATION: &str = commit::NOOP_CONFIRMATION;
+
+/// Exact acknowledgement required by the single no-artwork removal gate.
+pub const NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION: &str = commit::REMOVAL_CONFIRMATION;
 
 const ITLP_PATH: &str = "iPod_Control/iTunes/iTunes Library.itlp";
 const MAX_LOCATIONS_BYTES: u64 = 512 * 1024 * 1024;

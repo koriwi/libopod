@@ -606,6 +606,12 @@ cargo test --no-default-features --features system-sqlite
 cargo doc --no-deps --all-features
 ```
 
+The first real Nano 7G hardware gate has passed: the explicitly confirmed
+byte-identical transaction completed and read back, the operator safely
+ejected/rebooted, and playback continued to work. This validates transaction
+installation on this device but not yet the corrected CDB signature or semantic
+library mutation.
+
 The private tests verify all structural observations in section 15 and stage a
 one-track removal into a temporary host directory. The staged set has 725
 tracks, all five schemas remain identical, every database passes
@@ -618,8 +624,8 @@ only opened read-only; its essential file hashes remain unchanged.
 Next implementation work:
 
 1. Treat `backup_7g/` as immutable and private; confirm it remains ignored.
-2. Run the explicitly confirmed byte-identical Nano 7G hardware gate with a
-   fresh external backup, then eject/reboot/play/reconnect and record results.
+2. Run the now-exposed, explicitly confirmed one-track no-artwork removal gate,
+   leave its MP3 orphaned, then eject/reboot/play/reconnect and record results.
 3. Expand fault injection across every backup, journal, install, validation, and
    cleanup boundary and prove recovery from each durable state.
 4. If the no-op gate passes, expose a one-track, no-artwork removal that leaves

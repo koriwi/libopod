@@ -59,6 +59,43 @@ eject, reboot, browse and play multiple tracks, reconnect, and run
 `opod-inspect` again. Record whether the firmware or Apple software requests a
 restore.
 
-Semantic hardware writes and copyPod synchronization remain disabled until this
-no-op gate passes and the removal/artwork gates are completed. The full matrix
+### Gate 1 result
+
+The real Nano 7G no-op transaction completed, read back successfully, survived
+safe eject/reboot, and playback continued to work. This validates the
+byte-identical transaction path on this device. It does not validate semantic
+CDB changes.
+
+## Nano 7G gate 2: one no-artwork database removal
+
+This gate removes exactly one no-artwork track from SQLite and CDB while
+leaving its MP3 on disk as an orphaned safety copy. It does not modify
+ArtworkDB or ithmb files. Keep both the complete external backup and the new
+host transaction bundle.
+
+First list redacted candidates and choose an index whose artwork column is
+`no`:
+
+```console
+cargo run --release --example opod-stage-remove -- /path/to/ipod list
+```
+
+Create another empty host directory and run:
+
+```console
+cargo run --release --example opod-hardware-test -- \
+  remove /path/to/ipod TRACK_INDEX /path/to/empty-host-directory \
+  'I HAVE A VERIFIED BACKUP; REMOVE ONE NO-ARTWORK TRACK AND KEEP ITS MEDIA FILE'
+```
+
+If interrupted, run the same `recover` command documented above. On success,
+safely eject and reboot. Confirm that the library has one fewer track, browse
+albums/playlists, play multiple remaining tracks, reconnect, and run
+`opod-inspect`. Expected inspection changes are 725 tracks, valid SQLite and
+CBK, and `Some(Valid)` for the newly generated CDB HASHAB signature. ArtworkDB
+should still have 704 records.
+
+Stop if the firmware or Apple software requests a restore. Do not run copyPod
+or delete the orphan MP3 yet. CopyPod synchronization remains disabled until
+this removal gate and subsequent insertion/artwork gates pass. The full matrix
 is specified in `plan.md` sections 10 and 12.

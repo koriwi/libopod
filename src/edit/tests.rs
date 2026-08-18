@@ -14,7 +14,7 @@ mod tests {
     };
     use crate::{
         Device, Error, MountRoot, PersistentId, SqliteLibraryFile,
-        NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+        NANO7_NOOP_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
     };
 
     #[test]
@@ -72,7 +72,15 @@ mod tests {
         };
         let virtual_root = bundle.path().join("original");
         let virtual_device = Device::open(&virtual_root).unwrap();
-        install_staged_removal(&virtual_device, &staged, FailureMode::RollBack).unwrap();
+        assert!(virtual_device
+            .install_single_removal_hardware_test(&staged, "not confirmed")
+            .is_err());
+        virtual_device
+            .install_single_removal_hardware_test(
+                &staged,
+                NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
+            )
+            .unwrap();
 
         assert!(!virtual_root.join(TRANSACTION_PATH).exists());
         let reopened = Device::open(&virtual_root).unwrap();

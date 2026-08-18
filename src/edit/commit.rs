@@ -15,6 +15,8 @@ use crate::{error::io_error, Device, Error, IpodPath, MountRoot, Result};
 
 pub(crate) const TRANSACTION_PATH: &str = "iPod_Control/iTunes/.libopod-transaction-v1";
 pub(crate) const NOOP_CONFIRMATION: &str = "I HAVE A VERIFIED BACKUP; RUN NANO 7G NO-OP WRITE TEST";
+pub(crate) const REMOVAL_CONFIRMATION: &str =
+    "I HAVE A VERIFIED BACKUP; REMOVE ONE NO-ARTWORK TRACK AND KEEP ITS MEDIA FILE";
 const JOURNAL_NAME: &str = "journal.json";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +61,29 @@ pub(crate) fn install_noop_hardware_test(
         return Err(Error::Unsupported {
             feature: "Nano 7G no-op hardware test",
             reason: "only a zero-change bundle for a resolved Nano 7G is accepted".to_owned(),
+        });
+    }
+    install_staged_removal(device, staged, FailureMode::RollBack)
+}
+
+pub(crate) fn install_single_removal_hardware_test(
+    device: &Device,
+    staged: &StagedSqliteEdit,
+    confirmation: &str,
+) -> Result<()> {
+    if confirmation != REMOVAL_CONFIRMATION {
+        return Err(Error::Unsupported {
+            feature: "Nano 7G removal hardware test confirmation",
+            reason: format!("confirmation must exactly equal: {REMOVAL_CONFIRMATION}"),
+        });
+    }
+    if device.profile().map(crate::DeviceProfile::key) != Some("nano-7g")
+        || staged.removed_tracks() != 1
+        || staged.removed_artwork_tracks() != 0
+    {
+        return Err(Error::Unsupported {
+            feature: "Nano 7G single-track removal hardware test",
+            reason: "exactly one no-artwork track on a resolved Nano 7G is required".to_owned(),
         });
     }
     install_staged_removal(device, staged, FailureMode::RollBack)
