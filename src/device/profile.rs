@@ -85,6 +85,13 @@ const NANO_PRODUCT_IDS: [(u16, u8); 7] = [
     (0x1267, 7),
 ];
 
+/// `SysInfoExtended` `FamilyID` values for the Nano generations.
+///
+/// Verified on real devices: 12 = Nano 3G, 18 = Nano 7G. The remaining
+/// entries come from the classic libgpod device table and are provisional
+/// until confirmed against hardware.
+const NANO_FAMILY_IDS: [(u16, u8); 6] = [(6, 1), (8, 2), (12, 3), (14, 4), (16, 5), (18, 7)];
+
 /// Parses the `SysInfo` generation field into a Nano generation number.
 fn nano_generation(evidence: &IdentityEvidence) -> Option<u8> {
     let generation = evidence.generation()?.value.to_ascii_lowercase();
@@ -117,6 +124,11 @@ pub(crate) fn resolve(evidence: &IdentityEvidence) -> Result<Option<DeviceProfil
         .as_deref()
         .is_some_and(|value| value.contains("nano"));
     let generation = nano_generation(evidence);
+    let family_id_generation = evidence.family_id_value().and_then(|value| {
+        NANO_FAMILY_IDS
+            .iter()
+            .find_map(|(candidate, generation)| (*candidate == value.value).then_some(*generation))
+    });
     let pid_generation = product_id.and_then(|pid| {
         NANO_PRODUCT_IDS
             .iter()
@@ -148,8 +160,8 @@ pub(crate) fn resolve(evidence: &IdentityEvidence) -> Result<Option<DeviceProfil
         });
     }
 
-    let generation = generation.or(pid_generation);
-    if !is_nano && pid_generation.is_none() {
+    let generation = generation.or(family_id_generation).or(pid_generation);
+    if !is_nano && pid_generation.is_none() && family_id_generation.is_none() {
         return Ok(None);
     }
     let profile = match generation {

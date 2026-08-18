@@ -44,6 +44,7 @@ pub struct IdentityEvidence {
     model_family: Option<Sourced<String>>,
     generation: Option<Sourced<String>>,
     model_number: Option<Sourced<String>>,
+    family_id: Option<Sourced<u16>>,
     usb_product_id: Option<Sourced<u16>>,
     sqlite_db: Option<Sourced<bool>>,
     sparse_artwork: Option<Sourced<bool>>,
@@ -57,6 +58,7 @@ pub struct IdentityEvidence {
 
 impl IdentityEvidence {
     pub(crate) fn read_from(mount: &MountRoot) -> Result<Self> {
+        eprintln!("DBG read_from called");
         let mut evidence = Self::empty();
         if let Some(bytes) = read_optional(
             mount,
@@ -82,6 +84,7 @@ impl IdentityEvidence {
             model_family: None,
             generation: None,
             model_number: None,
+            family_id: None,
             usb_product_id: None,
             sqlite_db: None,
             sparse_artwork: None,
@@ -142,6 +145,30 @@ impl IdentityEvidence {
             offset: 0,
             reason: "property-list root is not a dictionary".to_owned(),
         })?;
+
+        if let Some(text) = dictionary.get("ModelFamily").and_then(Value::as_string) {
+            set_string(
+                &mut self.model_family,
+                text,
+                EvidenceSource::SysInfoExtended,
+            );
+        }
+        if let Some(text) = dictionary.get("Generation").and_then(Value::as_string) {
+            set_string(&mut self.generation, text, EvidenceSource::SysInfoExtended);
+        }
+        if let Some(text) = dictionary.get("ModelNumStr").and_then(Value::as_string) {
+            set_string(
+                &mut self.model_number,
+                text,
+                EvidenceSource::SysInfoExtended,
+            );
+        }
+        self.family_id = unsigned(dictionary.get("FamilyID")).and_then(|value| {
+            u16::try_from(value).ok().map(|value| Sourced {
+                value,
+                source: EvidenceSource::SysInfoExtended,
+            })
+        });
 
         self.sqlite_db = dictionary
             .get("SQLiteDB")
@@ -212,6 +239,11 @@ impl IdentityEvidence {
     }
 
     #[must_use]
+    pub fn family_id_value(&self) -> Option<&Sourced<u16>> {
+        self.family_id.as_ref()
+    }
+
+    #[must_use]
     pub fn model_number(&self) -> Option<&Sourced<String>> {
         self.model_number.as_ref()
     }
@@ -273,6 +305,7 @@ impl fmt::Debug for IdentityEvidence {
             .field("model_family", &self.model_family)
             .field("generation", &self.generation)
             .field("model_number", &self.model_number)
+            .field("family_id", &self.family_id)
             .field("usb_product_id", &self.usb_product_id)
             .field("sqlite_db", &self.sqlite_db)
             .field("sparse_artwork", &self.sparse_artwork)

@@ -208,4 +208,31 @@ mod tests {
         tampered[100] ^= 0x01;
         assert!(!verify(&guid, &tampered));
     }
+
+    #[test]
+    fn verifies_the_attached_nano3_signature() {
+        // Real-device vector: the Nano 3G's own iTunesDB must verify against
+        // the FireWire GUID stored in its SysInfoExtended.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("files_nano3");
+        let itunesdb = base.join("iTunes/iTunesDB");
+        if !itunesdb.is_file() {
+            return;
+        }
+        let extended = std::fs::read(base.join("Device/SysInfoExtended")).unwrap();
+        let value = plist::Value::from_reader_xml(std::io::Cursor::new(&extended)).unwrap();
+        let guid_text = value
+            .as_dictionary()
+            .and_then(|dict| dict.get("FireWireGUID"))
+            .and_then(plist::Value::as_string)
+            .unwrap();
+        let mut guid = [0u8; 8];
+        for (index, byte) in guid.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&guid_text[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        let database = std::fs::read(&itunesdb).unwrap();
+        assert!(
+            verify(&guid, &database),
+            "the stored Nano 3G HASH58 signature does not verify"
+        );
+    }
 }

@@ -12,7 +12,16 @@ use super::cdb_edit::{
 };
 use crate::{Error, PersistentId, Result};
 
+/// The Nano 7G `mhit` header size, used by the synthetic test builder; the
+/// classic parser accepts any header long enough for its fields (see
+/// `MHIT_MIN_HEADER`).
+#[cfg(test)]
 const MHIT_HEADER_SIZE: usize = 0x270;
+
+/// Minimum classic `mhit` header: the fields read below (`db_track_id` at
+/// 0x70 + 8) must fit, while the header itself varies by firmware version
+/// (observed 0x248 on Nano 3G, 0x9C minimum on older devices).
+const MHIT_MIN_HEADER: usize = 0x78;
 const MHIT_CHILD_COUNT: usize = 0x0c;
 const MHIT_TRACK_ID: usize = 0x10;
 const MHIT_SIZE: usize = 0x24;
@@ -132,7 +141,7 @@ fn parse_track(
     artwork_tracks: &std::collections::BTreeSet<PersistentId>,
 ) -> Result<ClassicTrack> {
     let header = chunk_header(chunk, 0, b"mhit")?;
-    if header.header_length < MHIT_HEADER_SIZE {
+    if header.header_length < MHIT_MIN_HEADER {
         return Err(malformed(4, "mhit header is too short"));
     }
     let persistent_id = PersistentId::from_bits(read_u64(chunk, MHIT_DB_TRACK_ID)?);
@@ -396,5 +405,43 @@ mod tests {
         // An empty ArtworkDB is not required; a malformed one must surface.
         let bytes = minimal_itunesdb();
         assert!(parse_library(&bytes, Some(b"not an artworkdb")).is_err());
+    }
+
+    #[test]
+    fn opens_the_attached_nano3_device() {
+        // End-to-end against the operator's Nano 3G files: the attached
+        // Device/iTunes/Artwork tree is wrapped into a proper iPod_Control
+        // layout, and Device::open must resolve the profile, parse all 724
+        // tracks, and read artwork presence.
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("files_nano3");
+        if !source.join("iTunes/iTunesDB").is_file() {
+            return;
+        }
+        let device_dir = tempfile::tempdir().unwrap();
+        let root = device_dir.path().join("iPod_Control");
+        for folder in ["Device", "iTunes", "Artwork"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            for entry in std::fs::read_dir(source.join(folder)).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), root.join(folder).join(entry.file_name())).unwrap();
+            }
+        }
+        let device = crate::Device::open(device_dir.path()).unwrap();
+        assert_eq!(
+            device.profile().map(crate::DeviceProfile::key),
+            Some("nano-3g")
+        );
+        assert!(device.evidence().has_firewire_guid());
+        let library = device.library().expect("classic library");
+        assert_eq!(library.track_count(), 724);
+        assert!(!library.tracks().is_empty());
+        // The fixture artwork covers a large share of the library.
+        let artwork_count = library
+            .tracks()
+            .iter()
+            .filter(|track| track.has_artwork)
+            .count();
+        assert!(artwork_count > 0, "no tracks reported artwork");
+        assert!(!library.playlists().is_empty(), "no playlists parsed");
     }
 }
