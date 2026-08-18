@@ -370,7 +370,14 @@ fn rewrite_mhod53(chunk: &[u8], removed_slots: &[u32]) -> Result<Vec<u8>> {
 /// of the last `mhip` while leaving the child's claimed total unchanged.
 /// Clamping lets the walk survive that quirk instead of failing the whole
 /// rewrite.
-fn mhod_child_end(bytes: &[u8], offset: usize) -> Option<usize> {
+/// Returns the claimed end of an `mhod` child at `offset`, or `None` when
+/// the bytes there are not a plausible `mhod`.
+///
+/// The claimed end may run past the parent: Nano 7G playlists embed each
+/// track's playlist order as a single `mhod` child inside its `mhip`, and the
+/// firmware may truncate the trailing bytes of the last `mhip` while leaving
+/// the child's claimed total unchanged.
+fn mhod_child_claimed_end(bytes: &[u8], offset: usize) -> Option<usize> {
     if bytes.get(offset..offset + 4) != Some(b"mhod") {
         return None;
     }
@@ -379,7 +386,21 @@ fn mhod_child_end(bytes: &[u8], offset: usize) -> Option<usize> {
     if header_length < 12 || total_length < header_length {
         return None;
     }
-    Some(offset.saturating_add(total_length).min(bytes.len()))
+    offset.checked_add(total_length)
+}
+
+/// Offset of the position value inside an mhip's embedded type-100 mhod.
+///
+/// The standard layout (Apple-written mhips and the fixture) stores the
+/// position at `offset + 24`, after the mhod's 8-byte gap. The firmware's
+/// truncated last mhip instead stores it at `offset + 16`; fall back to that
+/// variant only when the child's claimed total runs past the parent.
+fn mhip_value_offset(truncated: bool) -> usize {
+    if truncated {
+        16
+    } else {
+        24
+    }
 }
 
 fn mhip_position(chunk: &[u8]) -> Result<Option<u32>> {
@@ -390,14 +411,17 @@ fn mhip_position(chunk: &[u8]) -> Result<Option<u32>> {
     let child_count = usize_value(read_u32(chunk, 12)?, 12)?;
     let mut offset = header.header_length;
     for _ in 0..child_count {
-        let Some(end) = mhod_child_end(chunk, offset) else {
+        let Some(claimed_end) = mhod_child_claimed_end(chunk, offset) else {
             break;
         };
+        let truncated = claimed_end > chunk.len();
+        let end = claimed_end.min(chunk.len());
+        let value_offset = offset + mhip_value_offset(truncated);
         if read_u32(chunk, offset + 12)? == 100
-            && offset + 16 + 4 <= chunk.len()
-            && offset + 16 + 4 <= end
+            && value_offset + 4 <= chunk.len()
+            && value_offset + 4 <= end
         {
-            return read_u32(chunk, offset + 16).map(Some);
+            return read_u32(chunk, value_offset).map(Some);
         }
         offset = end;
     }
@@ -409,14 +433,13 @@ fn rewrite_mhip_position(mut chunk: Vec<u8>, removed_values: &[u32]) -> Result<V
     let child_count = usize_value(read_u32(&chunk, 12)?, 12)?;
     let mut offset = header.header_length;
     for _ in 0..child_count {
-        let Some(end) = mhod_child_end(&chunk, offset) else {
+        let Some(claimed_end) = mhod_child_claimed_end(&chunk, offset) else {
             break;
         };
-        let unclamped_end = offset
-            .checked_add(read_u32(&chunk, offset + 8)? as usize)
-            .unwrap_or(chunk.len());
-        if read_u32(&chunk, offset + 12)? == 100 && offset + 16 + 4 <= chunk.len() {
-            let value_offset = offset + 16;
+        let truncated = claimed_end > chunk.len();
+        let end = claimed_end.min(chunk.len());
+        let value_offset = offset + mhip_value_offset(truncated);
+        if read_u32(&chunk, offset + 12)? == 100 && value_offset + 4 <= chunk.len() {
             let value = read_u32(&chunk, value_offset)?;
             let shift = removed_values
                 .iter()
@@ -430,15 +453,9 @@ fn rewrite_mhip_position(mut chunk: Vec<u8>, removed_values: &[u32]) -> Result<V
         }
         offset = end;
         if end == chunk.len() {
-            // The child (possibly firmware-truncated) fills the mhip. When its
-            // claimed total runs past the end, pad the mhip back out so the
-            // rewritten playlist stays self-consistent.
-            if unclamped_end > chunk.len() {
-                chunk.resize(unclamped_end, 0);
-                let total = u32::try_from(chunk.len())
-                    .map_err(|_| verification("rewritten mhip exceeds u32"))?;
-                write_u32(&mut chunk, 8, total)?;
-            }
+            // A firmware-truncated trailing child fills the mhip: keep the
+            // chunk byte-for-byte otherwise (the firmware runs this exact
+            // structure on the device), just stop the child walk here.
             break;
         }
     }
@@ -459,10 +476,7 @@ pub(super) fn chunk_header(bytes: &[u8], offset: usize, magic: &[u8]) -> Result<
         return Err(malformed(offset + 4, "invalid chunk lengths"));
     }
     let end = checked_end(offset, total_length, bytes.len(), offset + 8)?;
-    Ok(ChunkHeader {
-        header_length,
-        end,
-    })
+    Ok(ChunkHeader { header_length, end })
 }
 
 pub(super) fn require_magic(bytes: &[u8], offset: usize, expected: &[u8]) -> Result<()> {
@@ -558,6 +572,75 @@ mod device_cdb_tests {
 
     use crate::PersistentId;
 
+    /// Walks the master playlist (kind-2 dataset) of a CDB and returns the
+    /// embedded position value of every mhip, in playlist order. The standard
+    /// layout stores the position at +24 inside the type-100 mhod child that
+    /// starts at mhip+76; the firmware's truncated trailing mhip stores it at
+    /// +16 instead.
+    fn master_mhip_positions(cdb: &[u8]) -> Vec<u32> {
+        let header_length = u32::from_le_bytes(cdb[4..8].try_into().unwrap()) as usize;
+        let payload = super::super::cdb::decode_payload(cdb, header_length).unwrap();
+        let datasets = u32::from_le_bytes(cdb[0x14..0x18].try_into().unwrap());
+        let mut offset = 0usize;
+        let mut positions = Vec::new();
+        for _ in 0..datasets {
+            let hdr =
+                u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let total =
+                u32::from_le_bytes(payload[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let kind = u32::from_le_bytes(payload[offset + 12..offset + 16].try_into().unwrap());
+            if kind == 2 {
+                let list = offset + hdr;
+                let lh =
+                    u32::from_le_bytes(payload[list + 4..list + 8].try_into().unwrap()) as usize;
+                let count = u32::from_le_bytes(payload[list + 8..list + 12].try_into().unwrap());
+                let poff = list + lh;
+                for _ in 0..count {
+                    let ph = u32::from_le_bytes(payload[poff + 4..poff + 8].try_into().unwrap())
+                        as usize;
+                    let ic = u32::from_le_bytes(payload[poff + 16..poff + 20].try_into().unwrap());
+                    let mc = u32::from_le_bytes(payload[poff + 12..poff + 16].try_into().unwrap());
+                    let mut coff = poff + ph;
+                    for _ in 0..mc {
+                        coff += u32::from_le_bytes(payload[coff + 8..coff + 12].try_into().unwrap())
+                            as usize;
+                    }
+                    for _ in 0..ic {
+                        let mtot =
+                            u32::from_le_bytes(payload[coff + 8..coff + 12].try_into().unwrap())
+                                as usize;
+                        let truncated = coff + 76 + 44 > coff + mtot;
+                        let value_off = coff + 76 + if truncated { 16 } else { 24 };
+                        positions.push(u32::from_le_bytes(
+                            payload[value_off..value_off + 4].try_into().unwrap(),
+                        ));
+                        coff += mtot;
+                    }
+                }
+            }
+            offset += total;
+        }
+        positions
+    }
+
+    #[test]
+    fn fixture_master_mhip_positions_are_consecutive() {
+        // Apple's own master playlist embeds each track's playlist order in a
+        // type-100 mhod child at +76 inside every mhip, with the position at
+        // +24 (after the mhod's 8-byte gap). The values must be the running
+        // playlist index; this guards the offset used by
+        // mhip_position/rewrite_mhip_position.
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g/iPod_Control/iTunes/iTunesCDB");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let positions = master_mhip_positions(&bytes);
+        let expected: Vec<u32> = (0..726).collect();
+        assert_eq!(positions, expected);
+    }
+
     #[test]
     fn removal_round_trips_the_copied_device_cdb() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("iTunesCDB");
@@ -596,12 +679,17 @@ mod device_cdb_tests {
         let first = super::remove_tracks_from_cdb(&bytes, [0u8; 8], &[pids[1]]);
         let rewritten = first
             .unwrap_or_else(|error| panic!("removal of the copied device CDB failed: {error:?}"));
-        // The rewritten CDB must itself re-parse: remove a second track from
-        // our own output to prove the round trip stays structurally sound.
+        // The rewritten CDB must itself re-parse and re-sign: remove a second
+        // track from our own output to prove the round trip stays sound.
         let second = super::remove_tracks_from_cdb(&rewritten, [0u8; 8], &[pids[2]]);
-        assert!(
-            second.is_ok(),
-            "second removal from rewritten device CDB failed: {second:?}"
-        );
+        let final_cdb = second.unwrap_or_else(|error| {
+            panic!("second removal from rewritten device CDB failed: {error:?}")
+        });
+        // 726 tracks minus two removals: the master playlist must still carry
+        // consecutive 0..723 positions, proving the shift logic now reads and
+        // writes the real embedded values.
+        let positions = master_mhip_positions(&final_cdb);
+        let expected: Vec<u32> = (0..724).collect();
+        assert_eq!(positions, expected);
     }
 }
