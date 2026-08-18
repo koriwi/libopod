@@ -1,6 +1,8 @@
+mod add;
 mod commit;
 mod generation;
 mod manifest;
+pub(crate) mod sort;
 
 pub use generation::{FileFingerprint, GenerationFingerprint};
 
@@ -13,16 +15,21 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, Transaction};
 
+pub(crate) use add::{add_tracks_to_staged_databases, ResolvedAddition};
 pub(crate) use commit::{
     install_noop_hardware_test, install_single_removal_hardware_test, pending_transaction,
 };
 
+use self::generation::fingerprint_host_file;
 use self::manifest::{back_up_generation, write_staging_manifest};
 use crate::{
     error::io_error,
     fs::read_limited,
     storage::{
-        binary::{build_hashab_cbk, remove_tracks_from_cdb, verify_cbk},
+        binary::{
+            add_track_to_cdb, build_hashab_cbk, remove_tracks_from_cdb, verify_cbk,
+            CdbTrackAddition,
+        },
         sqlite::inspect_sqlite_database,
     },
     BackendKind, Device, Error, IpodPath, Library, MountRoot, PersistentId, Result,
@@ -34,6 +41,45 @@ pub const NANO7_NOOP_HARDWARE_TEST_CONFIRMATION: &str = commit::NOOP_CONFIRMATIO
 
 /// Exact acknowledgement required by the single no-artwork removal gate.
 pub const NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION: &str = commit::REMOVAL_CONFIRMATION;
+
+/// Metadata for one track to add to the staged library.
+///
+/// The source file is copied into the staging bundle and never modified.
+#[derive(Clone, Debug)]
+pub struct TrackToAdd {
+    /// Host path of the audio file to stage (must exist and be readable).
+    pub source_path: PathBuf,
+    /// Track title.
+    pub title: String,
+    /// Track artist.
+    pub artist: Option<String>,
+    /// Album name.
+    pub album: Option<String>,
+    /// Album artist (falls back to `artist`).
+    pub album_artist: Option<String>,
+    /// Genre name.
+    pub genre: Option<String>,
+    /// Composer name.
+    pub composer: Option<String>,
+    /// Release year.
+    pub year: u32,
+    /// Track number within the album.
+    pub track_number: u32,
+    /// Total tracks on the album.
+    pub total_tracks: u32,
+    /// Disc number.
+    pub disc_number: u32,
+    /// Total discs.
+    pub total_discs: u32,
+    /// Bitrate in kbps.
+    pub bitrate: u32,
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Duration in milliseconds.
+    pub length_ms: u32,
+    /// Whether this track belongs to a compilation album.
+    pub compilation: bool,
+}
 
 const ITLP_PATH: &str = "iPod_Control/iTunes/iTunes Library.itlp";
 const MAX_LOCATIONS_BYTES: u64 = 512 * 1024 * 1024;
@@ -55,6 +101,7 @@ const SQLITE_FILES: [SqliteLibraryFile; 5] = [
 pub struct EditSession<'device> {
     device: &'device Device,
     removals: BTreeSet<PersistentId>,
+    additions: Vec<TrackToAdd>,
 }
 
 impl<'device> EditSession<'device> {
@@ -84,6 +131,7 @@ impl<'device> EditSession<'device> {
         Ok(Self {
             device,
             removals: BTreeSet::new(),
+            additions: Vec::new(),
         })
     }
 
@@ -113,6 +161,40 @@ impl<'device> EditSession<'device> {
         self.removals.len()
     }
 
+    /// Queues a track for addition without changing any files.
+    ///
+    /// The host source file is only read during staging, when it is copied
+    /// into the preview bundle. Queuing does not modify anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidStagingDirectory`] when the source path does
+    /// not exist or is not a regular file.
+    pub fn add_track(&mut self, track: TrackToAdd) -> Result<()> {
+        let metadata = fs::metadata(&track.source_path)
+            .map_err(|source| io_error("inspect track source", &track.source_path, source))?;
+        if !metadata.is_file() {
+            return Err(Error::InvalidStagingDirectory {
+                path: track.source_path.clone(),
+                reason: "track source must be a regular file".to_owned(),
+            });
+        }
+        if track.title.trim().is_empty() || track.sample_rate == 0 {
+            return Err(Error::InvalidStagingDirectory {
+                path: track.source_path.clone(),
+                reason: "track requires a non-empty title and a valid sample rate".to_owned(),
+            });
+        }
+        self.additions.push(track);
+        Ok(())
+    }
+
+    /// Returns the number of queued additions.
+    #[must_use]
+    pub fn addition_count(&self) -> usize {
+        self.additions.len()
+    }
+
     /// Builds a schema-preserving `SQLite` removal preview in an empty host
     /// directory.
     ///
@@ -135,10 +217,10 @@ impl<'device> EditSession<'device> {
     /// inside the opened mount, required schemas differ, a database operation
     /// fails, or output validation fails.
     pub fn stage_sqlite_preview(&self, destination: impl AsRef<Path>) -> Result<StagedSqliteEdit> {
-        if self.removals.is_empty() {
+        if self.removals.is_empty() && self.additions.is_empty() {
             return Err(Error::Unsupported {
                 feature: "empty edit preview",
-                reason: "queue at least one removal before staging".to_owned(),
+                reason: "queue at least one removal or addition before staging".to_owned(),
             });
         }
         self.stage_preview(destination.as_ref())
@@ -167,8 +249,12 @@ impl<'device> EditSession<'device> {
             feature: "SQLite staging",
             reason: "the source library is unavailable".to_owned(),
         })?;
+        let resolved = self.resolve_additions(&destination)?;
         if !self.removals.is_empty() {
             edit_staged_databases(&destination, &self.removals)?;
+        }
+        if !resolved.is_empty() {
+            add_tracks_to_staged_databases(&destination, &resolved)?;
         }
 
         let guid = self
@@ -179,11 +265,16 @@ impl<'device> EditSession<'device> {
                 feature: "HASHAB staging",
                 reason: "the required signing identity is unavailable".to_owned(),
             })?;
-        if self.removals.is_empty() {
+        if self.removals.is_empty() && resolved.is_empty() {
             copy_unchanged_companions(&source, self.device, &destination)?;
         } else {
             write_and_verify_cbk(&destination, guid)?;
-            write_cdb_preview(self.device, &destination, guid, &self.removals)?;
+            if !self.removals.is_empty() {
+                write_cdb_preview(self.device, &destination, guid, &self.removals)?;
+            }
+            if !resolved.is_empty() {
+                write_cdb_additions(self.device, &destination, guid, &resolved)?;
+            }
         }
         validate_staged_set(&destination)?;
 
@@ -191,15 +282,22 @@ impl<'device> EditSession<'device> {
             &destination.join(SqliteLibraryFile::Library.file_name()),
             &destination.join(SqliteLibraryFile::Locations.file_name()),
         )?;
-        validate_semantics(before, &after, &self.removals)?;
+        validate_semantics(before, &after, &self.removals, &resolved)?;
         self.device
             .generation()
             .verify_unchanged(self.device.mount(), self.device.profile())?;
+        let added_targets: Vec<IpodPath> = resolved
+            .iter()
+            .map(|addition| {
+                IpodPath::new(format!("iPod_Control/Music/{}", addition.media_relative))
+            })
+            .collect::<Result<_>>()?;
         let manifest = write_staging_manifest(
             self.device,
             &destination,
             self.device.generation(),
             self.removals.len(),
+            &added_targets,
         )?;
 
         let removed_tracks: Vec<_> = before
@@ -218,12 +316,65 @@ impl<'device> EditSession<'device> {
         Ok(StagedSqliteEdit {
             directory: destination,
             removed_tracks: self.removals.len(),
+            added_tracks: resolved.len(),
             remaining_tracks: after.track_count(),
             removed_media,
             removed_artwork_tracks,
+            added_media: added_targets,
             source_generation: self.device.generation().clone(),
             manifest,
         })
+    }
+
+    /// Allocates media paths, stages copies of each source file, and assigns
+    /// persistent IDs and timestamps for every queued addition.
+    fn resolve_additions(&self, destination: &Path) -> Result<Vec<ResolvedAddition>> {
+        if self.additions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let existing_pids: BTreeSet<PersistentId> =
+            self.device.library().map_or_else(BTreeSet::new, |library| {
+                library.tracks().iter().map(|track| track.id).collect()
+            });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let date_coredata = i64::try_from(now.saturating_add(978_307_200)).unwrap_or(i64::MAX);
+        let date_mac = u32::try_from(now.saturating_add(2_082_844_800)).unwrap_or(u32::MAX);
+        let mut resolved = Vec::with_capacity(self.additions.len());
+        for track in &self.additions {
+            let (media_relative, _staged_path) =
+                allocate_media_path(self.device, destination, &track.source_path)?;
+            let metadata = fs::metadata(&track.source_path)
+                .map_err(|source| io_error("inspect track source", &track.source_path, source))?;
+            let pid = generate_unique_pid(&existing_pids);
+            resolved.push(ResolvedAddition {
+                pid,
+                title: track.title.trim().to_owned(),
+                artist: track.artist.as_ref().map(|value| value.trim().to_owned()),
+                album: track.album.as_ref().map(|value| value.trim().to_owned()),
+                album_artist: track
+                    .album_artist
+                    .as_ref()
+                    .map(|value| value.trim().to_owned()),
+                genre: track.genre.as_ref().map(|value| value.trim().to_owned()),
+                composer: track.composer.as_ref().map(|value| value.trim().to_owned()),
+                year: track.year,
+                track_number: track.track_number,
+                total_tracks: track.total_tracks,
+                disc_number: track.disc_number,
+                total_discs: track.total_discs,
+                bitrate: track.bitrate,
+                sample_rate: track.sample_rate,
+                length_ms: track.length_ms,
+                compilation: track.compilation,
+                file_size: metadata.len(),
+                date_coredata,
+                media_relative,
+                date_mac,
+            });
+        }
+        Ok(resolved)
     }
 }
 
@@ -235,9 +386,11 @@ impl<'device> EditSession<'device> {
 pub struct StagedSqliteEdit {
     directory: PathBuf,
     removed_tracks: usize,
+    added_tracks: usize,
     remaining_tracks: usize,
     removed_media: Vec<IpodPath>,
     removed_artwork_tracks: usize,
+    added_media: Vec<IpodPath>,
     source_generation: GenerationFingerprint,
     manifest: PathBuf,
 }
@@ -253,6 +406,18 @@ impl StagedSqliteEdit {
     #[must_use]
     pub const fn removed_tracks(&self) -> usize {
         self.removed_tracks
+    }
+
+    /// Returns the number of queued additions in this preview.
+    #[must_use]
+    pub const fn added_tracks(&self) -> usize {
+        self.added_tracks
+    }
+
+    /// Returns media targets that a future completed commit would install.
+    #[must_use]
+    pub fn added_media(&self) -> &[IpodPath] {
+        &self.added_media
     }
 
     /// Returns the remaining music-track count after reparsing.
@@ -305,6 +470,152 @@ pub fn recover_interrupted_transaction(path: impl AsRef<Path>) -> Result<bool> {
     }
     commit::recover_transaction(&mount)?;
     Ok(true)
+}
+
+#[allow(clippy::too_many_lines)]
+/// Chooses the least-populated `Music/Fxx` directory, stages a verified copy
+/// of the source MP3 inside the bundle, and returns the relative media path
+/// (`Fxx/NAME.mp3`) plus the bundle-relative staged path.
+fn allocate_media_path(
+    device: &Device,
+    destination: &Path,
+    source_path: &Path,
+) -> Result<(String, String)> {
+    let music_relative = IpodPath::new("iPod_Control/Music")?;
+    let music = device.mount().resolve_existing(&music_relative)?;
+    let mut directories = Vec::new();
+    for entry in
+        fs::read_dir(&music).map_err(|source| io_error("read Music directory", &music, source))?
+    {
+        let entry = entry.map_err(|source| io_error("read Music entry", &music, source))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && name.len() == 3
+            && name.starts_with('F')
+            && name[1..]
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        {
+            directories.push(entry.path());
+        }
+    }
+    directories.sort();
+    if directories.is_empty() {
+        return Err(Error::Unsupported {
+            feature: "media allocation",
+            reason: "the device has no Music/Fxx media directories".to_owned(),
+        });
+    }
+    let directory = directories
+        .into_iter()
+        .min_by_key(|path| fs::read_dir(path).map_or(usize::MAX, std::iter::Iterator::count))
+        .ok_or_else(|| Error::Verification {
+            format: "media allocation",
+            reason: "no media directory could be selected".to_owned(),
+        })?;
+    let folder = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Verification {
+            format: "media allocation",
+            reason: "media directory name is not UTF-8".to_owned(),
+        })?
+        .to_owned();
+    let existing: BTreeSet<String> = fs::read_dir(&directory)
+        .map_err(|source| io_error("read media directory", &directory, source))?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .map(|name| name.to_ascii_uppercase())
+        .collect();
+    let extension = source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("mp3")
+        .to_ascii_lowercase();
+    if extension != "mp3" {
+        return Err(Error::Unsupported {
+            feature: "media allocation",
+            reason: "only MP3 sources are supported by the first addition gate".to_owned(),
+        });
+    }
+    let mut name = None;
+    for _ in 0..64 {
+        let candidate = random_media_name();
+        if !existing.contains(&candidate) {
+            name = Some(candidate);
+            break;
+        }
+    }
+    let name = name.ok_or_else(|| Error::Verification {
+        format: "media allocation",
+        reason: "could not find a free media filename".to_owned(),
+    })?;
+    let staged_dir = destination.join("iPod_Control").join("Music").join(&folder);
+    fs::create_dir_all(&staged_dir)
+        .map_err(|source| io_error("create staged media directory", &staged_dir, source))?;
+    let file_name = format!("{name}.{extension}");
+    let staged_file = staged_dir.join(&file_name);
+    fs::copy(source_path, &staged_file)
+        .map_err(|source| io_error("stage media file", &staged_file, source))?;
+    let (expected_bytes, expected_digest) = fingerprint_host_file(source_path)?;
+    let (actual_bytes, actual_digest) = fingerprint_host_file(&staged_file)?;
+    if actual_bytes != expected_bytes || actual_digest != expected_digest {
+        let _ = fs::remove_file(&staged_file);
+        return Err(Error::Verification {
+            format: "staged media file",
+            reason: "staged copy did not verify against its source".to_owned(),
+        });
+    }
+    if actual_bytes == 0 {
+        let _ = fs::remove_file(&staged_file);
+        return Err(Error::Verification {
+            format: "staged media file",
+            reason: "the source audio file is empty".to_owned(),
+        });
+    }
+    Ok((
+        format!("{folder}/{file_name}"),
+        format!("iPod_Control/Music/{folder}/{file_name}"),
+    ))
+}
+
+fn random_media_name() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut state = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos()),
+    )
+    .unwrap_or(u64::MAX)
+        ^ 0x9e37_79b9_7f4a_7c15;
+    let mut output = String::with_capacity(4);
+    for _ in 0..4 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        output.push(char::from(ALPHABET[(state % 36) as usize]));
+    }
+    output
+}
+
+fn generate_unique_pid(existing: &BTreeSet<PersistentId>) -> PersistentId {
+    let mut state = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos()),
+    )
+    .unwrap_or(u64::MAX)
+        ^ 0xd1b5_4a32_d192_ed03;
+    loop {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let candidate = PersistentId::from_bits(state);
+        if candidate.to_bits() != 0 && !existing.contains(&candidate) {
+            return candidate;
+        }
+    }
 }
 
 fn validate_destination(device: &Device, supplied: &Path) -> Result<PathBuf> {
@@ -631,6 +942,52 @@ fn write_cdb_preview(
     Ok(())
 }
 
+fn write_cdb_additions(
+    device: &Device,
+    directory: &Path,
+    guid: [u8; 8],
+    additions: &[ResolvedAddition],
+) -> Result<()> {
+    let relative = IpodPath::new("iPod_Control/iTunes/iTunesCDB")?;
+    let source = device.mount().resolve_existing(&relative)?;
+    let mut bytes = read_limited(&source, MAX_CDB_BYTES, "iTunesCDB")?;
+    for addition in additions {
+        let cdb_addition = CdbTrackAddition {
+            persistent_id: addition.pid,
+            location: format!(":iPod_Control:Music:{}", addition.media_relative),
+            title: addition.title.clone(),
+            artist: addition.artist.clone(),
+            album: addition.album.clone(),
+            album_artist: addition.album_artist.clone(),
+            genre: addition.genre.clone(),
+            composer: addition.composer.clone(),
+            file_size: u32::try_from(addition.file_size).map_err(|_| Error::Verification {
+                format: "staged CDB addition",
+                reason: "media file exceeds 4 GiB".to_owned(),
+            })?,
+            length_ms: addition.length_ms,
+            bitrate: addition.bitrate,
+            sample_rate: addition.sample_rate,
+            track_number: addition.track_number,
+            total_tracks: addition.total_tracks,
+            disc_number: addition.disc_number,
+            total_discs: addition.total_discs,
+            year: addition.year,
+            compilation: addition.compilation,
+            date_mac: addition.date_mac,
+        };
+        bytes = add_track_to_cdb(&bytes, guid, &cdb_addition)?;
+    }
+    let output = directory.join("iTunesCDB");
+    let mut file = File::create(&output)
+        .map_err(|source| io_error("create staged iTunesCDB", &output, source))?;
+    file.write_all(&bytes)
+        .map_err(|source| io_error("write staged iTunesCDB", &output, source))?;
+    file.sync_all()
+        .map_err(|source| io_error("flush staged iTunesCDB", &output, source))?;
+    Ok(())
+}
+
 fn validate_staged_set(directory: &Path) -> Result<()> {
     for file in SQLITE_FILES {
         let info = inspect_sqlite_database(&directory.join(file.file_name()), file)?;
@@ -648,8 +1005,12 @@ fn validate_semantics(
     before: &Library,
     after: &Library,
     removals: &BTreeSet<PersistentId>,
+    additions: &[ResolvedAddition],
 ) -> Result<()> {
-    let expected_tracks = before.track_count().saturating_sub(removals.len());
+    let expected_tracks = before
+        .track_count()
+        .saturating_sub(removals.len())
+        .saturating_add(additions.len());
     if after.track_count() != expected_tracks
         || after
             .tracks()
@@ -658,8 +1019,25 @@ fn validate_semantics(
     {
         return Err(Error::Verification {
             format: "staged SQLite edit",
-            reason: "reparsed track set differs from the requested removal".to_owned(),
+            reason: "reparsed track set differs from the requested edit".to_owned(),
         });
+    }
+    for addition in additions {
+        let track = after.tracks().iter().find(|track| track.id == addition.pid);
+        let Some(track) = track else {
+            return Err(Error::Verification {
+                format: "staged SQLite edit",
+                reason: "an added track is missing from the reparsed library".to_owned(),
+            });
+        };
+        if track.location.as_str() != format!("iPod_Control/Music/{}", addition.media_relative)
+            || track.size != addition.file_size
+        {
+            return Err(Error::Verification {
+                format: "staged SQLite edit",
+                reason: "an added track's location or size does not match its staging".to_owned(),
+            });
+        }
     }
     if before.playlists().len() != after.playlists().len() {
         return Err(Error::Verification {
@@ -667,6 +1045,7 @@ fn validate_semantics(
             reason: "playlist containers were not preserved".to_owned(),
         });
     }
+    let mut added_in_playlists = 0_usize;
     for (old, new) in before.playlists().iter().zip(after.playlists()) {
         let expected: Vec<_> = old
             .track_ids()
@@ -680,13 +1059,28 @@ fn validate_semantics(
             || old.distinguished_kind != new.distinguished_kind
             || old.is_hidden != new.is_hidden
             || old.is_smart != new.is_smart
-            || expected != new.track_ids()
         {
             return Err(Error::Verification {
                 format: "staged SQLite edit",
-                reason: "playlist metadata or membership was not preserved".to_owned(),
+                reason: "playlist metadata was not preserved".to_owned(),
             });
         }
+        let mut expected_with_additions = expected.clone();
+        expected_with_additions.extend(additions.iter().map(|addition| addition.pid));
+        if new.track_ids() == expected_with_additions {
+            added_in_playlists += additions.len();
+        } else if new.track_ids() != expected {
+            return Err(Error::Verification {
+                format: "staged SQLite edit",
+                reason: "playlist membership was not preserved".to_owned(),
+            });
+        }
+    }
+    if added_in_playlists != additions.len() {
+        return Err(Error::Verification {
+            format: "staged SQLite edit",
+            reason: "added tracks were not joined to the master playlist".to_owned(),
+        });
     }
     Ok(())
 }

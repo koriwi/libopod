@@ -595,11 +595,24 @@ The MIT Rust 2021 crate now exists. The initial M0/M1/M2 foundation includes:
   mid-install with the journal already counting the next file, during output
   validation, and after the committed journal write (which must survive
   recovery untouched); a corrupt journal must refuse recovery and leave the
-  transaction in place. Only the byte-identical no-op hardware gate and the
-  single no-artwork removal gate are publicly enabled; semantic installation
-  and media deletion remain disabled. The `opod-stage-remove` example makes the
-  host-only gate testable from a mounted, preferably read-only iPod without
-  exposing track metadata or device IDs.
+  transaction in place. A staged one-track addition is now also implemented:
+  it allocates a free `Music/Fxx/XXXX.mp3` name in the least-populated media
+  directory, stages a verified copy in the bundle, inserts the `item`,
+  `avformat_info`, `location`, and master `item_to_container` rows, creates or
+  updates album/artist/track_artist/composer/genre rows with shared-counter
+  PIDs and rank-based order fields, rebuilds the CBK, and rewrites the CDB
+  with a new MHIT (0x270 header + MHOD children), an appended MHLA album when
+  needed, rebuilt type-52/53 library indices, a new master-playlist MHIP, and
+  an exact-final-byte HASHAB signature. The transaction engine now treats new
+  media files as absent-original outputs: it verifies their absence before
+  installation, skips backups, and deletes them on rollback. Virtual tests
+  install the addition onto a copy of the fixture, read back 727 tracks with
+  the media file present, and recover an interrupted addition back to 726
+  tracks with the media file removed. Only the byte-identical no-op hardware
+  gate and the single no-artwork removal gate are publicly enabled; semantic
+  installation and media deletion remain disabled. The `opod-stage-remove`
+  example makes the host-only gate testable from a mounted, preferably
+  read-only iPod without exposing track metadata or device IDs.
 
 The current code passes:
 
@@ -633,6 +646,8 @@ Next implementation work:
    leave its MP3 orphaned, then eject/reboot/play/reconnect and record results.
 3. Add staged MP3 allocation/copy and SQLite insertion, followed by matching CDB
    insertion; keep media promotion and deletion disabled until those gates pass.
+   (Staging and virtual installation/recovery are now implemented; expose a
+   hardware gate only after the removal gate passes.)
 4. Implement ArtworkDB/ithmb updates, then connect copyPod. Defer HASH58/HASH72
    and legacy writers until this Nano 7G path is qualified.
 

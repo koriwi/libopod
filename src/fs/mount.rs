@@ -61,6 +61,35 @@ impl MountRoot {
         Ok(resolved)
     }
 
+    /// Resolves a validated path whose final component may be absent, while
+    /// still rejecting symlink escapes through existing parent directories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a parent directory is missing or resolves
+    /// outside this mount root.
+    pub fn resolve_possible(&self, relative: &IpodPath) -> Result<PathBuf> {
+        let mut joined = self.canonical.clone();
+        joined.extend(relative.components());
+        let file_name = joined.file_name().ok_or_else(|| Error::InvalidIpodPath {
+            path: relative.to_string(),
+            reason: "path has no final component".to_owned(),
+        })?;
+        let parent = joined.parent().ok_or_else(|| Error::InvalidIpodPath {
+            path: relative.to_string(),
+            reason: "path has no parent".to_owned(),
+        })?;
+        let resolved_parent = fs::canonicalize(parent)
+            .map_err(|source| io_error("resolve iPod-relative parent", parent, source))?;
+        if !resolved_parent.starts_with(&self.canonical) {
+            return Err(Error::InvalidIpodPath {
+                path: relative.to_string(),
+                reason: "resolved parent escapes the mount root through a symlink".to_owned(),
+            });
+        }
+        Ok(resolved_parent.join(file_name))
+    }
+
     /// Returns whether a validated path currently exists without following it
     /// outside the mount root.
     ///

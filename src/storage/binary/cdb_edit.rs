@@ -51,21 +51,31 @@ pub(crate) fn remove_tracks_from_cdb(
     for dataset in datasets {
         uncompressed.extend_from_slice(&dataset);
     }
+    finalize_cdb(&bytes[..header_length], &uncompressed, firewire_guid)
+}
+
+/// Compresses a rewritten dataset payload, patches the `mhbd` header, applies
+/// the exact-final-byte HASHAB signature, and verifies the result.
+pub(super) fn finalize_cdb(
+    header: &[u8],
+    uncompressed: &[u8],
+    firewire_guid: [u8; 8],
+) -> Result<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder
-        .write_all(&uncompressed)
+        .write_all(uncompressed)
         .map_err(|source| Error::Malformed {
             format: "iTunesCDB",
-            offset: u64::try_from(header_length).unwrap_or(u64::MAX),
+            offset: u64::try_from(header.len()).unwrap_or(u64::MAX),
             reason: format!("could not compress rewritten payload: {source}"),
         })?;
     let compressed = encoder.finish().map_err(|source| Error::Malformed {
         format: "iTunesCDB",
-        offset: u64::try_from(header_length).unwrap_or(u64::MAX),
+        offset: u64::try_from(header.len()).unwrap_or(u64::MAX),
         reason: format!("could not finish rewritten payload: {source}"),
     })?;
 
-    let mut output = bytes[..header_length].to_vec();
+    let mut output = header.to_vec();
     output.extend_from_slice(&compressed);
     write_u16(&mut output, 0xa8, 1)?;
     let output_len =
@@ -394,13 +404,13 @@ fn rewrite_mhip_position(mut chunk: Vec<u8>, removed_values: &[u32]) -> Result<V
 }
 
 #[derive(Clone, Copy)]
-struct ChunkHeader {
-    header_length: usize,
-    total_length: usize,
-    end: usize,
+pub(super) struct ChunkHeader {
+    pub header_length: usize,
+    pub total_length: usize,
+    pub end: usize,
 }
 
-fn chunk_header(bytes: &[u8], offset: usize, magic: &[u8]) -> Result<ChunkHeader> {
+pub(super) fn chunk_header(bytes: &[u8], offset: usize, magic: &[u8]) -> Result<ChunkHeader> {
     require_magic(bytes, offset, magic)?;
     let header_length = usize_value(read_u32(bytes, offset + 4)?, offset + 4)?;
     let total_length = usize_value(read_u32(bytes, offset + 8)?, offset + 8)?;
@@ -415,14 +425,19 @@ fn chunk_header(bytes: &[u8], offset: usize, magic: &[u8]) -> Result<ChunkHeader
     })
 }
 
-fn require_magic(bytes: &[u8], offset: usize, expected: &[u8]) -> Result<()> {
+pub(super) fn require_magic(bytes: &[u8], offset: usize, expected: &[u8]) -> Result<()> {
     if expected.len() != 4 || bytes.get(offset..offset + 4) != Some(expected) {
         return Err(malformed(offset, "unexpected chunk magic"));
     }
     Ok(())
 }
 
-fn checked_end(start: usize, length: usize, bound: usize, offset: usize) -> Result<usize> {
+pub(super) fn checked_end(
+    start: usize,
+    length: usize,
+    bound: usize,
+    offset: usize,
+) -> Result<usize> {
     let end = start
         .checked_add(length)
         .ok_or_else(|| malformed(offset, "chunk length overflow"))?;
@@ -432,11 +447,11 @@ fn checked_end(start: usize, length: usize, bound: usize, offset: usize) -> Resu
     Ok(end)
 }
 
-fn usize_value(value: u32, offset: usize) -> Result<usize> {
+pub(super) fn usize_value(value: u32, offset: usize) -> Result<usize> {
     usize::try_from(value).map_err(|_| malformed(offset, "value does not fit this host"))
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+pub(super) fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
     let value = bytes
         .get(offset..offset + 4)
         .ok_or_else(|| malformed(offset, "truncated u32"))?;
@@ -447,7 +462,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
     ))
 }
 
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+pub(super) fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
     let value = bytes
         .get(offset..offset + 8)
         .ok_or_else(|| malformed(offset, "truncated u64"))?;
@@ -458,7 +473,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
     ))
 }
 
-fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<()> {
+pub(super) fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<()> {
     let target = bytes
         .get_mut(offset..offset + 2)
         .ok_or_else(|| malformed(offset, "truncated u16 target"))?;
@@ -466,7 +481,7 @@ fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<()> {
     Ok(())
 }
 
-fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<()> {
+pub(super) fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<()> {
     let target = bytes
         .get_mut(offset..offset + 4)
         .ok_or_else(|| malformed(offset, "truncated u32 target"))?;
@@ -474,7 +489,15 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<()> {
     Ok(())
 }
 
-fn malformed(offset: usize, reason: &str) -> Error {
+pub(super) fn write_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<()> {
+    let target = bytes
+        .get_mut(offset..offset + 8)
+        .ok_or_else(|| malformed(offset, "truncated u64 target"))?;
+    target.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+pub(super) fn malformed(offset: usize, reason: &str) -> Error {
     Error::Malformed {
         format: "iTunesCDB",
         offset: u64::try_from(offset).unwrap_or(u64::MAX),
@@ -482,7 +505,7 @@ fn malformed(offset: usize, reason: &str) -> Error {
     }
 }
 
-fn verification(reason: &str) -> Error {
+pub(super) fn verification(reason: &str) -> Error {
     Error::Verification {
         format: "iTunesCDB",
         reason: reason.to_owned(),

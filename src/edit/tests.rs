@@ -8,14 +8,16 @@ mod tests {
 
     use super::{
         commit::{
-            install_staged_removal, recover_transaction, FailureMode, TRANSACTION_PATH,
+            install_single_addition_hardware_test, install_staged_removal, recover_transaction,
+            FailureMode, ADDITION_CONFIRMATION, TRANSACTION_PATH,
         },
-        edit_staged_databases, StagedSqliteEdit,
+        edit_staged_databases, TrackToAdd,
     };
     use crate::{
         Device, Error, MountRoot, PersistentId, SqliteLibraryFile,
         NANO7_NOOP_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
     };
+    use std::io::Read as _;
 
     #[test]
     fn removes_direct_references_and_repairs_derived_rows() {
@@ -240,7 +242,180 @@ mod tests {
         recover_transaction(&mount).unwrap();
     }
 
-    fn stage_private_no_artwork_removal() -> Option<(TempDir, StagedSqliteEdit)> {
+    #[test]
+    fn installs_and_reads_back_a_virtual_nano_addition() {
+        let Some((bundle, staged)) = stage_private_addition() else {
+            return;
+        };
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(staged.removed_tracks(), 0);
+        assert_eq!(staged.remaining_tracks(), 727);
+        assert_eq!(staged.added_media().len(), 1);
+        assert!(staged.added_media()[0].as_str().starts_with("iPod_Control/Music/"));
+        verify_staged_addition(&bundle, &staged);
+
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        assert!(install_single_addition_hardware_test(&virtual_device, &staged, "not confirmed")
+            .is_err());
+        install_single_addition_hardware_test(&virtual_device, &staged, ADDITION_CONFIRMATION)
+            .unwrap();
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        let media_target = virtual_root.join(staged.added_media()[0].as_str());
+        assert!(media_target.is_file());
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 727);
+    }
+
+    #[test]
+    fn recovers_an_interrupted_virtual_nano_addition() {
+        let Some((bundle, staged)) = stage_private_addition() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(5),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let media_target = virtual_root.join(staged.added_media()[0].as_str());
+        assert!(!media_target.exists());
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    /// The host generation backup does not include media directories; the
+    /// virtual device needs the allocated `Music/Fxx` parents to exist.
+    fn create_virtual_media_dirs(virtual_root: &Path, added_media: &[crate::IpodPath]) {
+        for media in added_media {
+            let parent = virtual_root.join(media.as_str()).parent().unwrap().to_path_buf();
+            std::fs::create_dir_all(&parent).unwrap();
+        }
+    }
+
+    fn stage_private_addition() -> Option<(TempDir, super::StagedSqliteEdit)> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return None;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let source = fixture
+            .join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return None;
+        }
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "LibOpod Fixture Addition".to_owned(),
+            artist: Some("LibOpod Test Artist".to_owned()),
+            album: Some("LibOpod Test Album".to_owned()),
+            album_artist: None,
+            genre: Some("Test Genre".to_owned()),
+            composer: None,
+            year: 2024,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 192,
+            sample_rate: 44100,
+            length_ms: 155_742,
+            compilation: false,
+        })
+        .unwrap();
+        assert_eq!(edit.addition_count(), 1);
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        Some((bundle, staged))
+    }
+
+    fn verify_staged_addition(bundle: &TempDir, staged: &super::StagedSqliteEdit) {
+        let directory = bundle.path();
+        for file in SqliteLibraryFile::ALL {
+            let info =
+                crate::storage::sqlite::inspect_sqlite_database(&directory.join(file.file_name()), file)
+                    .unwrap();
+            assert!(info.integrity_ok, "{} failed integrity", file.file_name());
+        }
+        let media = directory.join(staged.added_media()[0].as_str());
+        assert!(media.is_file());
+        let (media_bytes, _) =
+            crate::edit::generation::fingerprint_host_file(&media).unwrap();
+        let library = rusqlite::Connection::open(
+            directory.join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let tracks: i64 = library
+            .query_row("SELECT COUNT(*) FROM item", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tracks, 727);
+        let locations = rusqlite::Connection::open(
+            directory.join(SqliteLibraryFile::Locations.file_name()),
+        )
+        .unwrap();
+        let pid: i64 = library
+            .query_row(
+                "SELECT pid FROM item WHERE title = 'LibOpod Fixture Addition'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let location: String = locations
+            .query_row(
+                "SELECT location FROM location WHERE item_pid = ?1",
+                [pid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let relative = staged.added_media()[0].as_str().trim_start_matches("iPod_Control/Music/");
+        assert_eq!(location, relative);
+        let cdb = std::fs::read(directory.join("iTunesCDB")).unwrap();
+        let header_length = u32::from_le_bytes(cdb[4..8].try_into().unwrap()) as usize;
+        let mut decoder = flate2::read::ZlibDecoder::new(&cdb[header_length..]);
+        let mut payload = Vec::new();
+        decoder.read_to_end(&mut payload).unwrap();
+        let datasets = u32::from_le_bytes(cdb[0x14..0x18].try_into().unwrap());
+        let mut offset = 0;
+        let mut track_count = None;
+        let mut album_count = None;
+        for _ in 0..datasets {
+            let hdr = u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let total = u32::from_le_bytes(payload[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let kind = u32::from_le_bytes(payload[offset + 12..offset + 16].try_into().unwrap());
+            let list = offset + hdr;
+            if kind == 1 {
+                track_count =
+                    Some(u32::from_le_bytes(payload[list + 8..list + 12].try_into().unwrap()));
+            }
+            if kind == 4 {
+                album_count =
+                    Some(u32::from_le_bytes(payload[list + 8..list + 12].try_into().unwrap()));
+            }
+            offset += total;
+        }
+        assert_eq!(track_count, Some(727));
+        assert_eq!(album_count, Some(144));
+        let cbk = std::fs::read(directory.join("Locations.itdb.cbk")).unwrap();
+        let locations_bytes =
+            std::fs::read(directory.join(SqliteLibraryFile::Locations.file_name())).unwrap();
+        let info = crate::storage::binary::verify_cbk(&locations_bytes, &cbk, None).unwrap();
+        assert!(info.digests_match());
+        assert!(media_bytes > 0);
+    }
+
+    fn stage_private_no_artwork_removal() -> Option<(TempDir, super::StagedSqliteEdit)> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
         if !fixture.is_dir() {
             return None;

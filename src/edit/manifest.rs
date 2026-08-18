@@ -20,6 +20,7 @@ pub(crate) struct StagingManifest {
     pub profile: String,
     pub operation: String,
     pub removed_tracks: usize,
+    pub added_tracks: usize,
     pub source: Vec<ManifestSourceFile>,
     pub outputs: Vec<ManifestOutputFile>,
 }
@@ -92,12 +93,13 @@ pub(crate) fn write_staging_manifest(
     destination: &Path,
     generation: &GenerationFingerprint,
     removed_tracks: usize,
+    added_targets: &[IpodPath],
 ) -> Result<PathBuf> {
     let profile = device.profile().ok_or_else(|| Error::Unsupported {
         feature: "staging manifest",
         reason: "the device profile is unknown".to_owned(),
     })?;
-    let source = generation
+    let mut source: Vec<ManifestSourceFile> = generation
         .files()
         .iter()
         .map(|file| ManifestSourceFile {
@@ -111,6 +113,15 @@ pub(crate) fn write_staging_manifest(
                 .then(|| format!("original/{}", file.path())),
         })
         .collect();
+    for target in added_targets {
+        source.push(ManifestSourceFile {
+            path: target.to_string(),
+            present: false,
+            bytes: None,
+            sha256: None,
+            backup: None,
+        });
+    }
     let mut outputs = Vec::new();
     for (staged, target) in output_targets()? {
         let path = destination.join(&staged);
@@ -122,17 +133,33 @@ pub(crate) fn write_staging_manifest(
             sha256: hex(&digest),
         });
     }
+    for target in added_targets {
+        let path = destination.join(target.as_str());
+        let (bytes, digest) = fingerprint_host_file(&path)?;
+        outputs.push(ManifestOutputFile {
+            staged: target.to_string(),
+            target: target.to_string(),
+            bytes,
+            sha256: hex(&digest),
+        });
+    }
+    let operation = if removed_tracks == 0 && added_targets.is_empty() {
+        "no-op"
+    } else if removed_tracks == 0 {
+        "add-track"
+    } else if added_targets.is_empty() {
+        "remove-tracks"
+    } else {
+        "edit"
+    }
+    .to_owned();
     let manifest = StagingManifest {
         format: "libopod-staging-manifest".to_owned(),
         version: 1,
         profile: profile.key().to_owned(),
-        operation: if removed_tracks == 0 {
-            "no-op"
-        } else {
-            "remove-tracks"
-        }
-        .to_owned(),
+        operation,
         removed_tracks,
+        added_tracks: added_targets.len(),
         source,
         outputs,
     };
