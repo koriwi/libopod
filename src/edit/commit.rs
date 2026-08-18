@@ -216,7 +216,7 @@ pub(crate) fn install_artwork_addition_hardware_test(
     install_staged_removal(device, staged, FailureMode::RollBack)
 }
 
-pub(crate) fn install_staged_removal(
+pub fn install_staged_removal(
     device: &Device,
     staged: &StagedSqliteEdit,
     failure_mode: FailureMode,

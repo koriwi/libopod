@@ -499,6 +499,27 @@ pub struct StagedSqliteEdit {
 }
 
 impl StagedSqliteEdit {
+    /// Installs the staged transaction on the device the session was opened
+    /// from.
+    ///
+    /// The source generation is re-verified, every staged file is checked
+    /// against its manifest fingerprint, the databases are installed, the
+    /// rewritten library is read back and validated, media deletions (when the
+    /// session used [`MediaDeletionPolicy::Delete`]) are applied, and the
+    /// result is signed. On any failure the transaction is rolled back from
+    /// its on-device backup; an interrupted install is completed or rolled
+    /// back by [`crate::recover_interrupted_transaction`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source generation changed, a staged file
+    /// fails verification, the read-back library does not match the staged
+    /// edit, or any filesystem operation fails. On error the transaction is
+    /// rolled back from its on-device backup.
+    pub fn install(&self, device: &Device) -> Result<()> {
+        self::commit::install_staged_removal(device, self, self::commit::FailureMode::RollBack)
+    }
+
     /// Returns the host directory containing staged database files.
     #[must_use]
     pub fn directory(&self) -> &Path {

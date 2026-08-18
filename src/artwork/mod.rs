@@ -365,7 +365,12 @@ pub(crate) fn reindex_artwork_removals(
 
     let mut new_slots_by_track: BTreeMap<PersistentId, Vec<u32>> = BTreeMap::new();
     let mut next_slot: BTreeMap<String, u32> = BTreeMap::new();
-    let mut new_files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    // Every input file is rewritten, even when no records remain (the file
+    // becomes empty); this keeps the staged output set complete.
+    let mut new_files: BTreeMap<String, Vec<u8>> = files
+        .keys()
+        .map(|name| (name.clone(), Vec::new()))
+        .collect();
     // Shared artwork (reused album art) makes several records reference the
     // same slot; map each (file, old offset) once and reuse the packed slot.
     let mut slot_map: SlotMap = BTreeMap::new();
@@ -738,5 +743,37 @@ mod tests {
         assert_eq!(&rewritten[..8], &bytes[..8]);
         let total: u32 = le_u32(&rewritten, 8).unwrap();
         assert_eq!(usize::try_from(total).unwrap(), rewritten.len());
+    }
+
+    #[test]
+    fn reindexing_every_record_empties_but_keeps_all_files() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        let artwork = fixture.join("iPod_Control/Artwork/ArtworkDB");
+        if !artwork.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&artwork).unwrap();
+        let slot_bytes: BTreeMap<String, u32> = [
+            ("F1010_1.ithmb".to_owned(), 115_200u32),
+            ("F1013_1.ithmb".to_owned(), 5_000),
+            ("F1015_1.ithmb".to_owned(), 6_728),
+            ("F1016_1.ithmb".to_owned(), 6_612),
+        ]
+        .into_iter()
+        .collect();
+        let mut files = BTreeMap::new();
+        for name in slot_bytes.keys() {
+            let path = fixture.join("iPod_Control/Artwork").join(name);
+            files.insert(name.clone(), std::fs::read(&path).unwrap());
+        }
+        let records = parse_artwork_records(&bytes).unwrap();
+        let all: Vec<PersistentId> = records.iter().map(|record| record.track_id).collect();
+        let (rewritten, new_files) =
+            reindex_artwork_removals(&bytes, &all, &files, &slot_bytes).unwrap();
+        assert!(parse_artwork_records(&rewritten).unwrap().is_empty());
+        // Every input file is still produced, emptied, so the staged output
+        // set stays complete.
+        assert_eq!(new_files.len(), 4);
+        assert!(new_files.values().all(Vec::is_empty));
     }
 }
