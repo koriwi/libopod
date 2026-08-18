@@ -531,6 +531,44 @@ mod tests {
         assert_eq!(reopened.library().unwrap().track_count(), 727);
     }
 
+    #[test]
+    fn recovers_an_interrupted_new_art_install_across_ithmb_outputs() {
+        let Some((bundle, staged)) = stage_private_new_art_addition() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        // Output order: 5 DBs, CBK, CDB, ArtworkDB, 4 ithmb files, media.
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(9),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let artwork =
+            std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        assert_eq!(crate::artwork::parse_artwork_records(&artwork).unwrap().len(), 704);
+        for ithmb in staged.added_ithmb() {
+            let original_size = std::fs::metadata(
+                bundle.path().join("original").join(ithmb.as_str()),
+            )
+            .unwrap()
+            .len();
+            let restored =
+                std::fs::metadata(virtual_root.join(ithmb.as_str())).unwrap().len();
+            assert_eq!(restored, original_size, "{} not restored", ithmb.as_str());
+        }
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
     fn stage_private_new_art_addition() -> Option<(TempDir, super::StagedSqliteEdit)> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
         if !fixture.is_dir() {
