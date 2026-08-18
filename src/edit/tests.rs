@@ -468,7 +468,7 @@ mod tests {
                             u32::from_le_bytes(payload[toff + 0x0c..toff + 0x10].try_into().unwrap());
                         let mut coff = toff + hh;
                         for _ in 0..cc {
-                            let ch = u32::from_le_bytes(payload[coff + 4..coff + 8].try_into().unwrap()) as usize;
+                            let _ch = u32::from_le_bytes(payload[coff + 4..coff + 8].try_into().unwrap()) as usize;
                             let ct = u32::from_le_bytes(payload[coff + 8..coff + 12].try_into().unwrap()) as usize;
                             let mhod_type =
                                 u32::from_le_bytes(payload[coff + 12..coff + 16].try_into().unwrap());
