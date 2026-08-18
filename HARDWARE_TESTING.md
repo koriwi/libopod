@@ -130,7 +130,9 @@ cargo run --release --example opod-hardware-test -- \
 If interrupted, run the same `recover` command documented above. On success,
 safely eject and reboot. Confirm the library has one more track, play the new
 track and browse its album/artist, reconnect, and run `opod-inspect`. Expected
-inspection changes are 727 tracks, valid SQLite and CBK, and `Some(Valid)`
+inspection changes are one more track than before the gate (725 → 726 on a
+device that already ran gate 2; the pristine-fixture virtual tests expect
+727 = 726 + 1), valid SQLite and CBK, and `Some(Valid)`
 for the newly generated CDB HASHAB signature. ArtworkDB should still have 704
 records.
 
@@ -143,8 +145,9 @@ The full matrix is specified in `plan.md` sections 10 and 12.
 
 The real Nano 7G addition transaction completed, read back successfully, and
 survived safe eject/reboot: the operator found the newly added track
-immediately in the browse lists and played it without issue. This qualifies
-the staged media allocation and installation, the SQLite `item`/
+immediately in the browse lists, played it without issue, and the device and
+CLI both reported 726 tracks (725 after gate 2, plus the one added track). This
+qualifies the staged media allocation and installation, the SQLite `item`/
 `avformat_info`/`location`/container insertion, album/artist/composer/genre
 resolution, the rebuilt CBK, the new CDB MHIT with rebuilt type-52/53 library
 indices and master-playlist MHIP, and the exact-final-byte HASHAB signature on
