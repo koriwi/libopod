@@ -608,11 +608,12 @@ The MIT Rust 2021 crate now exists. The initial M0/M1/M2 foundation includes:
   installation, skips backups, and deletes them on rollback. Virtual tests
   install the addition onto a copy of the fixture, read back 727 tracks with
   the media file present, and recover an interrupted addition back to 726
-  tracks with the media file removed. Only the byte-identical no-op hardware
-  gate and the single no-artwork removal gate are publicly enabled; semantic
-  installation and media deletion remain disabled. The `opod-stage-remove`
-  example makes the host-only gate testable from a mounted, preferably
-  read-only iPod without exposing track metadata or device IDs.
+  tracks with the media file removed. The byte-identical no-op, the single
+  no-artwork removal, and the single no-artwork addition hardware gates are
+  publicly enabled; media deletion, artwork mutation, and copyPod
+  synchronization remain disabled. The `opod-stage-remove` example makes the
+  host-only gate testable from a mounted, preferably read-only iPod without
+  exposing track metadata or device IDs.
 
 The current code passes:
 
@@ -624,11 +625,14 @@ cargo test --no-default-features --features system-sqlite
 cargo doc --no-deps --all-features
 ```
 
-The first real Nano 7G hardware gate has passed: the explicitly confirmed
-byte-identical transaction completed and read back, the operator safely
-ejected/rebooted, and playback continued to work. This validates transaction
-installation on this device but not yet the corrected CDB signature or semantic
-library mutation.
+The first two real Nano 7G hardware gates have passed. The no-op gate
+validated the byte-identical transaction path (read back, reboot, playback).
+The removal gate then validated the first semantic mutation on hardware: the
+explicitly confirmed one-track no-artwork removal completed, read back, and
+both the CLI and the device firmware reported 725 tracks after reboot. This
+qualifies the schema-preserving SQLite removal, the CBK rebuild, and the
+corrected exact-final-byte HASHAB CDB signature on real firmware. The orphaned
+MP3 remains on disk as intended.
 
 The private tests verify all structural observations in section 15 and stage a
 one-track removal into a temporary host directory. The staged set has 725
@@ -642,14 +646,13 @@ only opened read-only; its essential file hashes remain unchanged.
 Next implementation work:
 
 1. Treat `backup_7g/` as immutable and private; confirm it remains ignored.
-2. Run the now-exposed, explicitly confirmed one-track no-artwork removal gate,
-   leave its MP3 orphaned, then eject/reboot/play/reconnect and record results.
-3. Add staged MP3 allocation/copy and SQLite insertion, followed by matching CDB
-   insertion; keep media promotion and deletion disabled until those gates pass.
-   (Staging and virtual installation/recovery are now implemented; expose a
-   hardware gate only after the removal gate passes.)
-4. Implement ArtworkDB/ithmb updates, then connect copyPod. Defer HASH58/HASH72
-   and legacy writers until this Nano 7G path is qualified.
+2. Run the now-exposed, explicitly confirmed one-track no-artwork addition gate
+   on the real Nano 7G (`opod-hardware-test add`), leave the media file in its
+   allocated `Music/Fxx` directory, then eject/reboot/play/reconnect and record
+   results. Expected: 727 tracks, valid signatures, no restore warning.
+3. Implement ArtworkDB/ithmb updates (needed before removal of artwork-bearing
+   tracks and before artwork-bearing additions), then connect copyPod. Defer
+   HASH58/HASH72 and legacy writers until this Nano 7G path is qualified.
 
 ## 17. copyPod migration spike
 

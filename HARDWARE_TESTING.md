@@ -96,6 +96,45 @@ CBK, and `Some(Valid)` for the newly generated CDB HASHAB signature. ArtworkDB
 should still have 704 records.
 
 Stop if the firmware or Apple software requests a restore. Do not run copyPod
-or delete the orphan MP3 yet. CopyPod synchronization remains disabled until
-this removal gate and subsequent insertion/artwork gates pass. The full matrix
-is specified in `plan.md` sections 10 and 12.
+or delete the orphan MP3 yet.
+
+### Gate 2 result
+
+The real Nano 7G removal transaction completed, read back successfully, and
+both the CLI and the device firmware reported 725 tracks after reboot: the
+semantic SQLite removal, CBK rebuild, exact-final-byte HASHAB CDB signature,
+and recoverable transaction path are now qualified on hardware. The orphaned
+MP3 remains on disk as intended.
+
+## Nano 7G gate 3: one no-artwork MP3 addition
+
+This gate adds exactly one MP3 track without artwork: it allocates a free
+`Music/Fxx/XXXX.mp3` name, stages a verified copy in the bundle, inserts the
+`item`/`avformat_info`/`location`/master `item_to_container` rows, creates or
+updates album/artist/composer/genre rows, rebuilds the CBK, rewrites the CDB
+with a new MHIT and rebuilt library indices, and installs everything
+recoverably. Bitrate is recorded as 192 kbps and the sample rate as 44100 Hz;
+supply the duration in milliseconds. Keep both the complete external backup
+and the new host transaction bundle.
+
+Create another empty host directory and run (SOURCE_MP3 must be an MP3 file on
+host storage; use `LENGTH_MS` from the file's actual duration):
+
+```console
+cargo run --release --example opod-hardware-test -- \
+  add /path/to/ipod /path/to/source.mp3 'TITLE' 'ARTIST' 'ALBUM' LENGTH_MS \
+  /path/to/empty-host-directory \
+  'I HAVE A VERIFIED BACKUP; ADD ONE NO-ARTWORK MP3 TRACK'
+```
+
+If interrupted, run the same `recover` command documented above. On success,
+safely eject and reboot. Confirm the library has one more track, play the new
+track and browse its album/artist, reconnect, and run `opod-inspect`. Expected
+inspection changes are 727 tracks, valid SQLite and CBK, and `Some(Valid)`
+for the newly generated CDB HASHAB signature. ArtworkDB should still have 704
+records.
+
+Stop if the firmware or Apple software requests a restore. Do not run copyPod
+or repeat the gate until the reboot checks pass. CopyPod synchronization
+remains disabled until this addition gate and subsequent artwork gates pass.
+The full matrix is specified in `plan.md` sections 10 and 12.

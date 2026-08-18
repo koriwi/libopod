@@ -8,8 +8,8 @@ mod tests {
 
     use super::{
         commit::{
-            install_single_addition_hardware_test, install_staged_removal, recover_transaction,
-            FailureMode, ADDITION_CONFIRMATION, TRANSACTION_PATH,
+            install_staged_removal, recover_transaction, FailureMode, ADDITION_CONFIRMATION,
+            TRANSACTION_PATH,
         },
         edit_staged_databases, TrackToAdd,
     };
@@ -257,9 +257,11 @@ mod tests {
         let virtual_root = bundle.path().join("original");
         create_virtual_media_dirs(&virtual_root, staged.added_media());
         let virtual_device = Device::open(&virtual_root).unwrap();
-        assert!(install_single_addition_hardware_test(&virtual_device, &staged, "not confirmed")
+        assert!(virtual_device
+            .install_single_addition_hardware_test(&staged, "not confirmed")
             .is_err());
-        install_single_addition_hardware_test(&virtual_device, &staged, ADDITION_CONFIRMATION)
+        virtual_device
+            .install_single_addition_hardware_test(&staged, ADDITION_CONFIRMATION)
             .unwrap();
         assert!(!virtual_root.join(TRANSACTION_PATH).exists());
         let media_target = virtual_root.join(staged.added_media()[0].as_str());

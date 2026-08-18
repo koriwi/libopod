@@ -17,9 +17,6 @@ pub(crate) const TRANSACTION_PATH: &str = "iPod_Control/iTunes/.libopod-transact
 pub(crate) const NOOP_CONFIRMATION: &str = "I HAVE A VERIFIED BACKUP; RUN NANO 7G NO-OP WRITE TEST";
 pub(crate) const REMOVAL_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; REMOVE ONE NO-ARTWORK TRACK AND KEEP ITS MEDIA FILE";
-// The addition gate is exercised by virtual tests today; the public hardware
-// example will reference it once the removal gate passes on hardware.
-#[allow(dead_code)]
 pub(crate) const ADDITION_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; ADD ONE NO-ARTWORK MP3 TRACK";
 const JOURNAL_NAME: &str = "journal.json";
@@ -100,7 +97,6 @@ pub(crate) fn install_single_removal_hardware_test(
     install_staged_removal(device, staged, FailureMode::RollBack)
 }
 
-#[allow(dead_code)]
 pub(crate) fn install_single_addition_hardware_test(
     device: &Device,
     staged: &StagedSqliteEdit,

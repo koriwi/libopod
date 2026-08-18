@@ -17,7 +17,8 @@ use rusqlite::{Connection, OpenFlags, Transaction};
 
 pub(crate) use add::{add_tracks_to_staged_databases, ResolvedAddition};
 pub(crate) use commit::{
-    install_noop_hardware_test, install_single_removal_hardware_test, pending_transaction,
+    install_noop_hardware_test, install_single_addition_hardware_test,
+    install_single_removal_hardware_test, pending_transaction,
 };
 
 use self::generation::fingerprint_host_file;
@@ -41,6 +42,9 @@ pub const NANO7_NOOP_HARDWARE_TEST_CONFIRMATION: &str = commit::NOOP_CONFIRMATIO
 
 /// Exact acknowledgement required by the single no-artwork removal gate.
 pub const NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION: &str = commit::REMOVAL_CONFIRMATION;
+
+/// Exact acknowledgement required by the single no-artwork addition gate.
+pub const NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION: &str = commit::ADDITION_CONFIRMATION;
 
 /// Metadata for one track to add to the staged library.
 ///

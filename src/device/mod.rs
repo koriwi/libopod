@@ -158,6 +158,25 @@ impl Device {
         crate::edit::install_single_removal_hardware_test(self, staged, confirmation)
     }
 
+    /// Installs one staged no-artwork MP3 addition as a Nano 7G hardware test.
+    ///
+    /// The database transaction is recoverable and read back before success;
+    /// the staged media file is installed alongside the database companions.
+    /// This is a qualification gate, not general sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before mutation unless the bundle adds exactly one
+    /// MP3 track without artwork to this generation and `confirmation` exactly
+    /// equals [`crate::NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION`].
+    pub fn install_single_addition_hardware_test(
+        &self,
+        staged: &crate::StagedSqliteEdit,
+        confirmation: &str,
+    ) -> Result<()> {
+        crate::edit::install_single_addition_hardware_test(self, staged, confirmation)
+    }
+
     /// Starts an in-memory edit session without modifying the device.
     ///
     /// # Errors
