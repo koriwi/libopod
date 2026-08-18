@@ -373,7 +373,19 @@ fn install_inner(
         let target = device.mount().resolve_existing(&relative)?;
         fs::remove_file(&target)
             .map_err(|source| io_error("delete removed media", &target, source))?;
-        sync_directory(target.parent().unwrap_or(device.mount().as_path()))?;
+    }
+    // Unlink durability on a USB flash filesystem is dominated by the
+    // directory fsync, so sync each affected parent directory once instead of
+    // once per deleted file. A full-library mirror drops from hundreds of
+    // syncs to a handful.
+    let mut synced = std::collections::BTreeSet::new();
+    for deletion in &journal.staging.deletions {
+        let relative = IpodPath::new(deletion.target.clone())?;
+        let target = device.mount().resolve_possible(&relative)?;
+        let parent = target.parent().unwrap_or(device.mount().as_path());
+        if synced.insert(parent.to_path_buf()) {
+            sync_directory(parent)?;
+        }
     }
 
     journal.phase = TransactionPhase::Validating;
