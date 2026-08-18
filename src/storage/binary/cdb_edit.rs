@@ -362,6 +362,26 @@ fn rewrite_mhod53(chunk: &[u8], removed_slots: &[u32]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Returns the end of an `mhod` child at `offset`, clamped to the parent
+/// length, or `None` when the bytes there are not a plausible `mhod`.
+///
+/// Nano 7G playlists embed each track's playlist order as a single `mhod`
+/// child inside its `mhip`, and the firmware may truncate the trailing bytes
+/// of the last `mhip` while leaving the child's claimed total unchanged.
+/// Clamping lets the walk survive that quirk instead of failing the whole
+/// rewrite.
+fn mhod_child_end(bytes: &[u8], offset: usize) -> Option<usize> {
+    if bytes.get(offset..offset + 4) != Some(b"mhod") {
+        return None;
+    }
+    let header_length = read_u32(bytes, offset + 4).ok()? as usize;
+    let total_length = read_u32(bytes, offset + 8).ok()? as usize;
+    if header_length < 12 || total_length < header_length {
+        return None;
+    }
+    Some(offset.saturating_add(total_length).min(bytes.len()))
+}
+
 fn mhip_position(chunk: &[u8]) -> Result<Option<u32>> {
     let header = chunk_header(chunk, 0, b"mhip")?;
     if header.header_length < 16 {
@@ -370,11 +390,16 @@ fn mhip_position(chunk: &[u8]) -> Result<Option<u32>> {
     let child_count = usize_value(read_u32(chunk, 12)?, 12)?;
     let mut offset = header.header_length;
     for _ in 0..child_count {
-        let child = chunk_header(chunk, offset, b"mhod")?;
-        if read_u32(chunk, offset + 12)? == 100 && child.header_length + 4 <= child.total_length {
-            return read_u32(chunk, offset + child.header_length).map(Some);
+        let Some(end) = mhod_child_end(chunk, offset) else {
+            break;
+        };
+        if read_u32(chunk, offset + 12)? == 100
+            && offset + 16 + 4 <= chunk.len()
+            && offset + 16 + 4 <= end
+        {
+            return read_u32(chunk, offset + 16).map(Some);
         }
-        offset = child.end;
+        offset = end;
     }
     Ok(None)
 }
@@ -384,9 +409,14 @@ fn rewrite_mhip_position(mut chunk: Vec<u8>, removed_values: &[u32]) -> Result<V
     let child_count = usize_value(read_u32(&chunk, 12)?, 12)?;
     let mut offset = header.header_length;
     for _ in 0..child_count {
-        let child = chunk_header(&chunk, offset, b"mhod")?;
-        if read_u32(&chunk, offset + 12)? == 100 && child.header_length + 4 <= child.total_length {
-            let value_offset = offset + child.header_length;
+        let Some(end) = mhod_child_end(&chunk, offset) else {
+            break;
+        };
+        let unclamped_end = offset
+            .checked_add(read_u32(&chunk, offset + 8)? as usize)
+            .unwrap_or(chunk.len());
+        if read_u32(&chunk, offset + 12)? == 100 && offset + 16 + 4 <= chunk.len() {
+            let value_offset = offset + 16;
             let value = read_u32(&chunk, value_offset)?;
             let shift = removed_values
                 .iter()
@@ -398,7 +428,19 @@ fn rewrite_mhip_position(mut chunk: Vec<u8>, removed_values: &[u32]) -> Result<V
                 value.saturating_sub(u32::try_from(shift).unwrap_or(u32::MAX)),
             )?;
         }
-        offset = child.end;
+        offset = end;
+        if end == chunk.len() {
+            // The child (possibly firmware-truncated) fills the mhip. When its
+            // claimed total runs past the end, pad the mhip back out so the
+            // rewritten playlist stays self-consistent.
+            if unclamped_end > chunk.len() {
+                chunk.resize(unclamped_end, 0);
+                let total = u32::try_from(chunk.len())
+                    .map_err(|_| verification("rewritten mhip exceeds u32"))?;
+                write_u32(&mut chunk, 8, total)?;
+            }
+            break;
+        }
     }
     Ok(chunk)
 }
@@ -406,7 +448,6 @@ fn rewrite_mhip_position(mut chunk: Vec<u8>, removed_values: &[u32]) -> Result<V
 #[derive(Clone, Copy)]
 pub(super) struct ChunkHeader {
     pub header_length: usize,
-    pub total_length: usize,
     pub end: usize,
 }
 
@@ -420,7 +461,6 @@ pub(super) fn chunk_header(bytes: &[u8], offset: usize, magic: &[u8]) -> Result<
     let end = checked_end(offset, total_length, bytes.len(), offset + 8)?;
     Ok(ChunkHeader {
         header_length,
-        total_length,
         end,
     })
 }
@@ -509,5 +549,59 @@ pub(super) fn verification(reason: &str) -> Error {
     Error::Verification {
         format: "iTunesCDB",
         reason: reason.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod device_cdb_tests {
+    use std::path::Path;
+
+    use crate::PersistentId;
+
+    #[test]
+    fn removal_round_trips_the_copied_device_cdb() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("iTunesCDB");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let header_length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let payload = super::super::cdb::decode_payload(&bytes, header_length).unwrap();
+        let datasets = u32::from_le_bytes(bytes[0x14..0x18].try_into().unwrap());
+        let mut offset = 0;
+        let mut pids = Vec::new();
+        for _ in 0..datasets {
+            let hdr =
+                u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let total =
+                u32::from_le_bytes(payload[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let kind = u32::from_le_bytes(payload[offset + 12..offset + 16].try_into().unwrap());
+            if kind == 1 {
+                let list = offset + hdr;
+                let lh =
+                    u32::from_le_bytes(payload[list + 4..list + 8].try_into().unwrap()) as usize;
+                let count = u32::from_le_bytes(payload[list + 8..list + 12].try_into().unwrap());
+                let mut toff = list + lh;
+                for _ in 0..count {
+                    let track_pid =
+                        u64::from_le_bytes(payload[toff + 0x70..toff + 0x78].try_into().unwrap());
+                    pids.push(PersistentId::from_bits(track_pid));
+                    toff += u32::from_le_bytes(payload[toff + 8..toff + 12].try_into().unwrap())
+                        as usize;
+                }
+            }
+            offset += total;
+        }
+        assert!(pids.len() > 2, "device CDB has enough tracks");
+        let first = super::remove_tracks_from_cdb(&bytes, [0u8; 8], &[pids[1]]);
+        let rewritten = first
+            .unwrap_or_else(|error| panic!("removal of the copied device CDB failed: {error:?}"));
+        // The rewritten CDB must itself re-parse: remove a second track from
+        // our own output to prove the round trip stays structurally sound.
+        let second = super::remove_tracks_from_cdb(&rewritten, [0u8; 8], &[pids[2]]);
+        assert!(
+            second.is_ok(),
+            "second removal from rewritten device CDB failed: {second:?}"
+        );
     }
 }
