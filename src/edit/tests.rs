@@ -1,7 +1,7 @@
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, path::Path};
+    use std::{collections::BTreeSet, fs, path::Path};
 
     use rusqlite::Connection;
     use tempfile::{tempdir, TempDir};
@@ -110,6 +110,134 @@ mod tests {
         recover_transaction(&mount).unwrap();
         let reopened = Device::open(&virtual_root).unwrap();
         assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn recovers_an_interruption_mid_backup() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        let error = install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionDuringBackupAfter(4),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Verification { .. }));
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn recovers_an_interruption_before_any_file_is_installed() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        let error = install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(0),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Verification { .. }));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn recovers_an_interruption_during_validation() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        let error = install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionDuringValidation,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Verification { .. }));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn keeps_a_committed_transaction_through_recovery() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        let error = install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfterCommitted,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Verification { .. }));
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        let reopened = Device::open(&virtual_root).unwrap();
+        // A committed transaction must survive recovery without rollback.
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+    }
+
+    #[test]
+    fn refuses_recovery_with_a_corrupt_journal() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(1),
+        )
+        .unwrap_err();
+        let transaction = virtual_root.join(TRANSACTION_PATH);
+        fs::write(transaction.join("journal.json"), b"not a journal").unwrap();
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        let error = recover_transaction(&mount).unwrap_err();
+        assert!(matches!(error, Error::Malformed { .. }));
+        // A corrupt journal must leave the transaction untouched for manual review.
+        assert!(transaction.exists());
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn recovery_is_a_noop_without_a_pending_transaction() {
+        let directory = tempdir().unwrap();
+        let mount = MountRoot::open(directory.path()).unwrap();
+        recover_transaction(&mount).unwrap();
     }
 
     fn stage_private_no_artwork_removal() -> Option<(TempDir, StagedSqliteEdit)> {

@@ -590,11 +590,16 @@ The MIT Rust 2021 crate now exists. The initial M0/M1/M2 foundation includes:
   creates and verifies same-volume backups, durably journals intent before each
   replacement, installs through flushed sibling files, validates every output,
   reopens the library, and supports strict interrupted-state rollback. Virtual
-  Nano tests pass for no-op installation, one-track installation, and an
-  injected interruption followed by recovery. Only the byte-identical no-op
-  hardware gate is publicly enabled; semantic installation and media deletion
-  remain disabled. The `opod-stage-remove` example makes this host-only gate testable from a mounted,
-  preferably read-only iPod without exposing track metadata or device IDs.
+  Nano tests pass for no-op installation, one-track installation, and injected
+  interruptions at every durable boundary: mid-backup, before any install,
+  mid-install with the journal already counting the next file, during output
+  validation, and after the committed journal write (which must survive
+  recovery untouched); a corrupt journal must refuse recovery and leave the
+  transaction in place. Only the byte-identical no-op hardware gate and the
+  single no-artwork removal gate are publicly enabled; semantic installation
+  and media deletion remain disabled. The `opod-stage-remove` example makes the
+  host-only gate testable from a mounted, preferably read-only iPod without
+  exposing track metadata or device IDs.
 
 The current code passes:
 
@@ -626,13 +631,9 @@ Next implementation work:
 1. Treat `backup_7g/` as immutable and private; confirm it remains ignored.
 2. Run the now-exposed, explicitly confirmed one-track no-artwork removal gate,
    leave its MP3 orphaned, then eject/reboot/play/reconnect and record results.
-3. Expand fault injection across every backup, journal, install, validation, and
-   cleanup boundary and prove recovery from each durable state.
-4. If the no-op gate passes, expose a one-track, no-artwork removal that leaves
-   the MP3 as an orphan; hardware-test reboot and rollback before deleting media.
-5. Add staged MP3 allocation/copy and SQLite insertion, followed by matching CDB
+3. Add staged MP3 allocation/copy and SQLite insertion, followed by matching CDB
    insertion; keep media promotion and deletion disabled until those gates pass.
-6. Implement ArtworkDB/ithmb updates, then connect copyPod. Defer HASH58/HASH72
+4. Implement ArtworkDB/ithmb updates, then connect copyPod. Defer HASH58/HASH72
    and legacy writers until this Nano 7G path is qualified.
 
 ## 17. copyPod migration spike

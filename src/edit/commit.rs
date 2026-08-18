@@ -23,7 +23,13 @@ const JOURNAL_NAME: &str = "journal.json";
 pub(crate) enum FailureMode {
     RollBack,
     #[cfg(test)]
+    SimulateInterruptionDuringBackupAfter(usize),
+    #[cfg(test)]
     SimulateInterruptionAfter(usize),
+    #[cfg(test)]
+    SimulateInterruptionDuringValidation,
+    #[cfg(test)]
+    SimulateInterruptionAfterCommitted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -152,7 +158,9 @@ fn install_inner(
     };
     write_journal(transaction, &journal)?;
 
-    for output in &journal.staging.outputs {
+    for (outputs_backed_up, output) in journal.staging.outputs.iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = outputs_backed_up;
         let original = original_state(&journal.staging, output)?;
         let (Some(bytes), Some(digest)) = (original.bytes, original.sha256.as_deref()) else {
             return Err(Error::Unsupported {
@@ -164,6 +172,13 @@ fn install_inner(
         verify_file(&target, bytes, digest, "live transaction input")?;
         let backup_file = backup.join(&output.staged);
         copy_new_verified(&target, &backup_file, bytes, digest)?;
+        #[cfg(test)]
+        if failure_mode == FailureMode::SimulateInterruptionDuringBackupAfter(outputs_backed_up) {
+            return Err(Error::Verification {
+                format: "injected transaction interruption",
+                reason: format!("stopped after {outputs_backed_up} backed-up files"),
+            });
+        }
     }
     sync_directory(&backup)?;
     staged
@@ -173,6 +188,13 @@ fn install_inner(
     journal.phase = TransactionPhase::Installing;
     write_journal(transaction, &journal)?;
     for (index, output) in journal.staging.outputs.iter().enumerate() {
+        #[cfg(test)]
+        if failure_mode == FailureMode::SimulateInterruptionAfter(index) {
+            return Err(Error::Verification {
+                format: "injected transaction interruption",
+                reason: format!("stopped before installing file {index}"),
+            });
+        }
         journal.installed = index + 1;
         write_journal(transaction, &journal)?;
         let staged_file = staged.directory().join(&output.staged);
@@ -184,13 +206,6 @@ fn install_inner(
         )?;
         let target = resolve_target(device.mount(), output)?;
         install_file(&staged_file, &target, index)?;
-        #[cfg(test)]
-        if failure_mode == FailureMode::SimulateInterruptionAfter(index + 1) {
-            return Err(Error::Verification {
-                format: "injected transaction interruption",
-                reason: format!("stopped after {} installed files", index + 1),
-            });
-        }
     }
 
     journal.phase = TransactionPhase::Validating;
@@ -198,6 +213,13 @@ fn install_inner(
     for output in &journal.staging.outputs {
         let target = resolve_target(device.mount(), output)?;
         verify_file(&target, output.bytes, &output.sha256, "installed output")?;
+        #[cfg(test)]
+        if failure_mode == FailureMode::SimulateInterruptionDuringValidation {
+            return Err(Error::Verification {
+                format: "injected transaction interruption",
+                reason: "stopped during output validation".to_owned(),
+            });
+        }
     }
     let reopened = Device::open_during_transaction(device.mount().as_path())?;
     if reopened.library().map_or(0, crate::Library::track_count) != staged.remaining_tracks() {
@@ -209,6 +231,13 @@ fn install_inner(
 
     journal.phase = TransactionPhase::Committed;
     write_journal(transaction, &journal)?;
+    #[cfg(test)]
+    if failure_mode == FailureMode::SimulateInterruptionAfterCommitted {
+        return Err(Error::Verification {
+            format: "injected transaction interruption",
+            reason: "stopped after the committed journal write".to_owned(),
+        });
+    }
     remove_transaction_directory(transaction)?;
     Ok(())
 }
