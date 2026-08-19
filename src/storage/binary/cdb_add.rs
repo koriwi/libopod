@@ -47,6 +47,7 @@ const MHOD_TYPE_LOCATION: u32 = 2;
 const MHOD_TYPE_ALBUM: u32 = 3;
 const MHOD_TYPE_ARTIST: u32 = 4;
 const MHOD_TYPE_GENRE: u32 = 5;
+const MHOD_TYPE_FILETYPE: u32 = 6;
 const MHOD_TYPE_COMPOSER: u32 = 12;
 const MHOD_TYPE_SHOW_NAME: u32 = 19;
 const MHOD_TYPE_ALBUM_ARTIST: u32 = 22;
@@ -356,6 +357,7 @@ pub(super) fn rewrite_track_dataset(
         .checked_add(1)
         .ok_or_else(|| verification("CDB track ID overflow"))?;
     let artist_id_ref = resolve_artist_id_ref(&tracks, addition);
+    let mhod_profile = first_track_mhod_types(dataset)?;
     output.extend_from_slice(&build_mhit(
         addition,
         db_id_2,
@@ -363,6 +365,7 @@ pub(super) fn rewrite_track_dataset(
         album_id,
         artist_id_ref,
         mhit_header_size,
+        &mhod_profile,
     ));
     write_u32(
         &mut output,
@@ -961,6 +964,44 @@ fn build_mhod_string(mhod_type: u32, text: &str) -> Vec<u8> {
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+/// Reads the `mhod` type profile (types in order) of the first existing
+/// track, so appended tracks carry exactly the child set the device firmware
+/// expects — the same principle as mirroring the `mhit` header size. Old
+/// firmware (Nano 2G) walks a track's children in order and needs the
+/// filetype mhod (6) to classify a track as playable; writing a different
+/// set/order hides the new tracks.
+fn first_track_mhod_types(dataset: &[u8]) -> Result<Vec<u32>> {
+    let header = chunk_header(dataset, 0, b"mhsd")?;
+    let list = header.header_length;
+    require_magic(dataset, list, b"mhlt")?;
+    let list_header = usize_value(read_u32(dataset, list + 4)?, list + 4)?;
+    let count = usize_value(read_u32(dataset, list + 8)?, list + 8)?;
+    if count == 0 {
+        // No existing track to mirror: use the modern classic profile.
+        return Ok(vec![
+            MHOD_TYPE_TITLE,
+            MHOD_TYPE_ARTIST,
+            MHOD_TYPE_ALBUM,
+            MHOD_TYPE_FILETYPE,
+            MHOD_TYPE_LOCATION,
+            MHOD_TYPE_GENRE,
+            MHOD_TYPE_ALBUM_ARTIST,
+        ]);
+    }
+    let body = checked_end(list, list_header, dataset.len(), list + 4)?;
+    let track = chunk_header(dataset, body, b"mhit")?;
+    let child_count = usize_value(read_u32(dataset, body + MHIT_CHILD_COUNT)?, MHIT_CHILD_COUNT)?;
+    let mut types = Vec::with_capacity(child_count);
+    let mut offset = body + track.header_length;
+    for _ in 0..child_count {
+        let mhod = chunk_header(dataset, offset, b"mhod")?;
+        types.push(read_u32(dataset, offset + 12)?);
+        offset = mhod.end;
+    }
+    Ok(types)
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn build_mhit(
     addition: &CdbTrackAddition,
     db_id_2: u64,
@@ -968,25 +1009,33 @@ fn build_mhit(
     album_id: u32,
     artist_id_ref: u32,
     header_size: usize,
+    mhod_profile: &[u32],
 ) -> Vec<u8> {
     let artwork = addition.artwork;
-    let mhod_fields = [
-        (MHOD_TYPE_TITLE, Some(addition.title.clone())),
-        (MHOD_TYPE_LOCATION, Some(addition.location.clone())),
-        (MHOD_TYPE_ARTIST, addition.artist.clone()),
-        (MHOD_TYPE_ALBUM, addition.album.clone()),
-        (MHOD_TYPE_GENRE, addition.genre.clone()),
-        (MHOD_TYPE_ALBUM_ARTIST, addition.album_artist.clone()),
-        (MHOD_TYPE_COMPOSER, addition.composer.clone()),
-    ];
     let mut mhods = Vec::new();
     let mut child_count = 0_u32;
-    for (mhod_type, text) in mhod_fields {
+    for &mhod_type in mhod_profile {
+        let text = match mhod_type {
+            MHOD_TYPE_TITLE => Some(addition.title.clone()),
+            MHOD_TYPE_LOCATION => Some(addition.location.clone()),
+            MHOD_TYPE_ALBUM => Some(addition.album.clone().unwrap_or_default()),
+            MHOD_TYPE_ARTIST => Some(addition.artist.clone().unwrap_or_default()),
+            MHOD_TYPE_GENRE => addition.genre.clone(),
+            MHOD_TYPE_FILETYPE => Some("MPEG audio file".to_owned()),
+            MHOD_TYPE_ALBUM_ARTIST => Some(
+                addition
+                    .album_artist
+                    .clone()
+                    .or_else(|| addition.artist.clone())
+                    .unwrap_or_default(),
+            ),
+            MHOD_TYPE_COMPOSER => addition.composer.clone(),
+            // Sort/other mhods cannot be rebuilt faithfully; omit them.
+            _ => None,
+        };
         if let Some(text) = text {
-            if !text.is_empty() {
-                mhods.extend_from_slice(&build_mhod_string(mhod_type, &text));
-                child_count += 1;
-            }
+            mhods.extend_from_slice(&build_mhod_string(mhod_type, &text));
+            child_count += 1;
         }
     }
     if child_count < 2 {

@@ -445,3 +445,82 @@ mod tests {
         assert!(!library.playlists().is_empty(), "no playlists parsed");
     }
 }
+
+#[cfg(test)]
+mod nano2_add_regression {
+    use super::*;
+    use crate::storage::binary::cdb_edit::split_datasets;
+    use crate::storage::binary::classic_edit::add_track;
+    use crate::storage::binary::cdb_add::CdbTrackAddition;
+
+    #[test]
+    fn appended_mhit_mirrors_the_nano2_mhod_profile() {
+        // The user's Nano 2G database (libgpod-written): its tracks carry
+        // mhods [1 title, 4 artist, 3 album, 6 filetype, 2 location] and the
+        // old firmware needs exactly that child set/order to display a track.
+        // An appended track must mirror it (including the filetype mhod).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("files_nano2/iTunes/iTunesDB");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let addition = CdbTrackAddition {
+            persistent_id: PersistentId::from_bits(0x7A33_0000_0000_0001),
+            location: ":iPod_Control:Music:F00/NEW.mp3".to_owned(),
+            title: "New Track".to_owned(),
+            artist: Some("Artist".to_owned()),
+            album: Some("Album".to_owned()),
+            album_artist: None,
+            genre: Some("Rock".to_owned()),
+            composer: None,
+            file_size: 1000,
+            length_ms: 60_000,
+            bitrate: 128,
+            sample_rate: 44_100,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            year: 2024,
+            compilation: false,
+            date_mac: 0,
+            artwork: None,
+        };
+        let rewritten = add_track(&bytes, crate::device::ChecksumKind::None, None, &addition)
+            .unwrap_or_else(|error| panic!("add to Nano 2G DB failed: {error:?}"));
+        let header_length = usize_value(read_u32(&rewritten, 4).unwrap(), 4).unwrap();
+        let payload = &rewritten[header_length..];
+        let ds = usize_value(read_u32(&rewritten, 0x14).unwrap(), 0x14).unwrap();
+        let datasets = split_datasets(payload, ds).unwrap();
+        let d0 = &datasets[0];
+        let ds_hdr = usize_value(read_u32(d0, 4).unwrap(), 4).unwrap();
+        let lh = usize_value(read_u32(d0, ds_hdr + 4).unwrap(), ds_hdr + 4).unwrap();
+        let count = usize_value(read_u32(d0, ds_hdr + 8).unwrap(), ds_hdr + 8).unwrap();
+        let mut off = ds_hdr + lh;
+        let mut expected = Vec::new();
+        let mut last_mhods = Vec::new();
+        for i in 0..count {
+            let ch = chunk_header(d0, off, b"mhit").unwrap();
+            let child_count = usize_value(read_u32(d0, off + 0x0c).unwrap(), off + 0x0c).unwrap();
+            let mut mhods = Vec::new();
+            let mut coff = off + ch.header_length;
+            for _ in 0..child_count {
+                let mh = chunk_header(d0, coff, b"mhod").unwrap();
+                mhods.push(read_u32(d0, coff + 12).unwrap());
+                coff = mh.end;
+            }
+            if i == 0 {
+                expected = mhods.clone();
+            }
+            if i == count - 1 {
+                last_mhods = mhods;
+            }
+            off = ch.end;
+        }
+        assert_eq!(
+            last_mhods, expected,
+            "appended mhit must mirror the device mhod profile"
+        );
+        assert_eq!(count, 601, "track count grew by one");
+    }
+}
