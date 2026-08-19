@@ -369,11 +369,13 @@ impl<'device> EditSession<'device> {
         }
         // Classic artwork uses the same mhfd ArtworkDB and fixed-slot ithmb
         // files as the Nano 7G: removals drop records and reindex slots,
-        // additions append records and frames.
-        if !self.removals.is_empty() {
+        // additions append records and frames. Nano 1G/2G have no artwork
+        // formats, so their removals/additions never touch ArtworkDB.
+        let artwork_supported = profile.capabilities().supports_artwork();
+        if !self.removals.is_empty() && artwork_supported {
             write_artwork_preview(self.device, &destination, &self.removals)?;
         }
-        if !resolved.is_empty() {
+        if !resolved.is_empty() && artwork_supported {
             write_artwork_additions(self.device, &destination, &resolved)?;
             write_artwork_frames(self.device, &destination, &resolved)?;
         }
@@ -497,14 +499,22 @@ impl<'device> EditSession<'device> {
             copy_unchanged_companions(&source, self.device, &destination)?;
         } else {
             write_and_verify_cbk(&destination, guid)?;
+            let artwork_supported = self
+                .device
+                .profile()
+                .is_some_and(|profile| profile.capabilities().supports_artwork());
             if !self.removals.is_empty() {
                 write_cdb_preview(self.device, &destination, guid, &self.removals)?;
-                write_artwork_preview(self.device, &destination, &self.removals)?;
+                if artwork_supported {
+                    write_artwork_preview(self.device, &destination, &self.removals)?;
+                }
             }
             if !resolved.is_empty() {
                 write_cdb_additions(self.device, &destination, guid, &resolved)?;
-                write_artwork_additions(self.device, &destination, &resolved)?;
-                write_artwork_frames(self.device, &destination, &resolved)?;
+                if artwork_supported {
+                    write_artwork_additions(self.device, &destination, &resolved)?;
+                    write_artwork_frames(self.device, &destination, &resolved)?;
+                }
             }
         }
         validate_staged_set(&destination)?;
@@ -1534,6 +1544,14 @@ fn write_artwork_preview(
     directory: &Path,
     removals: &BTreeSet<PersistentId>,
 ) -> Result<()> {
+    // Devices without artwork formats (Nano 1G/2G) have no `ArtworkDB` to
+    // read; a removal must be a pure database/media edit for them.
+    if !device
+        .profile()
+        .is_some_and(|profile| profile.capabilities().supports_artwork())
+    {
+        return Ok(());
+    }
     let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
     let source = device.mount().resolve_existing(&relative)?;
     let bytes = read_limited(&source, MAX_ARTWORK_BYTES, "ArtworkDB")?;
@@ -1608,6 +1626,14 @@ fn write_artwork_additions(
         .filter(|addition| addition.artwork.is_some())
         .collect();
     if linked.is_empty() {
+        return Ok(());
+    }
+    // Cover-less classic devices (Nano 1G/2G) cannot resolve artwork
+    // additions in the first place; stay defensive anyway.
+    if !device
+        .profile()
+        .is_some_and(|profile| profile.capabilities().supports_artwork())
+    {
         return Ok(());
     }
     let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;

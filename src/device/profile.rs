@@ -37,6 +37,16 @@ pub struct DeviceCapabilities {
     pub artwork_formats: Vec<ArtworkFormatProfile>,
 }
 
+impl DeviceCapabilities {
+    /// Whether the device stores cover artwork (an `ArtworkDB` plus fixed-slot
+    /// `.ithmb` files). Devices without writable formats (Nano 1G/2G) have no
+    /// artwork at all: staging must not touch `iPod_Control/Artwork/`.
+    #[must_use]
+    pub fn supports_artwork(&self) -> bool {
+        !self.artwork_formats.is_empty()
+    }
+}
+
 /// A resolved model profile. Profiles are conservative and hardware-gated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceProfile {
@@ -305,4 +315,22 @@ fn nano_4g() -> DeviceProfile {
         20,
         classic_cover_formats(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artwork_support_matches_the_device_family() {
+        // Nano 1G/2G have no artwork at all; 3G/4G and 7G do. Staging uses
+        // this to skip `ArtworkDB`/`.ithmb` handling on cover-less devices
+        // (a Nano 2G has no `iPod_Control/Artwork/ArtworkDB` to read).
+        for profile in [nano_1g(), nano_2g()] {
+            assert!(!profile.capabilities().supports_artwork());
+        }
+        for profile in [nano_3g(), nano_4g(), nano_7g()] {
+            assert!(profile.capabilities().supports_artwork());
+        }
+    }
 }
