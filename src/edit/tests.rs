@@ -669,6 +669,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn stages_and_installs_an_addition_with_new_encoded_artwork() {
         let Some((bundle, staged)) = stage_private_new_art_addition() else {
             return;
@@ -723,6 +724,30 @@ mod tests {
             .unwrap();
         assert_eq!(artist_status, 1);
         assert_eq!(artist_album_pid, album_pid);
+        // Browse-order columns use the (1-based rank) * 100 scale; a new
+        // entity must never sort ahead of existing ones.
+        let album_order: i64 = library
+            .query_row(
+                "SELECT name_order FROM album WHERE pid = ?1",
+                [album_pid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            album_order >= 100 && album_order % 100 == 0,
+            "album name_order must use the *100 scale, got {album_order}"
+        );
+        let artist_order: i64 = library
+            .query_row(
+                "SELECT name_order FROM artist WHERE pid = ?1",
+                [artist_pid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            artist_order >= 100 && artist_order % 100 == 0,
+            "artist name_order must use the *100 scale, got {artist_order}"
+        );
         let artwork_bytes = std::fs::read(directory.join("ArtworkDB")).unwrap();
         let records = crate::artwork::parse_artwork_records(&artwork_bytes).unwrap();
         assert_eq!(records.len(), 705);

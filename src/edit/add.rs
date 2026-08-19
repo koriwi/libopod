@@ -293,12 +293,17 @@ fn resolve_named_entity(
     }
     let pid = *next_pid;
     *next_pid = next_pid.saturating_add(1);
-    let name_order = i64::try_from(insertion_rank(
-        transaction,
-        path,
-        &format!("SELECT name FROM {table}"),
-        name,
-    )?)
+    // Orders are (1-based rank) * 100, matching the existing rows and
+    // `compute_orders`/`artist_order_rank`; without the scale a new entity
+    // would sort before every existing one.
+    let name_order = i64::try_from(
+        insertion_rank(
+            transaction,
+            path,
+            &format!("SELECT name FROM {table}"),
+            name,
+        )? * 100,
+    )
     .unwrap_or(i64::MAX);
     let sort_name = sort_key(name);
     transaction
@@ -334,12 +339,9 @@ fn resolve_album(
     }
     let pid = *next_pid;
     *next_pid = next_pid.saturating_add(1);
-    let name_order = i64::try_from(insertion_rank(
-        transaction,
-        path,
-        "SELECT name FROM album",
-        album_name,
-    )?)
+    let name_order = i64::try_from(
+        insertion_rank(transaction, path, "SELECT name FROM album", album_name)? * 100,
+    )
     .unwrap_or(i64::MAX);
     let artist_order = artist_order_rank(transaction, path, artist_pid)?;
     let sort_name = if album_name.is_empty() {
@@ -412,7 +414,7 @@ fn resolve_genre(transaction: &Transaction<'_>, path: &Path, genre: Option<&str>
              artist_count_calc, album_count_calc, compilation_count_calc, \
              album_artist_count_calc) \
              VALUES (?1, ?2, ?3, 0, 1, 1, 1, 0, 1)",
-            rusqlite::params![id, genre, i64::try_from(rank).unwrap_or(i64::MAX)],
+            rusqlite::params![id, genre, i64::try_from(rank * 100).unwrap_or(i64::MAX)],
         )
         .map_err(|source| sqlite_error("insert genre", path, source))?;
     Ok(id)
