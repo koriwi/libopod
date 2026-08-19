@@ -6,7 +6,7 @@
 
 mod encode;
 
-pub(crate) use encode::encode_new_frames;
+pub(crate) use encode::{encode_classic_frames, encode_new_frames};
 mod write;
 
 pub(crate) use write::{append_artwork_records, build_reused_children, NewArtworkRecord};

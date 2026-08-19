@@ -699,14 +699,14 @@ fn verify_bundle(
         reason: "the device profile is unknown".to_owned(),
     })?;
     let backend = profile.capabilities().backend;
+    let artwork_outputs =
+        usize::from(staged.removed_artwork_tracks() > 0 || staged.added_artwork_tracks() > 0)
+            + staged.added_ithmb().len()
+            + staged.removed_ithmb().len();
     let database_outputs = if backend == crate::device::BackendKind::Binary {
-        // Classic devices: only the iTunesDB is rewritten.
-        1
+        // Classic devices: the iTunesDB plus any artwork outputs.
+        1 + artwork_outputs
     } else {
-        let artwork_outputs =
-            usize::from(staged.removed_artwork_tracks() > 0 || staged.added_artwork_tracks() > 0)
-                + staged.added_ithmb().len()
-                + staged.removed_ithmb().len();
         7 + artwork_outputs
     };
     if manifest.profile != profile.key()

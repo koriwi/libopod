@@ -1220,8 +1220,21 @@ mod tests {
         assert_eq!(staged.remaining_tracks(), 723);
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
-        assert_eq!(manifest["outputs"].as_array().unwrap().len(), 1);
-        assert_eq!(manifest["outputs"][0]["target"], "iPod_Control/iTunes/iTunesDB");
+        // The removed first track carries artwork, so the bundle also stages
+        // the reindexed ArtworkDB and all four ithmb files.
+        assert_eq!(manifest["outputs"].as_array().unwrap().len(), 6);
+        let targets: Vec<String> = manifest["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|output| output["target"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(targets.iter().any(|target| target == "iPod_Control/iTunes/iTunesDB"));
+        assert!(targets.iter().any(|target| target == "iPod_Control/Artwork/ArtworkDB"));
+        for name in ["F1061_1.ithmb", "F1055_1.ithmb", "F1068_1.ithmb", "F1060_1.ithmb"] {
+            assert!(targets.iter().any(|target| target == &format!("iPod_Control/Artwork/{name}")));
+        }
+        assert_eq!(staged.removed_ithmb().len(), 4);
 
         // Install onto the virtual device (bundle/original) and read back.
         let virtual_root = bundle.path().join("original");
@@ -1296,5 +1309,116 @@ mod tests {
             .expect("added track present");
         assert_eq!(added.artist, "Classic Artist");
         assert!(added.location.as_str().starts_with("iPod_Control/Music/"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn classic_artwork_addition_round_trip_on_the_attached_nano3() {
+        let Some(device_dir) = build_classic_device_from_attachments() else {
+            return;
+        };
+        let device = Device::open(device_dir.path()).unwrap();
+        assert_eq!(device.library().unwrap().track_count(), 724);
+        for index in 0..40 {
+            std::fs::create_dir_all(
+                device_dir
+                    .path()
+                    .join(format!("iPod_Control/Music/F{index:02}")),
+            )
+            .unwrap();
+        }
+        let source = device_dir.path().join("source.mp3");
+        std::fs::write(&source, b"not a real mp3, but libpod does not decode audio").unwrap();
+        let art_dir = tempdir().unwrap();
+        let art_path = art_dir.path().join("cover.png");
+        let mut buffer = Vec::new();
+        let rgba = image::RgbaImage::from_pixel(600, 600, image::Rgba([200, 40, 120, 255]));
+        let encoder = image::codecs::png::PngEncoder::new(&mut buffer);
+        image::ImageEncoder::write_image(
+            encoder,
+            rgba.as_raw(),
+            600,
+            600,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        std::fs::write(&art_path, &buffer).unwrap();
+
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "Classic Art".to_owned(),
+            artist: Some("Classic Artist".to_owned()),
+            album: Some("Classic Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2007,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 128,
+            sample_rate: 44100,
+            length_ms: 60_000,
+            compilation: false,
+            reuse_album_art: false,
+            artwork_source: Some(art_path),
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(staged.added_artwork_tracks(), 1);
+        assert_eq!(staged.added_ithmb().len(), 4);
+        assert_eq!(staged.remaining_tracks(), 725);
+
+        // The staged ArtworkDB grew by one record and each ithmb file grew by
+        // exactly one slot.
+        let artwork_bytes = std::fs::read(bundle.path().join("ArtworkDB")).unwrap();
+        assert_eq!(crate::artwork::parse_artwork_records(&artwork_bytes).unwrap().len(), 142);
+        let slot_sizes: [(String, u64); 4] = [
+            ("F1061_1.ithmb".to_owned(), 6160),
+            ("F1055_1.ithmb".to_owned(), 32768),
+            ("F1068_1.ithmb".to_owned(), 32768),
+            ("F1060_1.ithmb".to_owned(), 204_800),
+        ];
+        for (name, slot) in &slot_sizes {
+            let staged_file = bundle.path().join("iPod_Control/Artwork").join(name);
+            let original = bundle.path().join("original/iPod_Control/Artwork").join(name);
+            let grown = std::fs::metadata(&staged_file).unwrap().len();
+            let before = std::fs::metadata(&original).unwrap().len();
+            assert_eq!(grown, before + slot, "{name} did not grow by one slot");
+        }
+
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        staged.install(&virtual_device).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+        let installed =
+            std::fs::read(virtual_root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        let guid = reopened.evidence().firewire_guid().expect("guid");
+        assert!(
+            crate::crypto::hash58::verify(&guid, &installed),
+            "installed classic iTunesDB does not verify with HASH58"
+        );
+        let installed_art =
+            std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        let records = crate::artwork::parse_artwork_records(&installed_art).unwrap();
+        assert_eq!(records.len(), 142);
+        let added = reopened
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| track.title == "Classic Art")
+            .expect("added track present");
+        let record = records
+            .iter()
+            .find(|record| record.track_id == added.id)
+            .expect("artwork record for the added track");
+        assert_eq!(record.formats.len(), 4);
     }
 }

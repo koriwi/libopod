@@ -367,6 +367,16 @@ impl<'device> EditSession<'device> {
                 &classic_addition(addition),
             )?;
         }
+        // Classic artwork uses the same mhfd ArtworkDB and fixed-slot ithmb
+        // files as the Nano 7G: removals drop records and reindex slots,
+        // additions append records and frames.
+        if !self.removals.is_empty() {
+            write_artwork_preview(self.device, &destination, &self.removals)?;
+        }
+        if !resolved.is_empty() {
+            write_artwork_additions(self.device, &destination, &resolved)?;
+            write_artwork_frames(self.device, &destination, &resolved)?;
+        }
 
         let output = destination.join("iTunesDB");
         write_file_sync(&output, &database)?;
@@ -437,9 +447,9 @@ impl<'device> EditSession<'device> {
             directory: destination,
             removed_tracks: self.removals.len(),
             added_tracks: resolved.len(),
-            added_artwork_tracks: 0,
-            added_ithmb: Vec::new(),
-            removed_ithmb: Vec::new(),
+            added_artwork_tracks: resolved.iter().filter(|add| add.artwork.is_some()).count(),
+            added_ithmb: added_ithmb_targets(&resolved)?,
+            removed_ithmb: removed_ithmb_targets(self.device, &self.removals)?,
             remaining_tracks: after.track_count(),
             removed_media,
             removed_artwork_tracks,
@@ -579,13 +589,18 @@ impl<'device> EditSession<'device> {
             .is_some_and(|profile| profile.capabilities().backend == BackendKind::Binary);
         if classic
             && self
+                .device
+                .profile()
+                .is_some_and(|profile| profile.capabilities().artwork_formats.is_empty())
+            && self
                 .additions
                 .iter()
                 .any(|track| track.reuse_album_art || track.artwork_source.is_some())
         {
             return Err(Error::Unsupported {
                 feature: "classic artwork encoding",
-                reason: "classic cover artwork is preserved but not yet written; add tracks without artwork".to_owned(),
+                reason: "this classic device has no writable artwork formats; add tracks without artwork"
+                    .to_owned(),
             });
         }
         let existing_pids: BTreeSet<PersistentId> =
@@ -614,7 +629,13 @@ impl<'device> EditSession<'device> {
             } else if track.reuse_album_art {
                 resolve_reused_artwork(self.device, track, &mut next_image_id)?
             } else if track.artwork_source.is_some() {
-                resolve_new_artwork(self.device, track, &mut running_sizes, &mut next_image_id)?
+                resolve_new_artwork(
+                    self.device,
+                    track,
+                    &mut running_sizes,
+                    &mut next_image_id,
+                    classic,
+                )?
             } else {
                 None
             };
@@ -1018,6 +1039,7 @@ fn resolve_new_artwork(
     track: &TrackToAdd,
     running_sizes: &mut std::collections::HashMap<String, u64>,
     next_image_id: &mut u32,
+    classic: bool,
 ) -> Result<Option<ArtworkLink>> {
     let source = track.artwork_source.as_ref().expect("checked by caller");
     let source_bytes =
@@ -1028,7 +1050,11 @@ fn resolve_new_artwork(
             reason: "artwork source is empty".to_owned(),
         });
     }
-    let frames = crate::artwork::encode_new_frames(&source_bytes)?;
+    let frames = if classic {
+        crate::artwork::encode_classic_frames(&source_bytes)?
+    } else {
+        crate::artwork::encode_new_frames(&source_bytes)?
+    };
     let mut out_frames = Vec::with_capacity(frames.len());
     let mut refs = Vec::with_capacity(frames.len());
     for frame in &frames {
@@ -1711,8 +1737,7 @@ fn write_artwork_frames(
 }
 
 /// Maps a resolved addition onto the binary `CdbTrackAddition` used by the
-/// shared `iTunesDB` dataset writers. Classic artwork encoding is not
-/// implemented yet, so `artwork` is always `None`.
+/// shared `iTunesDB` dataset writers.
 fn classic_addition(addition: &ResolvedAddition) -> CdbTrackAddition {
     CdbTrackAddition {
         persistent_id: addition.pid,
@@ -1734,7 +1759,10 @@ fn classic_addition(addition: &ResolvedAddition) -> CdbTrackAddition {
         year: addition.year,
         compilation: addition.compilation,
         date_mac: addition.date_mac,
-        artwork: None,
+        artwork: addition.artwork.as_ref().map(|art| CdbArtworkLink {
+            image_id: art.image_id,
+            src_img_size: art.src_img_size,
+        }),
     }
 }
 

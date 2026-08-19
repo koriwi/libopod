@@ -211,7 +211,7 @@ fn nano_7g() -> DeviceProfile {
 }
 
 /// Classic Nano 1–4 profile: uncompressed binary `iTunesDB`, no `SQLite`, and
-/// artwork preserved but not yet written.
+/// artwork preserved; the Nano 3G/4G also write the classic cover formats.
 ///
 /// Covers the signing matrix entry NONE for Nano 1–2G and HASH58 for
 /// Nano 3–4G. `cdb_version` matches the device's `mhbd` version field
@@ -222,6 +222,7 @@ fn classic_nano(
     checksum: ChecksumKind,
     cdb_version: u32,
     music_directories: u8,
+    artwork_formats: Vec<ArtworkFormatProfile>,
 ) -> DeviceProfile {
     DeviceProfile {
         key,
@@ -233,9 +234,33 @@ fn classic_nano(
             cdb_version,
             music_directories,
             sparse_artwork: false,
-            artwork_formats: Vec::new(),
+            artwork_formats,
         },
     }
+}
+
+/// The Nano 3G/4G cover formats, measured from a real Nano 3G: 55x55 with a
+/// 56-pixel stride (6160-byte slots), two 128x128 (32768), one 320x320
+/// (204800).
+fn classic_cover_formats() -> Vec<ArtworkFormatProfile> {
+    vec![
+        ArtworkFormatProfile {
+            format_id: 1061,
+            slot_bytes: 6_160,
+        },
+        ArtworkFormatProfile {
+            format_id: 1055,
+            slot_bytes: 32_768,
+        },
+        ArtworkFormatProfile {
+            format_id: 1068,
+            slot_bytes: 32_768,
+        },
+        ArtworkFormatProfile {
+            format_id: 1060,
+            slot_bytes: 204_800,
+        },
+    ]
 }
 
 fn nano_1g() -> DeviceProfile {
@@ -245,6 +270,7 @@ fn nano_1g() -> DeviceProfile {
         ChecksumKind::None,
         0x13,
         14,
+        Vec::new(),
     )
 }
 
@@ -255,6 +281,7 @@ fn nano_2g() -> DeviceProfile {
         ChecksumKind::None,
         0x13,
         14,
+        Vec::new(),
     )
 }
 
@@ -265,6 +292,7 @@ fn nano_3g() -> DeviceProfile {
         ChecksumKind::Hash58,
         0x30,
         20,
+        classic_cover_formats(),
     )
 }
 
@@ -275,5 +303,6 @@ fn nano_4g() -> DeviceProfile {
         ChecksumKind::Hash58,
         0x30,
         20,
+        classic_cover_formats(),
     )
 }

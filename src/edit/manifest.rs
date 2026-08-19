@@ -223,11 +223,33 @@ fn output_targets(
     backend: crate::device::BackendKind,
 ) -> Result<Vec<(String, IpodPath)>> {
     if backend == crate::device::BackendKind::Binary {
-        // Classic devices: the iTunesDB is the only rewritten database.
-        return Ok(vec![(
+        // Classic devices: the iTunesDB plus any rewritten artwork outputs.
+        let mut targets = vec![(
             "iTunesDB".to_owned(),
             IpodPath::new("iPod_Control/iTunes/iTunesDB")?,
-        )]);
+        )];
+        if destination.join("ArtworkDB").exists() {
+            targets.push((
+                "ArtworkDB".to_owned(),
+                IpodPath::new("iPod_Control/Artwork/ArtworkDB")?,
+            ));
+        }
+        let artwork_dir = destination.join("iPod_Control").join("Artwork");
+        if let Ok(entries) = fs::read_dir(&artwork_dir) {
+            let mut names: Vec<String> = entries
+                .filter_map(std::result::Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.to_ascii_lowercase().ends_with(".ithmb"))
+                .collect();
+            names.sort();
+            for name in names {
+                targets.push((
+                    format!("iPod_Control/Artwork/{name}"),
+                    IpodPath::new(format!("iPod_Control/Artwork/{name}"))?,
+                ));
+            }
+        }
+        return Ok(targets);
     }
     let mut targets = Vec::with_capacity(8);
     for file in SqliteLibraryFile::ALL {

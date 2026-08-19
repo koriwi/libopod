@@ -73,6 +73,41 @@ impl EncodedFrame {
     }
 }
 
+/// Classic (Nano 3G/4G) cover-art formats, measured from the operator's real
+/// Nano 3G files: `F1061_1.ithmb` carries 55x55 frames with a 56-pixel stride
+/// (6160-byte slots), `F1055_1`/`F1068_1` are 128x128 (32768-byte slots), and
+/// `F1060_1` is 320x320 (204800-byte slots).
+pub(crate) const CLASSIC_COVER_FORMATS: [Nano7gFormat; 4] = [
+    Nano7gFormat {
+        format_id: 1061,
+        width: 55,
+        height: 55,
+        stride_pixels: 56,
+        filename: "F1061_1.ithmb",
+    },
+    Nano7gFormat {
+        format_id: 1055,
+        width: 128,
+        height: 128,
+        stride_pixels: 128,
+        filename: "F1055_1.ithmb",
+    },
+    Nano7gFormat {
+        format_id: 1068,
+        width: 128,
+        height: 128,
+        stride_pixels: 128,
+        filename: "F1068_1.ithmb",
+    },
+    Nano7gFormat {
+        format_id: 1060,
+        width: 320,
+        height: 320,
+        stride_pixels: 320,
+        filename: "F1060_1.ithmb",
+    },
+];
+
 /// Decodes a JPEG/PNG source image and encodes one RGB565 frame per Nano 7G
 /// cover format.
 ///
@@ -80,6 +115,17 @@ impl EncodedFrame {
 ///
 /// Returns an error when the image cannot be decoded or has no pixels.
 pub(crate) fn encode_new_frames(source: &[u8]) -> Result<Vec<EncodedFrame>> {
+    encode_frames(source, &NANO7G_COVER_FORMATS)
+}
+
+/// Decodes a JPEG/PNG source image and encodes one RGB565 frame per classic
+/// (Nano 3G/4G) cover format.
+pub(crate) fn encode_classic_frames(source: &[u8]) -> Result<Vec<EncodedFrame>> {
+    encode_frames(source, &CLASSIC_COVER_FORMATS)
+}
+
+/// Decodes and resizes a source image into RGB565 frames for a format table.
+fn encode_frames(source: &[u8], formats: &[Nano7gFormat]) -> Result<Vec<EncodedFrame>> {
     let image = image::load_from_memory(source).map_err(|source| Error::Unsupported {
         feature: "artwork encoding",
         reason: format!("source image could not be decoded: {source}"),
@@ -90,8 +136,8 @@ pub(crate) fn encode_new_frames(source: &[u8]) -> Result<Vec<EncodedFrame>> {
             reason: "source image has no pixels".to_owned(),
         });
     }
-    let mut frames = Vec::with_capacity(NANO7G_COVER_FORMATS.len());
-    for format in NANO7G_COVER_FORMATS {
+    let mut frames = Vec::with_capacity(formats.len());
+    for format in formats {
         let resized =
             image::imageops::resize(&image, format.width, format.height, FilterType::Triangle);
         frames.push(EncodedFrame {
