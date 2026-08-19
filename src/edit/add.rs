@@ -81,6 +81,9 @@ pub(crate) fn add_tracks_to_staged_databases(
         insert_track(&transaction, addition, &library_path)?;
     }
     validate_added_invariants(&transaction, additions, &library_path)?;
+    // Reindex browse order columns so new artists/albums land in sorted
+    // position and pre-existing stale rows are healed.
+    reindex_browse_orders(&transaction, &library_path)?;
     transaction
         .commit()
         .map_err(|source| sqlite_error("commit staged add", &library_path, source))?;
@@ -932,4 +935,187 @@ fn sqlite_error(operation: &'static str, path: &Path, source: rusqlite::Error) -
         path: path.to_path_buf(),
         source,
     }
+}
+
+/// Recomputes the iTunes-style browse order columns for the whole staged
+/// library, healing stale values on every write.
+///
+/// Apple (and older libopod writers) leave `name_order` rows that no longer
+/// match sorted position — e.g. the pre-`9ffb669` bug wrote unscaled ranks,
+/// which put the Artists tab out of order. This pass renumbers every browse
+/// table and the per-item order columns from scratch.
+///
+/// The scheme is verified against Apple-written Nano 7G data:
+/// - `artist`/`track_artist`/`composer`.`name_order` and every item
+///   `*_order` column: sorted-position × 100 over distinct sort keys;
+/// - `genre_map`.`genre_order`: 1-based rank, unscaled;
+/// - `album`.`artist_order`: the album's artist rank (matches
+///   `artist`.`name_order`).
+///
+/// Columns with a different (unverified) scheme are left untouched:
+/// `album`.`name_order` plus `item`.`title_order` and
+/// `item`.`series_name_order`.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn reindex_browse_orders(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
+    reindex_named_table(transaction, path, "artist")?;
+    reindex_named_table(transaction, path, "track_artist")?;
+    reindex_named_table(transaction, path, "composer")?;
+
+    let genre_rows: Vec<(i64, String)> = transaction
+        .prepare("SELECT id, COALESCE(genre, '') FROM genre_map")
+        .map_err(|source| sqlite_error("prepare genre reindex", path, source))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|source| sqlite_error("query genre reindex", path, source))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|source| sqlite_error("collect genre reindex", path, source))?;
+    let genre_orders = key_orders(genre_rows.iter().map(|(_, genre)| genre), 1);
+    for (id, genre) in &genre_rows {
+        if let Some(order) = genre_orders.get(&sort_key(genre)) {
+            transaction
+                .execute(
+                    "UPDATE genre_map SET genre_order = ?1 WHERE id = ?2",
+                    rusqlite::params![order, id],
+                )
+                .map_err(|source| sqlite_error("update genre order", path, source))?;
+        }
+    }
+
+    let mut item_rows = transaction
+        .prepare(
+            "SELECT pid, \
+               COALESCE(NULLIF(sort_artist, ''), artist, ''), \
+               COALESCE(NULLIF(sort_album, ''), album, ''), \
+               COALESCE((SELECT genre FROM genre_map WHERE genre_map.id = item.genre_id), ''), \
+               COALESCE(NULLIF(sort_composer, ''), composer, ''), \
+               COALESCE(NULLIF(sort_album_artist, ''), NULLIF(album_artist, ''), \
+                        NULLIF(sort_artist, ''), artist, ''), \
+               COALESCE(NULLIF(sort_title, ''), title, '') \
+             FROM item",
+        )
+        .map_err(|source| sqlite_error("prepare item order reindex", path, source))?;
+    let item_keys = item_rows
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|source| sqlite_error("query item order reindex", path, source))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error("collect item order reindex", path, source))?;
+    drop(item_rows);
+    let artist_orders = key_orders(item_keys.iter().map(|row| &row.1), 100);
+    let album_orders = key_orders(item_keys.iter().map(|row| &row.2), 100);
+    let item_genre_orders = key_orders(item_keys.iter().map(|row| &row.3), 100);
+    let composer_orders = key_orders(item_keys.iter().map(|row| &row.4), 100);
+    let album_artist_orders = key_orders(item_keys.iter().map(|row| &row.5), 100);
+    for (pid, artist, album, genre, composer, album_artist, _title) in &item_keys {
+        let artist_order = artist_orders.get(&sort_key(artist)).copied().unwrap_or(100);
+        let album_order = album_orders.get(&sort_key(album)).copied().unwrap_or(100);
+        let genre_order = item_genre_orders
+            .get(&sort_key(genre))
+            .copied()
+            .unwrap_or(100);
+        let composer_order = composer_orders.get(&sort_key(composer)).copied().unwrap_or(100);
+        let album_artist_order = album_artist_orders
+            .get(&sort_key(album_artist))
+            .copied()
+            .unwrap_or(100);
+        transaction
+            .execute(
+                "UPDATE item SET artist_order = ?1, album_order = ?2, genre_order = ?3, \
+                 composer_order = ?4, album_artist_order = ?5, album_by_artist_order = ?5 \
+                 WHERE pid = ?6",
+                rusqlite::params![
+                    artist_order,
+                    album_order,
+                    genre_order,
+                    composer_order,
+                    album_artist_order,
+                    pid
+                ],
+            )
+            .map_err(|source| sqlite_error("update item orders", path, source))?;
+    }
+
+    let albums: Vec<(i64, String)> = transaction
+        .prepare(
+            "SELECT a.pid, COALESCE(art.name, '') FROM album a \
+             LEFT JOIN artist art ON art.pid = a.artist_pid",
+        )
+        .map_err(|source| sqlite_error("prepare album artist reindex", path, source))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|source| sqlite_error("query album artist reindex", path, source))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|source| sqlite_error("collect album artist reindex", path, source))?;
+    let artist_table_orders = reindex_named_table(transaction, path, "artist")?;
+    for (pid, artist_name) in &albums {
+        if let Some(order) = artist_table_orders.get(&sort_key(artist_name)) {
+            transaction
+                .execute(
+                    "UPDATE album SET artist_order = ?1 WHERE pid = ?2",
+                    rusqlite::params![order, pid],
+                )
+                .map_err(|source| sqlite_error("update album artist order", path, source))?;
+        }
+    }
+    Ok(())
+}
+
+/// Reindexes one named browse table (`artist`, `track_artist`, `composer`):
+/// `name_order` = sorted-position × 100 over distinct sort keys. Returns the
+/// key → order map for callers that need it (album artist ranks).
+fn reindex_named_table(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    table: &str,
+) -> Result<std::collections::HashMap<String, i64>> {
+    let rows: Vec<(i64, String)> = transaction
+        .prepare(&format!(
+            "SELECT pid, COALESCE(NULLIF(sort_name, ''), name, '') FROM {table}"
+        ))
+        .map_err(|source| sqlite_error("prepare browse reindex", path, source))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|source| sqlite_error("query browse reindex", path, source))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|source| sqlite_error("collect browse reindex", path, source))?;
+    let orders = key_orders(rows.iter().map(|(_, name)| name), 100);
+    for (pid, name) in rows {
+        if let Some(order) = orders.get(&sort_key(&name)) {
+            transaction
+                .execute(
+                    &format!("UPDATE {table} SET name_order = ?1 WHERE pid = ?2"),
+                    rusqlite::params![order, pid],
+                )
+                .map_err(|source| sqlite_error("update browse order", path, source))?;
+        }
+    }
+    Ok(orders)
+}
+
+/// Maps distinct sort keys to `(position + 1) * scale` in sorted order.
+/// An empty key sorts first, matching Apple's rank-1 default.
+fn key_orders<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    scale: i64,
+) -> std::collections::HashMap<String, i64> {
+    let mut distinct: Vec<String> = keys.map(|key| sort_key(key)).collect();
+    distinct.sort();
+    distinct.dedup();
+    distinct
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let order = i64::try_from(index + 1)
+                .ok()
+                .and_then(|position| position.checked_mul(scale))
+                .unwrap_or(i64::MAX);
+            (key.clone(), order)
+        })
+        .collect()
 }

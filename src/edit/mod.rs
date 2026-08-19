@@ -16,7 +16,8 @@ use std::{
 use rusqlite::{Connection, OpenFlags, Transaction};
 
 pub(crate) use add::{
-    add_tracks_to_staged_databases, ArtworkFrameOut, ArtworkLink, ResolvedAddition,
+    add_tracks_to_staged_databases, reindex_browse_orders, ArtworkFrameOut, ArtworkLink,
+    ResolvedAddition,
 };
 pub(crate) use commit::{
     install_artwork_addition_hardware_test, install_noop_hardware_test,
@@ -1240,6 +1241,9 @@ fn edit_staged_databases(directory: &Path, removals: &BTreeSet<PersistentId>) ->
     delete_direct_references(&transaction, &library_path)?;
     update_derived_rows(&transaction, &library_path)?;
     validate_relational_invariants(&transaction, &library_path)?;
+    // Heal browse order columns after removals too: stale name_order rows
+    // (from older writers) would otherwise keep the Artists tab mis-sorted.
+    reindex_browse_orders(&transaction, &library_path)?;
     transaction
         .commit()
         .map_err(|source| sqlite_error("commit staged edit", &library_path, source))?;

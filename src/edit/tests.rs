@@ -1128,6 +1128,68 @@ mod tests {
         assert!(media_bytes > 0);
     }
 
+    #[test]
+    fn reindex_heals_stale_browse_orders() {
+        // The pre-9ffb669 writer stored unscaled name_orders; those stale
+        // rows kept the Artists tab mis-sorted until a reindex touched the
+        // device. Every staged edit now renumbers the whole browse set.
+        let Some((bundle, _staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let library_path = bundle.path().join("Library.itdb");
+        let mut connection = Connection::open(&library_path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute_batch(
+                "UPDATE artist SET name_order = 3 WHERE name = 'Korn';\
+                 UPDATE artist SET name_order = 1 WHERE name = '3 Doors Down';\
+                 UPDATE artist SET name_order = 5200 WHERE name = 'Ye';\
+                 UPDATE item SET artist_order = 7 WHERE artist = 'Korn';",
+            )
+            .unwrap();
+        super::add::reindex_browse_orders(&transaction, &library_path).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        let connection = Connection::open(&library_path).unwrap();
+        let rows: Vec<(String, i64)> = connection
+            .prepare("SELECT name, name_order FROM artist ORDER BY name_order")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let keys: Vec<String> = rows
+            .iter()
+            .map(|(name, _)| super::sort::sort_key(name))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "artist table must be in sort-key order");
+        let korn: i64 = connection
+            .query_row(
+                "SELECT name_order FROM artist WHERE name = 'Korn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let korn_rank: i64 = i64::try_from(
+            keys.iter()
+                .position(|key| key == &super::sort::sort_key("Korn"))
+                .unwrap()
+                + 1,
+        )
+        .unwrap();
+        assert_eq!(korn, korn_rank * 100, "Korn healed to its sorted rank");
+        let item_artist_order: i64 = connection
+            .query_row(
+                "SELECT artist_order FROM item WHERE artist = 'Korn' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(item_artist_order, korn, "items follow the artist rank");
+    }
+
     fn stage_private_no_artwork_removal() -> Option<(TempDir, super::StagedSqliteEdit)> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
         if !fixture.is_dir() {
@@ -1160,12 +1222,12 @@ mod tests {
         .unwrap();
         library
             .execute_batch(
-                "CREATE TABLE item(pid INTEGER PRIMARY KEY,physical_order INTEGER,album_pid INTEGER,artist_pid INTEGER,track_artist_pid INTEGER,composer_pid INTEGER,genre_id INTEGER,category_id INTEGER,genius_id INTEGER,media_kind INTEGER,is_song INTEGER,is_music_video INTEGER,is_movie INTEGER,is_compilation INTEGER,artwork_status INTEGER);\
-                 CREATE TABLE album(pid INTEGER PRIMARY KEY,item_count INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_movies INTEGER,has_any_compilations INTEGER,all_compilations INTEGER,artwork_item_pid INTEGER,artwork_status INTEGER,min_volume_normalization_energy INTEGER,artist_pid INTEGER,name_order INTEGER);\
-                 CREATE TABLE artist(pid INTEGER PRIMARY KEY,has_songs INTEGER,has_music_videos INTEGER,has_non_compilation_tracks INTEGER,album_count INTEGER,artwork_album_pid INTEGER,artwork_status INTEGER);\
-                 CREATE TABLE track_artist(pid INTEGER PRIMARY KEY,has_songs INTEGER,has_music_videos INTEGER,has_non_compilation_tracks INTEGER);\
-                 CREATE TABLE composer(pid INTEGER PRIMARY KEY,has_music INTEGER);\
-                 CREATE TABLE genre_map(id INTEGER PRIMARY KEY,has_music INTEGER,artist_count_calc INTEGER,album_artist_count_calc INTEGER,album_count_calc INTEGER,compilation_count_calc INTEGER);\
+                "CREATE TABLE item(pid INTEGER PRIMARY KEY,physical_order INTEGER,album_pid INTEGER,artist_pid INTEGER,track_artist_pid INTEGER,composer_pid INTEGER,genre_id INTEGER,category_id INTEGER,genius_id INTEGER,media_kind INTEGER,is_song INTEGER,is_music_video INTEGER,is_movie INTEGER,is_compilation INTEGER,artwork_status INTEGER,title TEXT,artist TEXT,album TEXT,album_artist TEXT,composer TEXT,sort_title TEXT,sort_artist TEXT,sort_album TEXT,sort_album_artist TEXT,sort_composer TEXT,title_order INTEGER,artist_order INTEGER,album_order INTEGER,genre_order INTEGER,composer_order INTEGER,album_artist_order INTEGER,album_by_artist_order INTEGER);\
+                 CREATE TABLE album(pid INTEGER PRIMARY KEY,item_count INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_movies INTEGER,has_any_compilations INTEGER,all_compilations INTEGER,artwork_item_pid INTEGER,artwork_status INTEGER,min_volume_normalization_energy INTEGER,artist_pid INTEGER,name_order INTEGER,artist_order INTEGER);\
+                 CREATE TABLE artist(pid INTEGER PRIMARY KEY,name TEXT,sort_name TEXT,name_order INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_non_compilation_tracks INTEGER,album_count INTEGER,artwork_album_pid INTEGER,artwork_status INTEGER);\
+                 CREATE TABLE track_artist(pid INTEGER PRIMARY KEY,name TEXT,sort_name TEXT,name_order INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_non_compilation_tracks INTEGER);\
+                 CREATE TABLE composer(pid INTEGER PRIMARY KEY,name TEXT,sort_name TEXT,name_order INTEGER,has_music INTEGER);\
+                 CREATE TABLE genre_map(id INTEGER PRIMARY KEY,genre TEXT,genre_order INTEGER,has_music INTEGER,artist_count_calc INTEGER,album_artist_count_calc INTEGER,album_count_calc INTEGER,compilation_count_calc INTEGER);\
                  CREATE TABLE category_map(id INTEGER PRIMARY KEY);\
                  CREATE TABLE avformat_info(item_pid INTEGER PRIMARY KEY,volume_normalization_energy INTEGER);\
                  CREATE TABLE item_to_container(item_pid INTEGER,container_pid INTEGER,physical_order INTEGER,shuffle_order INTEGER);\
@@ -1176,13 +1238,13 @@ mod tests {
                  CREATE TABLE store_info(item_pid INTEGER);\
                  CREATE TABLE track_size_calc(pid INTEGER PRIMARY KEY,kind TEXT,size INTEGER);\
                  CREATE TABLE unknown_extension(value INTEGER);\
-                 INSERT INTO item VALUES(1,0,10,20,30,40,50,0,60,1,1,0,0,0,1);\
-                 INSERT INTO item VALUES(2,1,10,20,30,40,50,0,0,1,1,0,0,0,1);\
-                 INSERT INTO album VALUES(10,2,1,0,0,0,0,1,1,5,20,100);\
-                 INSERT INTO artist VALUES(20,1,0,1,1,10,1);\
-                 INSERT INTO track_artist VALUES(30,1,0,1);\
-                 INSERT INTO composer VALUES(40,1);\
-                 INSERT INTO genre_map VALUES(50,1,1,1,1,0);\
+                 INSERT INTO item VALUES(1,0,10,20,30,40,50,0,60,1,1,0,0,0,1,'Zed','Artist','Album','','',NULL,'artist','album',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);\
+                 INSERT INTO item VALUES(2,1,10,20,30,40,50,0,0,1,1,0,0,0,1,'Alpha','Artist','Album','','',NULL,'artist','album',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);\
+                 INSERT INTO album VALUES(10,2,1,0,0,0,0,1,1,5,20,100,NULL);\
+                 INSERT INTO artist VALUES(20,'Artist',NULL,NULL,1,0,1,1,10,1);\
+                 INSERT INTO track_artist VALUES(30,'Artist',NULL,NULL,1,0,1);\
+                 INSERT INTO composer VALUES(40,NULL,NULL,NULL,1);\
+                 INSERT INTO genre_map VALUES(50,NULL,NULL,1,1,1,1,0);\
                  INSERT INTO avformat_info VALUES(1,5);\
                  INSERT INTO avformat_info VALUES(2,7);\
                  INSERT INTO item_to_container VALUES(1,100,0,NULL);\
