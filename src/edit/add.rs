@@ -948,13 +948,15 @@ fn sqlite_error(operation: &'static str, path: &Path, source: rusqlite::Error) -
 /// The scheme is verified against Apple-written Nano 7G data:
 /// - `artist`/`track_artist`/`composer`.`name_order` and every item
 ///   `*_order` column: sorted-position × 100 over distinct sort keys;
+/// - `album`.`name_order`/`sort_order`: sorted-position × 100 over **rows**, one
+///   slot per album row (ties get consecutive slots — e.g. four "ASMR" albums
+///   at 1300/1400/1500/1600);
 /// - `genre_map`.`genre_order`: 1-based rank, unscaled;
 /// - `album`.`artist_order`: the album's artist rank (matches
 ///   `artist`.`name_order`).
 ///
 /// Columns with a different (unverified) scheme are left untouched:
-/// `album`.`name_order` plus `item`.`title_order` and
-/// `item`.`series_name_order`.
+/// `item`.`title_order` and `item`.`series_name_order`.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn reindex_browse_orders(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
     reindex_named_table(transaction, path, "artist")?;
@@ -1014,6 +1016,35 @@ pub(crate) fn reindex_browse_orders(transaction: &Transaction<'_>, path: &Path) 
     let item_genre_orders = key_orders(item_keys.iter().map(|row| &row.3), 100);
     let composer_orders = key_orders(item_keys.iter().map(|row| &row.4), 100);
     let album_artist_orders = key_orders(item_keys.iter().map(|row| &row.5), 100);
+
+    // Album rows: one rank slot per album row, sorted by sort key, ties in
+    // pid order (Apple ranks rows, not distinct names — "Follow the Leader"
+    // is 5100 while its deduped name rank is 48). sort_order mirrors
+    // name_order exactly, as Apple writes it.
+    let mut albums: Vec<(i64, String)> = transaction
+        .prepare("SELECT pid, COALESCE(NULLIF(sort_name, ''), name, '') FROM album")
+        .map_err(|source| sqlite_error("prepare album reindex", path, source))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|source| sqlite_error("query album reindex", path, source))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|source| sqlite_error("collect album reindex", path, source))?;
+    albums.sort_by(|left, right| {
+        sort_key(&left.1)
+            .cmp(&sort_key(&right.1))
+            .then(left.0.cmp(&right.0))
+    });
+    for (index, (pid, _name)) in albums.iter().enumerate() {
+        let order = i64::try_from(index + 1)
+            .ok()
+            .and_then(|position| position.checked_mul(100))
+            .unwrap_or(i64::MAX);
+        transaction
+            .execute(
+                "UPDATE album SET name_order = ?1, sort_order = ?1 WHERE pid = ?2",
+                rusqlite::params![order, pid],
+            )
+            .map_err(|source| sqlite_error("update album order", path, source))?;
+    }
     for (pid, artist, album, genre, composer, album_artist, _title) in &item_keys {
         let artist_order = artist_orders.get(&sort_key(artist)).copied().unwrap_or(100);
         let album_order = album_orders.get(&sort_key(album)).copied().unwrap_or(100);

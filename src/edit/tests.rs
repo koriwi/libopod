@@ -1188,6 +1188,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(item_artist_order, korn, "items follow the artist rank");
+
+        // Albums are ranked per row, not per distinct name: each album row
+        // gets its own consecutive slot, and sort_order mirrors name_order.
+        let albums: Vec<(String, i64, i64)> = connection
+            .prepare("SELECT name, name_order, sort_order FROM album ORDER BY name_order")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let album_keys: Vec<String> = albums
+            .iter()
+            .map(|(name, _, _)| super::sort::sort_key(name))
+            .collect();
+        let mut album_sorted = album_keys.clone();
+        album_sorted.sort();
+        assert_eq!(album_keys, album_sorted, "albums must be in sort-key order");
+        for (index, (_, order, sort_order)) in albums.iter().enumerate() {
+            let expected = i64::try_from(index + 1).unwrap() * 100;
+            assert_eq!(
+                *order, expected,
+                "each album row owns a consecutive slot"
+            );
+            assert_eq!(order, sort_order, "sort_order mirrors name_order");
+        }
     }
 
     fn stage_private_no_artwork_removal() -> Option<(TempDir, super::StagedSqliteEdit)> {
@@ -1223,7 +1248,7 @@ mod tests {
         library
             .execute_batch(
                 "CREATE TABLE item(pid INTEGER PRIMARY KEY,physical_order INTEGER,album_pid INTEGER,artist_pid INTEGER,track_artist_pid INTEGER,composer_pid INTEGER,genre_id INTEGER,category_id INTEGER,genius_id INTEGER,media_kind INTEGER,is_song INTEGER,is_music_video INTEGER,is_movie INTEGER,is_compilation INTEGER,artwork_status INTEGER,title TEXT,artist TEXT,album TEXT,album_artist TEXT,composer TEXT,sort_title TEXT,sort_artist TEXT,sort_album TEXT,sort_album_artist TEXT,sort_composer TEXT,title_order INTEGER,artist_order INTEGER,album_order INTEGER,genre_order INTEGER,composer_order INTEGER,album_artist_order INTEGER,album_by_artist_order INTEGER);\
-                 CREATE TABLE album(pid INTEGER PRIMARY KEY,item_count INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_movies INTEGER,has_any_compilations INTEGER,all_compilations INTEGER,artwork_item_pid INTEGER,artwork_status INTEGER,min_volume_normalization_energy INTEGER,artist_pid INTEGER,name_order INTEGER,artist_order INTEGER);\
+                 CREATE TABLE album(pid INTEGER PRIMARY KEY,item_count INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_movies INTEGER,has_any_compilations INTEGER,all_compilations INTEGER,artwork_item_pid INTEGER,artwork_status INTEGER,min_volume_normalization_energy INTEGER,artist_pid INTEGER,name_order INTEGER,artist_order INTEGER,name TEXT,sort_name TEXT,sort_order INTEGER);\
                  CREATE TABLE artist(pid INTEGER PRIMARY KEY,name TEXT,sort_name TEXT,name_order INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_non_compilation_tracks INTEGER,album_count INTEGER,artwork_album_pid INTEGER,artwork_status INTEGER);\
                  CREATE TABLE track_artist(pid INTEGER PRIMARY KEY,name TEXT,sort_name TEXT,name_order INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_non_compilation_tracks INTEGER);\
                  CREATE TABLE composer(pid INTEGER PRIMARY KEY,name TEXT,sort_name TEXT,name_order INTEGER,has_music INTEGER);\
@@ -1240,7 +1265,7 @@ mod tests {
                  CREATE TABLE unknown_extension(value INTEGER);\
                  INSERT INTO item VALUES(1,0,10,20,30,40,50,0,60,1,1,0,0,0,1,'Zed','Artist','Album','','',NULL,'artist','album',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);\
                  INSERT INTO item VALUES(2,1,10,20,30,40,50,0,0,1,1,0,0,0,1,'Alpha','Artist','Album','','',NULL,'artist','album',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);\
-                 INSERT INTO album VALUES(10,2,1,0,0,0,0,1,1,5,20,100,NULL);\
+                 INSERT INTO album VALUES(10,2,1,0,0,0,0,1,1,5,20,100,NULL,'Album',NULL,NULL);\
                  INSERT INTO artist VALUES(20,'Artist',NULL,NULL,1,0,1,1,10,1);\
                  INSERT INTO track_artist VALUES(30,'Artist',NULL,NULL,1,0,1);\
                  INSERT INTO composer VALUES(40,NULL,NULL,NULL,1);\
