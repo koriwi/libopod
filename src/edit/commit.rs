@@ -39,6 +39,8 @@ pub(crate) enum FailureMode {
     #[cfg(test)]
     SimulateInterruptionAfter(usize),
     #[cfg(test)]
+    SimulateInterruptionDuringDeletionAfter(usize),
+    #[cfg(test)]
     SimulateInterruptionDuringValidation,
     #[cfg(test)]
     SimulateInterruptionAfterCommitted,
@@ -267,7 +269,7 @@ fn install_inner(
         .map_err(|source| io_error("create device transaction backup", &backup, source))?;
     let mut journal = TransactionJournal {
         format: "libopod-device-transaction".to_owned(),
-        version: 1,
+        version: 2,
         phase: TransactionPhase::BackingUp,
         installed: 0,
         staging: manifest,
@@ -318,22 +320,9 @@ fn install_inner(
             });
         }
     }
-    for deletion in &journal.staging.deletions {
-        let relative = IpodPath::new(deletion.target.clone())?;
-        let target = device.mount().resolve_existing(&relative)?;
-        verify_file(
-            &target,
-            deletion.bytes,
-            &deletion.sha256,
-            "live deletion input",
-        )?;
-        let backup_file = backup.join("deletions").join(relative.as_str());
-        if let Some(parent) = backup_file.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|source| io_error("create deletion backup parent", parent, source))?;
-        }
-        copy_new_verified(&target, &backup_file, deletion.bytes, &deletion.sha256)?;
-    }
+    // Deletions are immediate: no byte backup is staged or copied on-device.
+    // The operator asked for a delete, so the install unlinks by path and
+    // rollback restores only the database (the media file is gone by design).
     sync_directory(&backup)?;
     staged
         .source_generation
@@ -368,11 +357,20 @@ fn install_inner(
         install_file(&staged_file, &target, index)?;
     }
 
-    for deletion in &journal.staging.deletions {
+    for (deletion_index, deletion) in journal.staging.deletions.iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = deletion_index;
         let relative = IpodPath::new(deletion.target.clone())?;
         let target = device.mount().resolve_existing(&relative)?;
         fs::remove_file(&target)
             .map_err(|source| io_error("delete removed media", &target, source))?;
+        #[cfg(test)]
+        if failure_mode == FailureMode::SimulateInterruptionDuringDeletionAfter(deletion_index) {
+            return Err(Error::Verification {
+                format: "injected transaction interruption",
+                reason: format!("stopped after {deletion_index} deleted media files"),
+            });
+        }
     }
     // Unlink durability on a USB flash filesystem is dominated by the
     // directory fsync, so sync each affected parent directory once instead of
@@ -499,21 +497,9 @@ pub(crate) fn recover_transaction(mount: &MountRoot) -> Result<()> {
                 }
             }
         }
-        for deletion in &journal.staging.deletions {
-            let relative = IpodPath::new(deletion.target.clone())?;
-            let target = mount.resolve_possible(&relative)?;
-            let backup = transaction
-                .join("backup")
-                .join("deletions")
-                .join(deletion.target.as_str());
-            install_file(&backup, &target, 0)?;
-            verify_file(
-                &target,
-                deletion.bytes,
-                &deletion.sha256,
-                "restored deletion",
-            )?;
-        }
+        // Fast-deletion journals carry no byte backup: once the install
+        // unlinked a media file it is gone by design, so recovery restores
+        // only the database outputs above and leaves deletions absent.
     }
     remove_transaction_directory(&transaction)
 }
@@ -766,20 +752,9 @@ fn require_transaction_space(mount: &MountRoot, manifest: &StagingManifest) -> R
         .map(|output| output.bytes)
         .max()
         .unwrap_or(0);
-    let deletion_bytes = manifest
-        .deletions
-        .iter()
-        .try_fold(0_u64, |total, deletion| {
-            total
-                .checked_add(deletion.bytes)
-                .ok_or_else(|| Error::Verification {
-                    format: "device transaction",
-                    reason: "required deletion backup space overflowed u64".to_owned(),
-                })
-        })?;
+    // Fast deletions need no on-device backup space: unlink frees it.
     let required = backup_bytes
-        .checked_add(deletion_bytes)
-        .and_then(|bytes| bytes.checked_add(temporary_bytes))
+        .checked_add(temporary_bytes)
         .and_then(|bytes| bytes.checked_add(4 * 1024 * 1024))
         .ok_or_else(|| Error::Verification {
             format: "device transaction",
@@ -906,10 +881,10 @@ fn read_journal(directory: &Path) -> Result<TransactionJournal> {
             offset: u64::try_from(source.column()).unwrap_or(u64::MAX),
             reason: source.to_string(),
         })?;
-    if journal.format != "libopod-device-transaction" || journal.version != 1 {
+    if journal.format != "libopod-device-transaction" || journal.version != 2 {
         return Err(Error::Unsupported {
             feature: "transaction journal version",
-            reason: "expected libopod-device-transaction version 1".to_owned(),
+            reason: "expected libopod-device-transaction version 2".to_owned(),
         });
     }
     Ok(journal)

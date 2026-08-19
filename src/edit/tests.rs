@@ -91,6 +91,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn deletes_media_on_install_and_restores_it_on_rollback() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
         if !fixture.is_dir() {
@@ -145,7 +146,8 @@ mod tests {
         let reopened = Device::open(&virtual_root).unwrap();
         assert_eq!(reopened.library().unwrap().track_count(), 725);
 
-        // An interrupted install must roll the media file back.
+        // An interruption before the deletion unlink leaves the media in
+        // place; recovery restores the database from its on-device backup.
         let device = Device::open(&fixture).unwrap();
         let track = device
             .library()
@@ -174,6 +176,42 @@ mod tests {
         let mount = MountRoot::open(&virtual_root).unwrap();
         recover_transaction(&mount).unwrap();
         assert!(media.is_file(), "media file must be restored on rollback");
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+
+        // An interruption after the unlink keeps the media gone: fast
+        // deletion never restores media, only the database rolls back.
+        let device = Device::open(&fixture).unwrap();
+        let track = device
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| !track.has_artwork)
+            .unwrap()
+            .clone();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        edit.set_media_policy(MediaDeletionPolicy::Delete);
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        let virtual_root = bundle.path().join("original");
+        let media = virtual_root.join(track.location.as_str());
+        fs::create_dir_all(media.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(track.location.as_str()), &media).unwrap();
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionDuringDeletionAfter(0),
+        )
+        .unwrap_err();
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        assert!(
+            !media.exists(),
+            "fast deletion must not restore unlinked media on rollback"
+        );
         let reopened = Device::open(&virtual_root).unwrap();
         assert_eq!(reopened.library().unwrap().track_count(), 726);
     }

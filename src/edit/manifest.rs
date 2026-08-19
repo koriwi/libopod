@@ -31,9 +31,11 @@ pub(crate) struct StagingManifest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ManifestDeletionFile {
+    /// Device-relative path of the media file the install unlinks. Deletions
+    /// are immediate and unverified-by-content by design: the operator asked
+    /// for a delete, so the install removes the file by path and does not
+    /// retain a byte backup for rollback.
     pub target: String,
-    pub bytes: u64,
-    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -167,7 +169,7 @@ pub(crate) fn write_staging_manifest(
     .to_owned();
     let manifest = StagingManifest {
         format: "libopod-staging-manifest".to_owned(),
-        version: 1,
+        version: 2,
         profile: profile.key().to_owned(),
         operation,
         removed_tracks,
@@ -209,10 +211,10 @@ pub(crate) fn read_staging_manifest(path: &Path) -> Result<StagingManifest> {
             offset: u64::try_from(source.column()).unwrap_or(u64::MAX),
             reason: source.to_string(),
         })?;
-    if manifest.format != "libopod-staging-manifest" || manifest.version != 1 {
+    if manifest.format != "libopod-staging-manifest" || manifest.version != 2 {
         return Err(Error::Unsupported {
             feature: "staging manifest version",
-            reason: "expected libopod-staging-manifest version 1".to_owned(),
+            reason: "expected libopod-staging-manifest version 2".to_owned(),
         });
     }
     Ok(manifest)

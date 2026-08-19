@@ -425,12 +425,11 @@ impl<'device> EditSession<'device> {
             let mut deletions = Vec::new();
             for track in &removed_tracks {
                 let relative = track.location.clone();
-                let target = self.device.mount().resolve_existing(&relative)?;
-                let (bytes, digest) = fingerprint_host_file(&target)?;
+                // Fast deletion: record only the path; the install unlinks the file
+                // immediately and retains no byte backup for rollback.
+                self.device.mount().resolve_existing(&relative)?;
                 deletions.push(ManifestDeletionFile {
                     target: relative.to_string(),
-                    bytes,
-                    sha256: hex(&digest),
                 });
             }
             deletions
@@ -550,12 +549,11 @@ impl<'device> EditSession<'device> {
             let mut deletions = Vec::new();
             for track in &removed_tracks {
                 let relative = track.location.clone();
-                let target = self.device.mount().resolve_existing(&relative)?;
-                let (bytes, digest) = fingerprint_host_file(&target)?;
+                // Fast deletion: record only the path; the install unlinks the file
+                // immediately and retains no byte backup for rollback.
+                self.device.mount().resolve_existing(&relative)?;
                 deletions.push(ManifestDeletionFile {
                     target: relative.to_string(),
-                    bytes,
-                    sha256: hex(&digest),
                 });
             }
             deletions
@@ -1520,15 +1518,6 @@ fn write_cdb_additions(
     Ok(())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
 
 /// Rewrites `ArtworkDB` and rebuilds the `.ithmb` files after removals that
 /// reference artwork.

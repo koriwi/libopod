@@ -180,7 +180,7 @@ fn stages_a_schema_preserving_removal_outside_the_private_fixture() {
     assert_eq!(staged.source_generation(), device.generation());
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
-    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["version"], 2);
     assert_eq!(manifest["profile"], "nano-7g");
     assert_eq!(manifest["removed_tracks"], 1);
     assert_eq!(manifest["source"].as_array().unwrap().len(), 15);

@@ -12,10 +12,13 @@ Gates 1–6 (no-op, both removals, both additions, both artwork paths) have
 passed on hardware. The device is at 727 tracks / 705 ArtworkDB records.
 
 The media-deletion policy: when the operator asks for a delete (distinct
-confirmation phrase), the media file is deleted **as part of the removal
-transaction** — no post-reboot confirmation phase, mirroring iTunes. The file
-is backed up inside the transaction and restored on rollback, so a failed or
-interrupted commit never loses it.
+confirmation phrase), the media file is unlinked **as part of the removal
+transaction** — no post-reboot confirmation phase and no byte backup,
+mirroring iTunes. The staging manifest records only the target path (plus
+the device-relative generation backup of the small database files), so a
+failed or interrupted commit rolls the database back while unlinked media
+stays gone by design. Unlink durability is one directory fsync per affected
+`Music/Fxx` directory, not per file.
 
 Artwork-bearing removals now **rewrite and reindex the `.ithmb` files**
 instead of leaving unreferenced slots: the remaining images are packed into
@@ -298,7 +301,8 @@ cargo run --release --example opod-hardware-test -- \
 
 Expect: one fewer track (727 → 726), the media file gone from
 `iPod_Control/Music/`, valid signatures, no restore warning after reboot. An
-interrupted install restores the file (transaction rollback).
+interrupted install rolls the database back; the unlinked media stays gone
+(no byte backup is retained).
 
 ## Nano 7G gate 8: artwork-bearing removal with media deletion and reindex
 
