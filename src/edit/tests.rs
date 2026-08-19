@@ -1518,4 +1518,188 @@ mod tests {
         assert_eq!(duplicates, 1, "no duplicate artist rows");
         assert_eq!(staged.remaining_tracks(), 727);
     }
+
+    /// Dumps every row of a table, ordered, as comparable values.
+    fn table_rows(connection: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        table_rows_where(connection, table, "")
+    }
+
+    fn table_rows_where(
+        connection: &Connection,
+        table: &str,
+        filter: &str,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        let sql = if filter.is_empty() {
+            format!("SELECT * FROM {table} ORDER BY rowid")
+        } else {
+            format!("SELECT * FROM {table} WHERE {filter} ORDER BY rowid")
+        };
+        let mut statement = connection.prepare(&sql).unwrap_or_else(|error| {
+            panic!("prepare {table}: {error}")
+        });
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                let mut values = Vec::with_capacity(columns);
+                for index in 0..columns {
+                    values.push(row.get(index)?);
+                }
+                Ok(values)
+            })
+            .unwrap_or_else(|error| panic!("query {table}: {error}"))
+            .map(|row| row.unwrap_or_else(|error| panic!("row {table}: {error}")))
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sqlite_roundtrip_preserves_untouched_data() {
+        // A removal rewrites only the rows it must; every other row in the
+        // library and locations databases must stay row-identical, the
+        // companion databases must stay row-identical (minus the removed
+        // track's own rows), and the copied-not-rewritten companions
+        // (iTunesCDB, Locations.itdb.cbk) must stay byte-identical.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let track = device.library().unwrap().tracks()[50].clone();
+        let removed_pid = i64::from_ne_bytes(track.id.to_bits().to_ne_bytes());
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+
+        // Copied-not-rewritten companions must be byte-identical; removed
+        // tracks force the CDB to be re-encoded, so its retained chunks must
+        // be preserved and the rewritten CBK must hash against the rewritten
+        // Locations.itdb.
+        let original_cdb =
+            std::fs::read(fixture.join("iPod_Control/iTunes/iTunesCDB")).unwrap();
+        let staged_cdb = std::fs::read(bundle.path().join("iTunesCDB")).unwrap();
+        let original_header = u32::from_le_bytes(original_cdb[4..8].try_into().unwrap()) as usize;
+        let staged_header = u32::from_le_bytes(staged_cdb[4..8].try_into().unwrap()) as usize;
+        let original_payload = crate::storage::binary::cdb_decode_payload(&original_cdb, original_header).unwrap();
+        let staged_payload = crate::storage::binary::cdb_decode_payload(&staged_cdb, staged_header).unwrap();
+        let mut removed = std::collections::BTreeSet::new();
+        for (index, pid) in crate::storage::binary::cdb_track_pids(&original_payload)
+            .iter()
+            .enumerate()
+        {
+            if *pid == track.id {
+                removed.insert(index);
+            }
+        }
+        assert_eq!(removed.len(), 1, "removed track not found in the fixture CDB");
+        crate::storage::binary::assert_retained_chunks_preserved(
+            &original_payload,
+            &staged_payload,
+            &removed,
+        );
+        let staged_locations_bytes = std::fs::read(
+            bundle.path().join(SqliteLibraryFile::Locations.file_name()),
+        )
+        .unwrap();
+        let staged_cbk = std::fs::read(bundle.path().join("Locations.itdb.cbk")).unwrap();
+        let cbk_info =
+            crate::storage::binary::cdb_cbk_verify(&staged_locations_bytes, &staged_cbk, None)
+                .unwrap();
+        assert!(
+            cbk_info.digests_match(),
+            "rewritten CBK does not match the rewritten Locations.itdb"
+        );
+
+        // Tables the removal legitimately touches.
+        let touched = [
+            "item",
+            "avformat_info",
+            "item_to_container",
+            "album",
+            "artist",
+            "track_artist",
+            "composer",
+            "genre_map",
+            "category_map",
+            "track_size_calc",
+        ];
+        let original_library = Connection::open(
+            fixture.join("iPod_Control/iTunes/iTunes Library.itlp/Library.itdb"),
+        )
+        .unwrap();
+        let staged_library =
+            Connection::open(bundle.path().join(SqliteLibraryFile::Library.file_name())).unwrap();
+        let tables: Vec<String> = original_library
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        for table in tables {
+            if touched.contains(&table.as_str()) {
+                continue;
+            }
+            assert_eq!(
+                table_rows(&original_library, &table),
+                table_rows(&staged_library, &table),
+                "table {table} changed during a removal"
+            );
+        }
+
+        let original_locations = Connection::open(
+            fixture.join("iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb"),
+        )
+        .unwrap();
+        let staged_locations =
+            Connection::open(bundle.path().join(SqliteLibraryFile::Locations.file_name())).unwrap();
+        assert_eq!(
+            table_rows(&original_locations, "base_location"),
+            table_rows(&staged_locations, "base_location"),
+            "base_location changed during a removal"
+        );
+
+        let original_dynamic = Connection::open(
+            fixture.join("iPod_Control/iTunes/iTunes Library.itlp/Dynamic.itdb"),
+        )
+        .unwrap();
+        let staged_dynamic = Connection::open(bundle.path().join("Dynamic.itdb")).unwrap();
+        assert_eq!(
+            table_rows_where(&original_dynamic, "item_stats", &format!("item_pid != {removed_pid}")),
+            table_rows(&staged_dynamic, "item_stats"),
+            "item_stats changed beyond the removed track during a removal"
+        );
+        for table in ["container_ui", "rental_info"] {
+            assert_eq!(
+                table_rows(&original_dynamic, table),
+                table_rows(&staged_dynamic, table),
+                "Dynamic.{table} changed during a removal"
+            );
+        }
+
+        for (name, staged_name) in [("Extras", "Extras.itdb"), ("Genius", "Genius.itdb")] {
+            let original_conn = Connection::open(
+                fixture
+                    .join("iPod_Control/iTunes/iTunes Library.itlp")
+                    .join(format!("{name}.itdb")),
+            )
+            .unwrap();
+            let staged_conn = Connection::open(bundle.path().join(staged_name)).unwrap();
+            let companion_tables: Vec<String> = original_conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            for table in companion_tables {
+                assert_eq!(
+                    table_rows(&original_conn, &table),
+                    table_rows(&staged_conn, &table),
+                    "{name}.{table} changed during a removal"
+                );
+            }
+        }
+        let _ = staged;
+    }
 }

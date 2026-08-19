@@ -1156,6 +1156,7 @@ fn split_datasets(payload: &[u8], expected: usize) -> Result<Vec<Vec<u8>>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -1235,6 +1236,50 @@ mod tests {
     }
 
     #[test]
+    fn fixture_addition_preserves_original_chunks() {
+        // Opposite side of the byte-preservation harness: adding a track must
+        // leave every original chunk byte-identical; new chunks append after.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("backup_7g/iPod_Control/iTunes/iTunesCDB");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let header_length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let payload = super::super::cdb::decode_payload(&bytes, header_length).unwrap();
+        let addition = CdbTrackAddition {
+            persistent_id: PersistentId::from_bits(0x7B22_0000_0000_0002),
+            location: "F40/ZZZZ.mp3".to_owned(),
+            title: "Harness Addition".to_owned(),
+            artist: Some("Harness Artist".to_owned()),
+            album: Some("Harness Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            file_size: 1000,
+            length_ms: 60_000,
+            bitrate: 128,
+            sample_rate: 44100,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            year: 2024,
+            compilation: false,
+            date_mac: 0,
+            artwork: None,
+        };
+        let rewritten =
+            super::add_track_to_cdb(&bytes, [0u8; 8], &addition).unwrap_or_else(|error| {
+                panic!("addition to the fixture CDB failed: {error:?}")
+            });
+        let rewritten_header = u32::from_le_bytes(rewritten[4..8].try_into().unwrap()) as usize;
+        let rewritten_payload =
+            super::super::cdb::decode_payload(&rewritten, rewritten_header).unwrap();
+        super::assert_original_chunks_preserved(&payload, &rewritten_payload);
+    }
+
+    #[test]
     fn parses_legacy_pre_gap_string_mhods() {
         // The pre-gap Nano 7G writer stored encoding at +16, length at +20,
         // data at +32, and claimed `40 + len` total while writing only
@@ -1255,5 +1300,118 @@ mod tests {
         let parsed = parse_string_mhod(&chunk, 0, true).unwrap().unwrap();
         assert_eq!(parsed.0, text);
         assert_eq!(parsed.1, 32 + text.len() * 2);
+    }
+}
+
+/// Addition byte-preservation harness: adding a track must leave every
+/// original chunk byte-identical; new chunks are appended after the original
+/// ones. `original`/`rewritten` are decoded payloads before/after the add.
+/// Original-chunk byte-preservation harness (addition side): every original
+/// mhit/mhia/mhod/mhip must stay byte-identical and in order; new chunks
+/// append after. Exposed to the edit test harness.
+#[cfg(test)]
+pub(crate) fn assert_original_chunks_preserved(original: &[u8], rewritten: &[u8]) {
+    let input = super::cdb_edit::split_payload(original);
+    let output = super::cdb_edit::split_payload(rewritten);
+    assert_eq!(input.len(), output.len(), "dataset count must not change");
+    for (input_dataset, output_dataset) in input.iter().zip(output.iter()) {
+        let (input, input_kind) = *input_dataset;
+        let (output, _) = *output_dataset;
+        match input_kind {
+            1 => {
+                // Original mhits are a byte-identical prefix of the output.
+                let mut in_off = super::cdb_edit::dataset_list_body(input);
+                let mut out_off = super::cdb_edit::dataset_list_body(output);
+                let mut compared = 0;
+                while in_off < input.len() {
+                    let in_track = chunk_header(input, in_off, b"mhit").unwrap();
+                    let out_track = chunk_header(output, out_off, b"mhit").unwrap();
+                    assert_eq!(
+                        &input[in_off..in_track.end],
+                        &output[out_off..out_track.end],
+                        "original track chunk changed during addition"
+                    );
+                    in_off = in_track.end;
+                    out_off = out_track.end;
+                    compared += 1;
+                }
+                assert!(compared > 0, "no original tracks compared");
+                assert!(
+                    out_off <= output.len(),
+                    "appended track walked past the output dataset"
+                );
+            }
+            2 | 3 | 5 => {
+                // Each original mhyp is byte-identical except the rebuilt
+                // 52/53 indices; the appended mhip may follow.
+                let mut in_off = super::cdb_edit::dataset_list_body(input);
+                let mut out_off = super::cdb_edit::dataset_list_body(output);
+                while in_off < input.len() {
+                    let in_hyp = chunk_header(input, in_off, b"mhyp").unwrap();
+                    let out_hyp = chunk_header(output, out_off, b"mhyp").unwrap();
+                    let in_playlist = &input[in_off..in_hyp.end];
+                    let out_playlist = &output[out_off..out_hyp.end];
+                    let header_length =
+                        usize_value(read_u32(in_playlist, 4).unwrap(), 4).unwrap();
+                    let mhod_count =
+                        usize_value(read_u32(in_playlist, 12).unwrap(), 12).unwrap();
+                    let mhip_count =
+                        usize_value(read_u32(in_playlist, 16).unwrap(), 16).unwrap();
+                    let mut in_child = header_length;
+                    let mut out_child = header_length;
+                    for _ in 0..mhod_count {
+                        let in_mhod = chunk_header(in_playlist, in_child, b"mhod").unwrap();
+                        let mhod_type = read_u32(in_playlist, in_child + 12).unwrap();
+                        if mhod_type == 52 || mhod_type == 53 {
+                            let out_mhod =
+                                chunk_header(out_playlist, out_child, b"mhod").unwrap();
+                            in_child = in_mhod.end;
+                            out_child = out_mhod.end;
+                            continue;
+                        }
+                        let out_mhod = chunk_header(out_playlist, out_child, b"mhod").unwrap();
+                        assert_eq!(
+                            &in_playlist[in_child..in_mhod.end],
+                            &out_playlist[out_child..out_mhod.end],
+                            "original mhod changed during addition"
+                        );
+                        in_child = in_mhod.end;
+                        out_child = out_mhod.end;
+                    }
+                    for _ in 0..mhip_count {
+                        let in_mhip = chunk_header(in_playlist, in_child, b"mhip").unwrap();
+                        let out_mhip = chunk_header(out_playlist, out_child, b"mhip").unwrap();
+                        assert_eq!(
+                            &in_playlist[in_child..in_mhip.end],
+                            &out_playlist[out_child..out_mhip.end],
+                            "original mhip changed during addition"
+                        );
+                        in_child = in_mhip.end;
+                        out_child = out_mhip.end;
+                    }
+                    in_off = in_hyp.end;
+                    out_off = out_hyp.end;
+                }
+            }
+            4 => {
+                // A new album appends an mhia; originals are a prefix.
+                let mut in_off = super::cdb_edit::dataset_list_body(input);
+                let mut out_off = super::cdb_edit::dataset_list_body(output);
+                while in_off < input.len() {
+                    let in_album = chunk_header(input, in_off, b"mhia").unwrap();
+                    let out_album = chunk_header(output, out_off, b"mhia").unwrap();
+                    assert_eq!(
+                        &input[in_off..in_album.end],
+                        &output[out_off..out_album.end],
+                        "original album chunk changed during addition"
+                    );
+                    in_off = in_album.end;
+                    out_off = out_album.end;
+                }
+            }
+            _ => {
+                assert_eq!(input, output, "untouched dataset changed during addition");
+            }
+        }
     }
 }

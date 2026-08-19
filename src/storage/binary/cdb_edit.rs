@@ -570,10 +570,50 @@ pub(super) fn verification(reason: &str) -> Error {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod device_cdb_tests {
     use std::path::Path;
 
     use crate::PersistentId;
+
+    /// Splits a decoded payload into dataset slices.
+    fn split_datasets(payload: &[u8]) -> Vec<(&[u8], u32)> {
+        let mut datasets = Vec::new();
+        let mut offset = 0;
+        while offset < payload.len() {
+            let total = u32::from_le_bytes(payload[offset + 8..offset + 12].try_into().unwrap())
+                as usize;
+            let kind = u32::from_le_bytes(payload[offset + 12..offset + 16].try_into().unwrap());
+            datasets.push((&payload[offset..offset + total], kind));
+            offset += total;
+        }
+        datasets
+    }
+
+    /// Returns the persistent IDs of all tracks in a CDB payload, in order.
+    fn track_pids(payload: &[u8]) -> Vec<PersistentId> {
+        for (dataset, kind) in split_datasets(payload) {
+            if kind == 1 {
+                let list = u32::from_le_bytes(dataset[4..8].try_into().unwrap()) as usize;
+                let lh = u32::from_le_bytes(dataset[list + 4..list + 8].try_into().unwrap())
+                    as usize;
+                let count = u32::from_le_bytes(dataset[list + 8..list + 12].try_into().unwrap());
+                let mut offset = list + lh;
+                let mut pids = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let pid = u64::from_le_bytes(
+                        dataset[offset + 0x70..offset + 0x78].try_into().unwrap(),
+                    );
+                    pids.push(PersistentId::from_bits(pid));
+                    offset += u32::from_le_bytes(
+                        dataset[offset + 8..offset + 12].try_into().unwrap(),
+                    ) as usize;
+                }
+                return pids;
+            }
+        }
+        Vec::new()
+    }
 
     /// Walks the master playlist (kind-2 dataset) of a CDB and returns the
     /// embedded position value of every mhip, in playlist order. The standard
@@ -645,6 +685,34 @@ mod device_cdb_tests {
     }
 
     #[test]
+    fn fixture_removal_preserves_retained_chunks() {
+        // The byte-preservation harness: removing one track must leave every
+        // retained mhit chunk and every untouched dataset byte-identical,
+        // proving unknown fields in the mhit (and elsewhere) are never
+        // re-emitted or zeroed.
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g/iPod_Control/iTunes/iTunesCDB");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let header_length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let payload = super::super::cdb::decode_payload(&bytes, header_length).unwrap();
+        let pids = track_pids(&payload);
+        assert!(pids.len() > 200, "fixture library is unexpectedly small");
+        let removed_index = pids.len() / 2;
+        let rewritten = super::remove_tracks_from_cdb(&bytes, [0u8; 8], &[pids[removed_index]])
+            .expect("removal stages");
+        let rewritten_header =
+            u32::from_le_bytes(rewritten[4..8].try_into().unwrap()) as usize;
+        let rewritten_payload =
+            super::super::cdb::decode_payload(&rewritten, rewritten_header).unwrap();
+        let mut removed = std::collections::BTreeSet::new();
+        removed.insert(removed_index);
+        super::assert_retained_chunks_preserved(&payload, &rewritten_payload, &removed);
+    }
+
+    #[test]
     fn removal_round_trips_the_copied_device_cdb() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("iTunesCDB");
         if !path.is_file() {
@@ -694,5 +762,198 @@ mod device_cdb_tests {
         let positions = master_mhip_positions(&final_cdb);
         let expected: Vec<u32> = (0..724).collect();
         assert_eq!(positions, expected);
+    }
+}
+
+/// A retained-chunk byte-preservation harness: an edit must not modify any
+/// chunk it is not supposed to rewrite. `original` and `rewritten` are the
+/// decoded payloads of the same file before/after a change; retained `mhit`
+/// chunks and untouched datasets must appear byte-for-byte in the output.
+#[allow(clippy::too_many_lines)]
+/// Retained-chunk byte-preservation harness (removal side): splits both
+/// payloads into datasets by kind; kind-1 mhits must be byte-identical in
+/// order (removed excised), kind 2/3/5 playlists must keep every non-52/53
+/// mhod and every mhip byte-identical, and every other dataset must be
+/// byte-identical. Exposed to the edit test harness.
+#[cfg(test)]
+pub(crate) fn assert_retained_chunks_preserved(
+    original: &[u8],
+    rewritten: &[u8],
+    removed_track_indices: &std::collections::BTreeSet<usize>,
+) {
+    let input = split_payload(original);
+    let output = split_payload(rewritten);
+    assert_eq!(input.len(), output.len(), "dataset count must not change");
+
+    for (input_dataset, output_dataset) in input.iter().zip(output.iter()) {
+        let (input, input_kind) = *input_dataset;
+        let (output, _) = *output_dataset;
+        if input_kind == 1 {
+            // Track dataset: retained mhit chunks must be byte-identical, in
+            // order, with the removed tracks excised.
+            let mut in_off = dataset_list_body(input);
+            let mut out_off = dataset_list_body(output);
+            let mut index = 0;
+            let mut matched_any = 0usize;
+            loop {
+                let in_done = in_off >= input.len();
+                let out_done = out_off >= output.len();
+                if in_done && out_done {
+                    break;
+                }
+                if in_done {
+                    assert!(!in_done, "output has trailing track bytes at {out_off}");
+                }
+                let track = chunk_header(input, in_off, b"mhit").unwrap();
+                if removed_track_indices.contains(&index) {
+                    in_off = track.end;
+                    index += 1;
+                    continue;
+                }
+                assert!(!out_done, "output ran out of tracks at input {in_off}");
+                let out_track = chunk_header(output, out_off, b"mhit").unwrap();
+                assert_eq!(
+                    &input[in_off..track.end],
+                    &output[out_off..out_track.end],
+                    "retained track chunk {index} changed bytes"
+                );
+                in_off = track.end;
+                out_off = out_track.end;
+                index += 1;
+                matched_any += 1;
+            }
+            assert!(matched_any > 0, "no retained tracks were compared");
+        } else if matches!(input_kind, 2 | 3 | 5) {
+            // Playlist datasets: retained mhods (other than rebuilt 52/53)
+            // and retained mhips must be byte-identical.
+            let mut in_off = dataset_list_body(input);
+            let mut out_off = dataset_list_body(output);
+            loop {
+                if in_off >= input.len() && out_off >= output.len() {
+                    break;
+                }
+                if in_off < input.len() && out_off < output.len() {
+                    if &input[in_off..in_off + 4] == b"mhyp" {
+                        let in_hyp = chunk_header(input, in_off, b"mhyp").unwrap();
+                        let out_hyp = chunk_header(output, out_off, b"mhyp").unwrap();
+                        compare_playlist(
+                            &input[in_off..in_hyp.end],
+                            &output[out_off..out_hyp.end],
+                        );
+                        in_off = in_hyp.end;
+                        out_off = out_hyp.end;
+                        continue;
+                    }
+                    if input[in_off..in_off + 4] == output[out_off..out_off + 4] {
+                        let magic = &input[in_off..in_off + 4];
+                        if magic == b"mhod" || magic == b"mhip" {
+                            let in_chunk = chunk_header(input, in_off, magic).unwrap();
+                            let out_chunk = chunk_header(output, out_off, magic).unwrap();
+                            assert_eq!(
+                                &input[in_off..in_chunk.end],
+                                &output[out_off..out_chunk.end],
+                                "retained playlist chunk at {in_off} changed"
+                            );
+                            in_off = in_chunk.end;
+                            out_off = out_chunk.end;
+                            continue;
+                        }
+                    }
+                    panic!("playlist byte streams diverged at {in_off} / {out_off}");
+                }
+                panic!("playlist byte count changed");
+            }
+        } else {
+            // Untouched datasets must be byte-identical, including headers.
+            assert_eq!(
+                input,
+                output,
+                "untouched kind-{input_kind} dataset changed"
+            );
+        }
+    }
+}
+
+/// Splits a decoded payload into `(dataset bytes, kind)` slices.
+#[cfg(test)]
+pub(crate) fn split_payload(payload: &[u8]) -> Vec<(&[u8], u32)> {
+    let mut datasets = Vec::new();
+    let mut offset = 0;
+    while offset < payload.len() {
+        let total = usize_value(read_u32(payload, offset + 8).unwrap(), offset + 8).unwrap();
+        let kind = read_u32(payload, offset + 12).unwrap();
+        datasets.push((&payload[offset..offset + total], kind));
+        offset += total;
+    }
+    datasets
+}
+
+#[cfg(test)]
+pub(crate) fn dataset_list_body(payload: &[u8]) -> usize {
+    let list = usize_value(read_u32(payload, 4).unwrap(), 4).unwrap();
+    let list_header = usize_value(read_u32(payload, list + 4).unwrap(), list + 4).unwrap();
+    list + list_header
+}
+
+/// Returns the persistent id of every track mhit in the kind-1 dataset, in
+/// file order. Shared by the round-trip harnesses.
+#[cfg(test)]
+pub(crate) fn cdb_track_pids(payload: &[u8]) -> Vec<PersistentId> {
+    for (dataset, kind) in split_payload(payload) {
+        if kind == 1 {
+            let list = usize_value(read_u32(dataset, 4).unwrap(), 4).unwrap();
+            let list_header = usize_value(read_u32(dataset, list + 4).unwrap(), list + 4).unwrap();
+            let count = read_u32(dataset, list + 8).unwrap();
+            let mut offset = list + list_header;
+            let mut pids = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let pid = u64::from_le_bytes(dataset[offset + 0x70..offset + 0x78].try_into().unwrap());
+                pids.push(PersistentId::from_bits(pid));
+                offset += usize_value(read_u32(dataset, offset + 8).unwrap(), offset + 8).unwrap();
+            }
+            return pids;
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+fn compare_playlist(input: &[u8], output: &[u8]) {
+    let walk = |playlist: &[u8]| -> Vec<(usize, usize)> {
+        let header_length =
+            usize_value(read_u32(playlist, 4).unwrap(), 4).unwrap();
+        let mhod_count = usize_value(read_u32(playlist, 12).unwrap(), 12).unwrap();
+        let mhip_count = usize_value(read_u32(playlist, 16).unwrap(), 16).unwrap();
+        let mut chunks = Vec::new();
+        let mut offset = header_length;
+        for _ in 0..mhod_count {
+            let chunk = chunk_header(playlist, offset, b"mhod").unwrap();
+            chunks.push((offset, chunk.end));
+            offset = chunk.end;
+        }
+        for _ in 0..mhip_count {
+            let chunk = chunk_header(playlist, offset, b"mhip").unwrap();
+            chunks.push((offset, chunk.end));
+            offset = chunk.end;
+        }
+        assert_eq!(offset, playlist.len(), "playlist walk misaligned");
+        chunks
+    };
+    let in_chunks = walk(input);
+    let out_chunks = walk(output);
+    for (in_chunk, out_chunk) in in_chunks.iter().zip(out_chunks.iter()) {
+        let in_bytes = &input[in_chunk.0..in_chunk.1];
+        let is_mhod = in_bytes.len() >= 16 && &in_bytes[..4] == b"mhod";
+        let mhod_type = if is_mhod { read_u32(in_bytes, 12).unwrap() } else { 0 };
+        // The 52/53 library indices are intentionally rebuilt; mhip position
+        // values shift on removal; everything else must be byte-identical.
+        if mhod_type == 52 || mhod_type == 53 || !is_mhod {
+            continue;
+        }
+        assert_eq!(
+            in_bytes,
+            &output[out_chunk.0..out_chunk.1],
+            "retained playlist chunk changed"
+        );
     }
 }

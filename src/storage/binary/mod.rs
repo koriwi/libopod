@@ -5,6 +5,15 @@ mod cdb_edit;
 mod classic;
 mod classic_edit;
 
+// Round-trip differ harness helpers, shared with the edit test modules
+// (crate-internal, test builds only).
+#[cfg(test)]
+pub(crate) use cbk::verify_cbk as cdb_cbk_verify;
+#[cfg(test)]
+pub(crate) use cdb::decode_payload as cdb_decode_payload;
+#[cfg(test)]
+pub(crate) use cdb_edit::{assert_retained_chunks_preserved, cdb_track_pids};
+
 pub use cbk::CbkInfo;
 pub use cdb::{CdbDatasetInfo, CdbInfo};
 pub use classic::parse_library;

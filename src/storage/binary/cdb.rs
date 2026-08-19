@@ -125,7 +125,7 @@ pub(crate) fn inspect_cdb(bytes: &[u8], firewire_guid: Option<&[u8; 8]>) -> Resu
     })
 }
 
-pub(super) fn decode_payload(bytes: &[u8], header_len: usize) -> Result<Vec<u8>> {
+pub(crate) fn decode_payload(bytes: &[u8], header_len: usize) -> Result<Vec<u8>> {
     let compressed = bytes.get(header_len..).ok_or_else(|| {
         malformed_error(
             u64::try_from(header_len).unwrap_or(u64::MAX),
