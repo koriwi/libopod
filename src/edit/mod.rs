@@ -924,36 +924,18 @@ fn allocate_media_path(
 
 fn random_media_name() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut state = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos()),
-    )
-    .unwrap_or(u64::MAX)
-        ^ 0x9e37_79b9_7f4a_7c15;
     let mut output = String::with_capacity(4);
     for _ in 0..4 {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        output.push(char::from(ALPHABET[(state % 36) as usize]));
+        output.push(char::from(
+            ALPHABET[(crate::random::next_u64() % 36) as usize],
+        ));
     }
     output
 }
 
 fn generate_unique_pid(existing: &BTreeSet<PersistentId>) -> PersistentId {
-    let mut state = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos()),
-    )
-    .unwrap_or(u64::MAX)
-        ^ 0xd1b5_4a32_d192_ed03;
     loop {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        let candidate = PersistentId::from_bits(state);
+        let candidate = PersistentId::from_bits(crate::random::next_u64());
         if candidate.to_bits() != 0 && !existing.contains(&candidate) {
             return candidate;
         }

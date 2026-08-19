@@ -261,8 +261,8 @@ fn next_pid(transaction: &Transaction<'_>, path: &Path) -> Result<i64> {
     Ok(max.unwrap_or(0).saturating_add(1))
 }
 
-/// Looks up a named entity row (`artist`/`track_artist`/`composer`) by exact name,
-/// creating it with the shared counter when absent.
+/// Looks up a named entity row (`artist`/`track_artist`/`composer`) by exact
+/// or normalized name, creating it with the shared counter when absent.
 fn resolve_named_entity(
     transaction: &Transaction<'_>,
     path: &Path,
@@ -289,6 +289,29 @@ fn resolve_named_entity(
             reason: format!("{table} lookup failed: {source}"),
         })?;
     if let Some(pid) = existing {
+        return Ok(pid);
+    }
+    // iTunes stores the display name; taggers may emit NFC while the library
+    // holds NFD (or differ in case/article), so retry by normalized key before
+    // creating a duplicate entity.
+    let target = normalized_key(name);
+    let normalized_match = transaction
+        .prepare(&format!("SELECT pid, name FROM {table}"))
+        .map_err(|source| Error::Verification {
+            format: "staged SQLite entity lookup",
+            reason: format!("{table} scan failed: {source}"),
+        })?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| Error::Verification {
+            format: "staged SQLite entity lookup",
+            reason: format!("{table} scan failed: {source}"),
+        })?
+        .filter_map(std::result::Result::ok)
+        .find(|(_, existing_name)| normalized_key(existing_name) == target)
+        .map(|(pid, _)| pid);
+    if let Some(pid) = normalized_match {
         return Ok(pid);
     }
     let pid = *next_pid;
@@ -335,6 +358,21 @@ fn resolve_album(
         .optional()
         .map_err(|source| sqlite_error("look up album", path, source))?;
     if let Some(pid) = existing {
+        return Ok(pid);
+    }
+    // Normalized fallback for the same artist (see resolve_named_entity).
+    let target = normalized_key(album_name);
+    let normalized_match = transaction
+        .prepare("SELECT pid, name FROM album WHERE artist_pid = ?1")
+        .map_err(|source| sqlite_error("scan albums", path, source))?
+        .query_map([artist_pid], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| sqlite_error("scan albums", path, source))?
+        .filter_map(std::result::Result::ok)
+        .find(|(_, existing_name)| normalized_key(existing_name) == target)
+        .map(|(pid, _)| pid);
+    if let Some(pid) = normalized_match {
         return Ok(pid);
     }
     let pid = *next_pid;
@@ -385,6 +423,12 @@ fn artist_order_rank(transaction: &Transaction<'_>, path: &Path, artist_pid: i64
     Ok(rank)
 }
 
+/// NFC-normalized, case-folded, article-stripped key used to match entity
+/// names (artists, albums, genres) across tagger/library spelling differences.
+fn normalized_key(name: &str) -> String {
+    sort_key(name.trim())
+}
+
 fn resolve_genre(transaction: &Transaction<'_>, path: &Path, genre: Option<&str>) -> Result<i64> {
     let Some(genre) = genre else {
         return Ok(0);
@@ -401,6 +445,20 @@ fn resolve_genre(transaction: &Transaction<'_>, path: &Path, genre: Option<&str>
         .optional()
         .map_err(|source| sqlite_error("look up genre", path, source))?;
     if let Some(id) = existing {
+        return Ok(id);
+    }
+    let target = normalized_key(genre);
+    let normalized_match = transaction
+        .prepare("SELECT id, genre FROM genre_map")
+        .map_err(|source| sqlite_error("scan genres", path, source))?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| sqlite_error("scan genres", path, source))?
+        .filter_map(std::result::Result::ok)
+        .find(|(_, existing_genre)| normalized_key(existing_genre) == target)
+        .map(|(id, _)| id);
+    if let Some(id) = normalized_match {
         return Ok(id);
     }
     let next: Option<i64> = transaction
@@ -683,14 +741,23 @@ fn insert_location_row(
     addition: &ResolvedAddition,
     pid: i64,
 ) -> Result<()> {
+    // Resolve the music root by path instead of assuming its row id.
+    let base_location_id: i64 = transaction
+        .query_row(
+            "SELECT id FROM locations.base_location WHERE path = 'iPod_Control/Music'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("resolve music base location", path, source))?;
     transaction
         .execute(
             "INSERT INTO locations.location (item_pid, sub_id, base_location_id, location_type, \
              location, extension, kind_id, date_created, file_size, file_creator, file_type, \
              num_dir_levels_file, num_dir_levels_lib) \
-             VALUES (?1, 0, 1, 0x46494C45, ?2, 0x4D503320, 1, ?3, ?4, NULL, NULL, NULL, NULL)",
+             VALUES (?1, 0, ?2, 0x46494C45, ?3, 0x4D503320, 1, ?4, ?5, NULL, NULL, NULL, NULL)",
             rusqlite::params![
                 pid,
+                base_location_id,
                 addition.media_relative,
                 addition.date_coredata,
                 i64::try_from(addition.file_size).unwrap_or(i64::MAX),
@@ -789,10 +856,21 @@ fn update_derived_rows(
             )
             .map_err(|source| sqlite_error("update genre totals", path, source))?;
     }
+    // Resolve the audio size row by kind instead of assuming its pid.
+    let audio_pid: i64 = transaction
+        .query_row(
+            "SELECT pid FROM track_size_calc WHERE kind = 'audio'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("resolve audio size row", path, source))?;
     transaction
         .execute(
-            "UPDATE track_size_calc SET size = size + ?1 WHERE kind = 'audio' AND pid = 1",
-            [i64::try_from(addition.file_size).unwrap_or(i64::MAX)],
+            "UPDATE track_size_calc SET size = size + ?1 WHERE kind = 'audio' AND pid = ?2",
+            rusqlite::params![
+                i64::try_from(addition.file_size).unwrap_or(i64::MAX),
+                audio_pid
+            ],
         )
         .map_err(|source| sqlite_error("update track_size_calc", path, source))?;
     Ok(())

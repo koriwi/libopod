@@ -443,8 +443,12 @@ pub(super) fn append_album(
     let body = checked_end(list, list_header, dataset.len(), list + 4)?;
     let mut output = dataset[..body].to_vec();
     let mut offset = body;
+    // Collect existing `sql_id` values so the new album's id is unique even
+    // when the RNG stream repeats within a clock tick.
+    let mut sql_ids = std::collections::BTreeSet::new();
     for _ in 0..count {
         let album = chunk_header(dataset, offset, b"mhia")?;
+        sql_ids.insert(read_u64(dataset, offset + 0x14)?);
         output.extend_from_slice(&dataset[offset..album.end]);
         offset = album.end;
     }
@@ -457,11 +461,18 @@ pub(super) fn append_album(
         .clone()
         .or_else(|| addition.artist.clone())
         .unwrap_or_default();
+    let sql_id = loop {
+        let candidate = crate::random::next_u64();
+        if candidate != 0 && !sql_ids.contains(&candidate) {
+            break candidate;
+        }
+    };
     output.extend_from_slice(&build_mhia(
         album_id,
         &album_name,
         &album_artist,
         addition.persistent_id,
+        sql_id,
     ));
     write_u32(
         &mut output,
@@ -1094,7 +1105,13 @@ fn build_mhip(track_id: u32, position: u32) -> Vec<u8> {
     output
 }
 
-fn build_mhia(album_id: u32, name: &str, artist: &str, representative: PersistentId) -> Vec<u8> {
+fn build_mhia(
+    album_id: u32,
+    name: &str,
+    artist: &str,
+    representative: PersistentId,
+    sql_id: u64,
+) -> Vec<u8> {
     let mut mhods = Vec::new();
     let mut child_count = 0_u32;
     for (mhod_type, text) in [(200_u32, name), (201_u32, artist)] {
@@ -1115,23 +1132,11 @@ fn build_mhia(album_id: u32, name: &str, artist: &str, representative: Persisten
     write_u32(&mut output, 8, u32::try_from(total).unwrap_or(u32::MAX)).ok();
     write_u32(&mut output, 0x0c, child_count).ok();
     write_u32(&mut output, 0x10, album_id).ok();
-    write_u64(&mut output, 0x14, random_u64()).ok(); // sql_id
+    write_u64(&mut output, 0x14, sql_id).ok(); // sql_id
     write_u16(&mut output, 0x1c, 2).ok(); // platform_flag
     write_u64(&mut output, 0x20, representative.to_bits()).ok();
     output.extend_from_slice(&mhods);
     output
-}
-
-fn random_u64() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let mut state = u64::try_from(nanos).unwrap_or(u64::MAX) ^ 0x9e37_79b9_7f4a_7c15;
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
-    state
 }
 
 fn split_datasets(payload: &[u8], expected: usize) -> Result<Vec<Vec<u8>>> {

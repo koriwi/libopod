@@ -1446,4 +1446,76 @@ mod tests {
             .expect("artwork record for the added track");
         assert_eq!(record.formats.len(), 4);
     }
+
+    #[test]
+    fn normalized_matching_avoids_duplicate_artists() {
+        // A staged addition whose artist differs only by case must reuse the
+        // existing artist row instead of creating a duplicate that splits the
+        // device browser.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let original_pid: i64 = {
+            let library = rusqlite::Connection::open(
+                fixture.join("iPod_Control/iTunes/iTunes Library.itlp/Library.itdb"),
+            )
+            .unwrap();
+            library
+                .query_row(
+                    "SELECT pid FROM artist WHERE name = 'Linkin Park'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let source = fixture.join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return;
+        }
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "Normalization Check".to_owned(),
+            artist: Some("LINKIN PARK".to_owned()), // case differs from the row
+            album: Some("Normalized Test Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2007,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 128,
+            sample_rate: 44100,
+            length_ms: 60_000,
+            compilation: false,
+            reuse_album_art: false,
+            artwork_source: None,
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        let library = rusqlite::Connection::open(
+            bundle.path().join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let artist_pid: i64 = library
+            .query_row(
+                "SELECT artist_pid FROM item WHERE title = 'Normalization Check'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(artist_pid, original_pid, "case-folded artist must reuse the row");
+        let duplicates: i64 = library
+            .query_row("SELECT COUNT(*) FROM artist WHERE name = 'Linkin Park'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(duplicates, 1, "no duplicate artist rows");
+        assert_eq!(staged.remaining_tracks(), 727);
+    }
 }

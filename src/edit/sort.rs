@@ -1,9 +1,13 @@
 //! Shared iTunes-style sort-key helpers used by the binary and `SQLite` writers.
 
+use unicode_normalization::UnicodeNormalization;
+
 /// Case-folded, article-stripped sort key (approximation of iTunes ordering).
+/// The name is first normalized to NFC so decomposed and precomposed spellings
+/// of the same character compare equal.
 pub(crate) fn sort_key(text: &str) -> String {
     strip_article(text)
-        .chars()
+        .nfc()
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -58,5 +62,17 @@ mod tests {
         assert_eq!(jump_letter("1234"), u16::from(b'0'));
         assert_eq!(jump_letter("Zebra"), u16::from(b'Z'));
         assert_eq!(jump_letter("(hello)"), u16::from(b'H'));
+    }
+
+    #[test]
+    fn normalized_keys_fold_case_articles_and_unicode() {
+        // NFC and NFD spellings of the same name compare equal.
+        assert_eq!(super::sort_key("Sören"), super::sort_key("So\u{308}ren"));
+        // Case and article folding.
+        assert_eq!(super::sort_key("The Beatles"), super::sort_key("beatles"));
+        assert_eq!(
+            super::sort_key("THE DARK SIDE"),
+            super::sort_key("the dark side")
+        );
     }
 }

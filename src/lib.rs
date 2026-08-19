@@ -8,6 +8,7 @@ pub mod edit;
 mod error;
 pub mod fs;
 pub mod library;
+mod random;
 mod storage;
 
 pub use artwork::{
