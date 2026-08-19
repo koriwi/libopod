@@ -623,7 +623,17 @@ impl<'device> EditSession<'device> {
         let date_mac = u32::try_from(now.saturating_add(2_082_844_800)).unwrap_or(u32::MAX);
         let mut resolved = Vec::with_capacity(self.additions.len());
         let mut running_sizes = std::collections::HashMap::new();
-        let mut next_image_id = base_image_id(self.device)?;
+        // Only additions that carry artwork need the ArtworkDB image-id base;
+        // cover-less devices (Nano 1G/2G) have no ArtworkDB to read.
+        let mut next_image_id = if self
+            .additions
+            .iter()
+            .any(|track| track.reuse_album_art || track.artwork_source.is_some())
+        {
+            base_image_id(self.device)?
+        } else {
+            100
+        };
         for track in &self.additions {
             let (media_relative, _staged_path) =
                 allocate_media_path(self.device, destination, &track.source_path)?;

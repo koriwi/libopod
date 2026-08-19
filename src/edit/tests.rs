@@ -1215,6 +1215,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stages_a_no_artwork_add_without_an_artwork_database() {
+        // A cover-less classic (Nano 1G/2G) has no
+        // iPod_Control/Artwork/ArtworkDB. Simulate that on the attached Nano
+        // 3G files by removing the ArtworkDB: a no-artwork addition must
+        // stage without ever resolving the artwork database (regression for
+        // base_image_id reading it unconditionally).
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("files_nano3");
+        if !source.join("iTunes/iTunesDB").is_file() {
+            return;
+        }
+        let device_dir = tempdir().unwrap();
+        let root = device_dir.path().join("iPod_Control");
+        for folder in ["Device", "iTunes", "Artwork"] {
+            let folder_source = source.join(folder);
+            if !folder_source.is_dir() {
+                continue;
+            }
+            fs::create_dir_all(root.join(folder)).unwrap();
+            for entry in fs::read_dir(&folder_source).unwrap() {
+                let entry = entry.unwrap();
+                fs::copy(entry.path(), root.join(folder).join(entry.file_name())).unwrap();
+            }
+        }
+        fs::create_dir_all(root.join("Music/F00")).unwrap();
+        if root.join("Artwork/ArtworkDB").exists() {
+            fs::remove_file(root.join("Artwork/ArtworkDB")).unwrap();
+        }
+        assert!(!root.join("Artwork/ArtworkDB").exists());
+        let device = Device::open(device_dir.path()).unwrap();
+        let source_mp3 = device_dir.path().join("source.mp3");
+        fs::write(&source_mp3, [0u8; 4096]).unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source_mp3,
+            title: "No Art".to_owned(),
+            artist: Some("Test Artist".to_owned()),
+            album: Some("Test Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2024,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 128,
+            sample_rate: 44100,
+            length_ms: 60_000,
+            compilation: false,
+            reuse_album_art: false,
+            artwork_source: None,
+        })
+        .unwrap();
+        let staging = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(staging.path()).unwrap();
+        assert_eq!(staged.remaining_tracks(), 725, "724 + 1 added");
+        assert_eq!(staged.added_artwork_tracks(), 0);
+        assert!(!staging.path().join("ArtworkDB").exists());
+    }
+
     fn stage_private_no_artwork_removal() -> Option<(TempDir, super::StagedSqliteEdit)> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
         if !fixture.is_dir() {
