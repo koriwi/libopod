@@ -581,8 +581,8 @@ mod device_cdb_tests {
         let mut datasets = Vec::new();
         let mut offset = 0;
         while offset < payload.len() {
-            let total = u32::from_le_bytes(payload[offset + 8..offset + 12].try_into().unwrap())
-                as usize;
+            let total =
+                u32::from_le_bytes(payload[offset + 8..offset + 12].try_into().unwrap()) as usize;
             let kind = u32::from_le_bytes(payload[offset + 12..offset + 16].try_into().unwrap());
             datasets.push((&payload[offset..offset + total], kind));
             offset += total;
@@ -595,8 +595,8 @@ mod device_cdb_tests {
         for (dataset, kind) in split_datasets(payload) {
             if kind == 1 {
                 let list = u32::from_le_bytes(dataset[4..8].try_into().unwrap()) as usize;
-                let lh = u32::from_le_bytes(dataset[list + 4..list + 8].try_into().unwrap())
-                    as usize;
+                let lh =
+                    u32::from_le_bytes(dataset[list + 4..list + 8].try_into().unwrap()) as usize;
                 let count = u32::from_le_bytes(dataset[list + 8..list + 12].try_into().unwrap());
                 let mut offset = list + lh;
                 let mut pids = Vec::with_capacity(count as usize);
@@ -605,9 +605,9 @@ mod device_cdb_tests {
                         dataset[offset + 0x70..offset + 0x78].try_into().unwrap(),
                     );
                     pids.push(PersistentId::from_bits(pid));
-                    offset += u32::from_le_bytes(
-                        dataset[offset + 8..offset + 12].try_into().unwrap(),
-                    ) as usize;
+                    offset +=
+                        u32::from_le_bytes(dataset[offset + 8..offset + 12].try_into().unwrap())
+                            as usize;
                 }
                 return pids;
             }
@@ -703,8 +703,7 @@ mod device_cdb_tests {
         let removed_index = pids.len() / 2;
         let rewritten = super::remove_tracks_from_cdb(&bytes, [0u8; 8], &[pids[removed_index]])
             .expect("removal stages");
-        let rewritten_header =
-            u32::from_le_bytes(rewritten[4..8].try_into().unwrap()) as usize;
+        let rewritten_header = u32::from_le_bytes(rewritten[4..8].try_into().unwrap()) as usize;
         let rewritten_payload =
             super::super::cdb::decode_payload(&rewritten, rewritten_header).unwrap();
         let mut removed = std::collections::BTreeSet::new();
@@ -836,10 +835,7 @@ pub(crate) fn assert_retained_chunks_preserved(
                     if &input[in_off..in_off + 4] == b"mhyp" {
                         let in_hyp = chunk_header(input, in_off, b"mhyp").unwrap();
                         let out_hyp = chunk_header(output, out_off, b"mhyp").unwrap();
-                        compare_playlist(
-                            &input[in_off..in_hyp.end],
-                            &output[out_off..out_hyp.end],
-                        );
+                        compare_playlist(&input[in_off..in_hyp.end], &output[out_off..out_hyp.end]);
                         in_off = in_hyp.end;
                         out_off = out_hyp.end;
                         continue;
@@ -865,11 +861,7 @@ pub(crate) fn assert_retained_chunks_preserved(
             }
         } else {
             // Untouched datasets must be byte-identical, including headers.
-            assert_eq!(
-                input,
-                output,
-                "untouched kind-{input_kind} dataset changed"
-            );
+            assert_eq!(input, output, "untouched kind-{input_kind} dataset changed");
         }
     }
 }
@@ -907,7 +899,8 @@ pub(crate) fn cdb_track_pids(payload: &[u8]) -> Vec<PersistentId> {
             let mut offset = list + list_header;
             let mut pids = Vec::with_capacity(count as usize);
             for _ in 0..count {
-                let pid = u64::from_le_bytes(dataset[offset + 0x70..offset + 0x78].try_into().unwrap());
+                let pid =
+                    u64::from_le_bytes(dataset[offset + 0x70..offset + 0x78].try_into().unwrap());
                 pids.push(PersistentId::from_bits(pid));
                 offset += usize_value(read_u32(dataset, offset + 8).unwrap(), offset + 8).unwrap();
             }
@@ -920,8 +913,7 @@ pub(crate) fn cdb_track_pids(payload: &[u8]) -> Vec<PersistentId> {
 #[cfg(test)]
 fn compare_playlist(input: &[u8], output: &[u8]) {
     let walk = |playlist: &[u8]| -> Vec<(usize, usize)> {
-        let header_length =
-            usize_value(read_u32(playlist, 4).unwrap(), 4).unwrap();
+        let header_length = usize_value(read_u32(playlist, 4).unwrap(), 4).unwrap();
         let mhod_count = usize_value(read_u32(playlist, 12).unwrap(), 12).unwrap();
         let mhip_count = usize_value(read_u32(playlist, 16).unwrap(), 16).unwrap();
         let mut chunks = Vec::new();
@@ -944,7 +936,11 @@ fn compare_playlist(input: &[u8], output: &[u8]) {
     for (in_chunk, out_chunk) in in_chunks.iter().zip(out_chunks.iter()) {
         let in_bytes = &input[in_chunk.0..in_chunk.1];
         let is_mhod = in_bytes.len() >= 16 && &in_bytes[..4] == b"mhod";
-        let mhod_type = if is_mhod { read_u32(in_bytes, 12).unwrap() } else { 0 };
+        let mhod_type = if is_mhod {
+            read_u32(in_bytes, 12).unwrap()
+        } else {
+            0
+        };
         // The 52/53 library indices are intentionally rebuilt; mhip position
         // values shift on removal; everything else must be byte-identical.
         if mhod_type == 52 || mhod_type == 53 || !is_mhod {

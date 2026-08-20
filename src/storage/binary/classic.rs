@@ -449,17 +449,57 @@ mod tests {
 #[cfg(test)]
 mod nano2_add_regression {
     use super::*;
+    use crate::storage::binary::cdb_add::CdbTrackAddition;
     use crate::storage::binary::cdb_edit::split_datasets;
     use crate::storage::binary::classic_edit::add_track;
-    use crate::storage::binary::cdb_add::CdbTrackAddition;
 
     #[test]
-    fn appended_mhit_mirrors_the_nano2_mhod_profile() {
-        // The user's Nano 2G database (libgpod-written): its tracks carry
-        // mhods [1 title, 4 artist, 3 album, 6 filetype, 2 location] and the
-        // old firmware needs exactly that child set/order to display a track.
-        // An appended track must mirror it (including the filetype mhod).
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("files_nano2/iTunes/iTunesDB");
+    fn adds_the_first_track_to_an_empty_nano2_library() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("files_nano2/iTunes/iTunesDB.copyPod-backup");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(path).unwrap();
+        let addition = CdbTrackAddition {
+            persistent_id: PersistentId::from_bits(0x7A33_0000_0000_0002),
+            location: ":iPod_Control:Music:F00/FIRST.mp3".to_owned(),
+            title: "First Track".to_owned(),
+            artist: Some("Artist".to_owned()),
+            album: Some("Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            file_size: 1000,
+            length_ms: 60_000,
+            bitrate: 128,
+            sample_rate: 44_100,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            year: 2024,
+            compilation: false,
+            date_mac: 0,
+            artwork: None,
+        };
+        let rewritten = add_track(&bytes, crate::device::ChecksumKind::None, None, &addition)
+            .unwrap_or_else(|error| panic!("first Nano 2G add failed: {error:?}"));
+        let library = parse_library(&rewritten, None).expect("parse first-track result");
+        assert_eq!(library.tracks.len(), 1);
+        assert_eq!(library.tracks[0].persistent_id, addition.persistent_id);
+    }
+
+    #[test]
+    fn heals_the_failed_nano2_playlist_and_uses_the_reference_track_profile() {
+        // The working iOpenPod Nano 2G database uses the ordered profile
+        // [1 title, 4 artist, 3 album, 6 filetype, 2 location, 5 genre,
+        // 22 album artist]. The failed libopod image still contains 22 older
+        // rows with the working core order alongside 494 newer no-filetype
+        // rows. Profile selection must find a working row rather than choosing
+        // the more common broken profile.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("files_nano2_sync_new_songs_not_showing_up/iTunes/iTunesDB");
         if !path.is_file() {
             return;
         }
@@ -497,7 +537,6 @@ mod nano2_add_regression {
         let lh = usize_value(read_u32(d0, ds_hdr + 4).unwrap(), ds_hdr + 4).unwrap();
         let count = usize_value(read_u32(d0, ds_hdr + 8).unwrap(), ds_hdr + 8).unwrap();
         let mut off = ds_hdr + lh;
-        let mut expected = Vec::new();
         let mut last_mhods = Vec::new();
         for i in 0..count {
             let ch = chunk_header(d0, off, b"mhit").unwrap();
@@ -509,18 +548,59 @@ mod nano2_add_regression {
                 mhods.push(read_u32(d0, coff + 12).unwrap());
                 coff = mh.end;
             }
-            if i == 0 {
-                expected = mhods.clone();
-            }
             if i == count - 1 {
                 last_mhods = mhods;
             }
             off = ch.end;
         }
         assert_eq!(
-            last_mhods, expected,
-            "appended mhit must mirror the device mhod profile"
+            last_mhods,
+            vec![1, 4, 3, 6, 2, 5, 22],
+            "appended mhit must match the working iOpenPod profile"
         );
-        assert_eq!(count, 601, "track count grew by one");
+        assert_eq!(count, 517, "track count grew by one");
+
+        // The working reference keeps the type-2 and type-3 master playlists
+        // in sync. The failed libopod image had 516 tracks in type 1/type 2
+        // but only the 22 old tracks in type 3, matching the on-device symptom.
+        for dataset in datasets
+            .iter()
+            .filter(|dataset| matches!(read_u32(dataset, 12), Ok(2 | 3)))
+        {
+            let dataset_header = usize_value(read_u32(dataset, 4).unwrap(), 4).unwrap();
+            let list_header = usize_value(
+                read_u32(dataset, dataset_header + 4).unwrap(),
+                dataset_header + 4,
+            )
+            .unwrap();
+            let master = dataset_header + list_header;
+            assert_eq!(
+                read_u32(dataset, master + 16).unwrap(),
+                517,
+                "both classic master playlists must contain the added track"
+            );
+
+            let master_header = chunk_header(dataset, master, b"mhyp").unwrap();
+            let mhod_count =
+                usize_value(read_u32(dataset, master + 12).unwrap(), master + 12).unwrap();
+            let mut child = master + master_header.header_length;
+            for _ in 0..mhod_count {
+                child = chunk_header(dataset, child, b"mhod").unwrap().end;
+            }
+            for position in 0..517_u32 {
+                let mhip = chunk_header(dataset, child, b"mhip").unwrap();
+                let mhod = child + mhip.header_length;
+                assert_eq!(&dataset[mhod..mhod + 4], b"mhod");
+                assert_eq!(read_u32(dataset, mhod + 8).unwrap(), 44);
+                assert_eq!(read_u32(dataset, mhod + 12).unwrap(), 100);
+                assert_eq!(read_u32(dataset, mhod + 24).unwrap(), position);
+                assert_eq!(
+                    mhod + usize_value(read_u32(dataset, mhod + 8).unwrap(), mhod + 8).unwrap(),
+                    mhip.end,
+                    "every position MHOD must fit completely inside its MHIP"
+                );
+                child = mhip.end;
+            }
+        }
     }
 }

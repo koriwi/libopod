@@ -38,9 +38,10 @@ pub struct DeviceCapabilities {
 }
 
 impl DeviceCapabilities {
-    /// Whether the device stores cover artwork (an `ArtworkDB` plus fixed-slot
-    /// `.ithmb` files). Devices without writable formats (Nano 1G/2G) have no
-    /// artwork at all: staging must not touch `iPod_Control/Artwork/`.
+    /// Whether libopod has writable cover-art formats for this profile (an
+    /// `ArtworkDB` plus fixed-slot `.ithmb` files). An empty list means the
+    /// writer must leave artwork storage untouched; it does not imply that the
+    /// physical device is incapable of displaying artwork.
     #[must_use]
     pub fn supports_artwork(&self) -> bool {
         !self.artwork_formats.is_empty()
@@ -221,7 +222,8 @@ fn nano_7g() -> DeviceProfile {
 }
 
 /// Classic Nano 1–4 profile: uncompressed binary `iTunesDB`, no `SQLite`, and
-/// artwork preserved; the Nano 3G/4G also write the classic cover formats.
+/// artwork preserved when present. Nano 3G/4G have qualified writable cover
+/// formats; Nano 1G/2G artwork writing remains unimplemented.
 ///
 /// Covers the signing matrix entry NONE for Nano 1–2G and HASH58 for
 /// Nano 3–4G. `cdb_version` matches the device's `mhbd` version field
@@ -323,9 +325,9 @@ mod tests {
 
     #[test]
     fn artwork_support_matches_the_device_family() {
-        // Nano 1G/2G have no artwork at all; 3G/4G and 7G do. Staging uses
-        // this to skip `ArtworkDB`/`.ithmb` handling on cover-less devices
-        // (a Nano 2G has no `iPod_Control/Artwork/ArtworkDB` to read).
+        // Nano 1G/2G can display artwork, but their writer profiles are not
+        // implemented yet. Staging must therefore leave their ArtworkDB and
+        // ithmb files untouched. Nano 3G/4G and 7G are writable.
         for profile in [nano_1g(), nano_2g()] {
             assert!(!profile.capabilities().supports_artwork());
         }

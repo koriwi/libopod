@@ -684,11 +684,15 @@ fn verify_bundle(
         feature: "device transaction",
         reason: "the device profile is unknown".to_owned(),
     })?;
-    let backend = profile.capabilities().backend;
-    let artwork_outputs =
-        usize::from(staged.removed_artwork_tracks() > 0 || staged.added_artwork_tracks() > 0)
-            + staged.added_ithmb().len()
-            + staged.removed_ithmb().len();
+    let capabilities = profile.capabilities();
+    let backend = capabilities.backend;
+    let artwork_outputs = expected_artwork_outputs(
+        capabilities.supports_artwork(),
+        staged.removed_artwork_tracks(),
+        staged.added_artwork_tracks(),
+        staged.added_ithmb(),
+        staged.removed_ithmb(),
+    );
     let database_outputs = if backend == crate::device::BackendKind::Binary {
         // Classic devices: the iTunesDB plus any artwork outputs.
         1 + artwork_outputs
@@ -720,6 +724,30 @@ fn verify_bundle(
         )?;
     }
     Ok(())
+}
+
+fn expected_artwork_outputs(
+    artwork_supported: bool,
+    removed_artwork_tracks: usize,
+    added_artwork_tracks: usize,
+    added_ithmb: &[IpodPath],
+    removed_ithmb: &[IpodPath],
+) -> usize {
+    if !artwork_supported {
+        // Nano 1G/2G libraries can contain ArtworkDB records even though
+        // libopod does not yet have a qualified writer for their formats.
+        // Their staging bundles intentionally leave all artwork files alone.
+        return 0;
+    }
+
+    let artwork_db = usize::from(removed_artwork_tracks > 0 || added_artwork_tracks > 0);
+    let ithmb = added_ithmb
+        .iter()
+        .chain(removed_ithmb)
+        .map(IpodPath::as_str)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    artwork_db + ithmb
 }
 
 fn original_state<'a>(
@@ -913,4 +941,30 @@ fn hex(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expected_artwork_outputs;
+    use crate::IpodPath;
+
+    #[test]
+    fn ignores_existing_artwork_on_profiles_without_a_writer() {
+        assert_eq!(
+            expected_artwork_outputs(false, 3, 0, &[], &[]),
+            0,
+            "Nano 1G/2G edits intentionally leave their existing artwork untouched"
+        );
+    }
+
+    #[test]
+    fn counts_each_rewritten_ithmb_only_once_for_mixed_edits() {
+        let shared = IpodPath::new("iPod_Control/Artwork/F1061_1.ithmb").unwrap();
+        let added_only = IpodPath::new("iPod_Control/Artwork/F1055_1.ithmb").unwrap();
+        assert_eq!(
+            expected_artwork_outputs(true, 1, 1, &[shared.clone(), added_only], &[shared],),
+            3,
+            "one ArtworkDB plus two unique ithmb files"
+        );
+    }
 }

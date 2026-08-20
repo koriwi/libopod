@@ -62,7 +62,6 @@ pub struct IdentityEvidence {
 
 impl IdentityEvidence {
     pub(crate) fn read_from(mount: &MountRoot) -> Result<Self> {
-        eprintln!("DBG read_from called");
         let mut evidence = Self::empty();
         if let Some(bytes) = read_optional(
             mount,

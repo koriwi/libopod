@@ -191,9 +191,10 @@ enum SortField {
 
 fn parse_track(chunk: &[u8], position: u32) -> Result<ParsedTrack> {
     let header = chunk_header(chunk, 0, b"mhit")?;
-    // The header size varies by firmware version (Nano 7G 0x270, classic
-    // 0x248); require only the highest field read below (artist id ref).
-    if header.header_length < MHIT_ARTIST_ID_REF + 4 {
+    // Header size varies by database version. Nano 1G/2G uses 0x148 and
+    // therefore has no later artist-id field; only the persistent ID is
+    // required. Extended sort fields default to zero when absent.
+    if header.header_length < MHIT_DB_TRACK_ID + 8 {
         return Err(malformed(
             4,
             "mhit header is too short for index rebuilding",
@@ -218,11 +219,11 @@ fn parse_track(chunk: &[u8], position: u32) -> Result<ParsedTrack> {
         position,
         persistent_id: PersistentId::from_bits(read_u64(chunk, MHIT_DB_TRACK_ID)?),
         track_id: read_u32(chunk, MHIT_TRACK_ID)?,
-        artist_id_ref: read_u32(chunk, MHIT_ARTIST_ID_REF)?,
+        artist_id_ref: read_optional_u32(chunk, header.header_length, MHIT_ARTIST_ID_REF)?,
         track_number: read_u32(chunk, MHIT_TRACK_NUMBER)?,
         disc_number: read_u32(chunk, MHIT_DISC_NUMBER)?,
-        season: read_u32(chunk, MHIT_SEASON)?,
-        episode: read_u32(chunk, MHIT_EPISODE)?,
+        season: read_optional_u32(chunk, header.header_length, MHIT_SEASON)?,
+        episode: read_optional_u32(chunk, header.header_length, MHIT_EPISODE)?,
         title: string_or(&strings, MHOD_TYPE_TITLE),
         album: string_or(&strings, MHOD_TYPE_ALBUM),
         artist: string_or(&strings, MHOD_TYPE_ARTIST),
@@ -241,6 +242,14 @@ fn parse_track(chunk: &[u8], position: u32) -> Result<ParsedTrack> {
 
 fn string_or(strings: &HashMap<u32, String>, mhod_type: u32) -> String {
     strings.get(&mhod_type).cloned().unwrap_or_default()
+}
+
+fn read_optional_u32(chunk: &[u8], header_length: usize, offset: usize) -> Result<u32> {
+    if header_length >= offset.saturating_add(4) {
+        read_u32(chunk, offset)
+    } else {
+        Ok(0)
+    }
 }
 
 /// Parses a string `mhod` at `offset`, returning the string and the mhod's
@@ -280,6 +289,13 @@ pub(super) fn parse_string_mhod(
     offset: usize,
     legacy: bool,
 ) -> Result<Option<(String, usize)>> {
+    let mhod_type = read_u32(chunk, offset + 12)?;
+    if !matches!(
+        mhod_type,
+        1..=14 | 18..=31 | 33..=44 | 200..=204 | 300
+    ) {
+        return Ok(None);
+    }
     let (encoding_offset, length_offset, data_offset) = if legacy {
         (offset + 16, offset + 20, offset + 32)
     } else {
@@ -357,7 +373,7 @@ pub(super) fn rewrite_track_dataset(
         .checked_add(1)
         .ok_or_else(|| verification("CDB track ID overflow"))?;
     let artist_id_ref = resolve_artist_id_ref(&tracks, addition);
-    let mhod_profile = first_track_mhod_types(dataset)?;
+    let mhod_profile = track_mhod_profile(dataset)?;
     output.extend_from_slice(&build_mhit(
         addition,
         db_id_2,
@@ -618,14 +634,38 @@ fn rewrite_master_playlist(
         offset = mhod.end;
     }
 
-    let mut position = usize_value(read_u32(playlist, 16)?, 16)?;
+    let mut existing_mhips = HashMap::with_capacity(mhip_count);
     for _ in 0..mhip_count {
         let mhip = chunk_header(playlist, offset, b"mhip")?;
-        output.extend_from_slice(&playlist[offset..mhip.end]);
+        let existing_track_id = read_u32(playlist, offset + 0x18)?;
+        existing_mhips.insert(existing_track_id, playlist[offset..mhip.end].to_vec());
         offset = mhip.end;
     }
     if offset != playlist.len() {
         return Err(malformed(offset, "trailing bytes after mhyp children"));
+    }
+
+    // Master membership and type-52 indices both use positions in type-1
+    // track order. Re-emit that canonical order, retaining a byte-identical
+    // existing MHIP only when its type-100 child has the complete iOpenPod
+    // layout. The old libopod writer omitted the MHOD header's 8-byte gap:
+    // each generated MHIP was 112 bytes but its child claimed 44 bytes. Such
+    // an entry is only valid as a firmware-truncated final child and corrupts
+    // the following entries when several tracks are added in one sync.
+    let mut position = 0_usize;
+    for existing in tracks {
+        let position_u32 = u32::try_from(position)
+            .map_err(|_| verification("master playlist position exceeds u32"))?;
+        if let Some(mhip) = existing_mhips.remove(&existing.track_id) {
+            if master_mhip_is_canonical(&mhip, existing.track_id, position_u32)? {
+                output.extend_from_slice(&mhip);
+            } else {
+                output.extend_from_slice(&build_mhip(existing.track_id, position_u32));
+            }
+        } else {
+            output.extend_from_slice(&build_mhip(existing.track_id, position_u32));
+        }
+        position += 1;
     }
     let position_u32 = u32::try_from(position)
         .map_err(|_| verification("master playlist position exceeds u32"))?;
@@ -640,6 +680,26 @@ fn rewrite_master_playlist(
         u32::try_from(output.len()).map_err(|_| verification("rewritten playlist exceeds u32"))?;
     write_u32(&mut output, 8, output_len)?;
     Ok(output)
+}
+
+fn master_mhip_is_canonical(mhip: &[u8], track_id: u32, position: u32) -> Result<bool> {
+    let header = chunk_header(mhip, 0, b"mhip")?;
+    if header.header_length != MHIP_HEADER_SIZE
+        || read_u32(mhip, 0x0c)? != 1
+        || read_u32(mhip, 0x18)? != track_id
+    {
+        return Ok(false);
+    }
+    let mhod_offset = header.header_length;
+    if mhip.get(mhod_offset..mhod_offset + 4) != Some(b"mhod") {
+        return Ok(false);
+    }
+    let mhod_header = usize_value(read_u32(mhip, mhod_offset + 4)?, mhod_offset + 4)?;
+    let mhod_total = usize_value(read_u32(mhip, mhod_offset + 8)?, mhod_offset + 8)?;
+    Ok(mhod_header == 24
+        && mhod_offset.checked_add(mhod_total) == Some(mhip.len())
+        && read_u32(mhip, mhod_offset + 12)? == 100
+        && read_u32(mhip, mhod_offset + 24)? == position)
 }
 
 /// Builds the sorted index entries for one sort category, including the new
@@ -964,39 +1024,81 @@ fn build_mhod_string(mhod_type: u32, text: &str) -> Vec<u8> {
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-/// Reads the `mhod` type profile (types in order) of the first existing
-/// track, so appended tracks carry exactly the child set the device firmware
-/// expects — the same principle as mirroring the `mhit` header size. Old
-/// firmware (Nano 2G) walks a track's children in order and needs the
-/// filetype mhod (6) to classify a track as playable; writing a different
-/// set/order hides the new tracks.
-fn first_track_mhod_types(dataset: &[u8]) -> Result<Vec<u32>> {
+/// Reads the ordered union of `mhod` types used by existing tracks.
+///
+/// A Nano 2G library commonly has a short first track profile and adds genre
+/// or album-artist children only on later tracks. Mirroring only the first
+/// row loses those fields; using the ordered union preserves the device's
+/// established order while retaining all metadata types it already uses.
+fn track_mhod_profile(dataset: &[u8]) -> Result<Vec<u32>> {
     let header = chunk_header(dataset, 0, b"mhsd")?;
     let list = header.header_length;
     require_magic(dataset, list, b"mhlt")?;
     let list_header = usize_value(read_u32(dataset, list + 4)?, list + 4)?;
     let count = usize_value(read_u32(dataset, list + 8)?, list + 8)?;
     if count == 0 {
-        // No existing track to mirror: use the modern classic profile.
+        // iOpenPod's current writer order for a newly initialized classic
+        // library. Filetype is supplied for MP3 additions.
         return Ok(vec![
             MHOD_TYPE_TITLE,
+            MHOD_TYPE_LOCATION,
             MHOD_TYPE_ARTIST,
             MHOD_TYPE_ALBUM,
-            MHOD_TYPE_FILETYPE,
-            MHOD_TYPE_LOCATION,
             MHOD_TYPE_GENRE,
             MHOD_TYPE_ALBUM_ARTIST,
+            MHOD_TYPE_COMPOSER,
+            MHOD_TYPE_FILETYPE,
         ]);
     }
     let body = checked_end(list, list_header, dataset.len(), list + 4)?;
-    let track = chunk_header(dataset, body, b"mhit")?;
-    let child_count = usize_value(read_u32(dataset, body + MHIT_CHILD_COUNT)?, MHIT_CHILD_COUNT)?;
-    let mut types = Vec::with_capacity(child_count);
-    let mut offset = body + track.header_length;
-    for _ in 0..child_count {
-        let mhod = chunk_header(dataset, offset, b"mhod")?;
-        types.push(read_u32(dataset, offset + 12)?);
-        offset = mhod.end;
+    let mut profiles = Vec::with_capacity(count);
+    let mut track_offset = body;
+    for _ in 0..count {
+        let track = chunk_header(dataset, track_offset, b"mhit")?;
+        let child_count = usize_value(
+            read_u32(dataset, track_offset + MHIT_CHILD_COUNT)?,
+            track_offset + MHIT_CHILD_COUNT,
+        )?;
+        let mut profile = Vec::with_capacity(child_count);
+        let mut offset = track_offset + track.header_length;
+        for _ in 0..child_count {
+            let (mhod_type, claimed_end, legacy) = mhod_child(dataset, offset)?;
+            profile.push(mhod_type);
+            offset = parse_string_mhod(dataset, offset, legacy)?
+                .map_or(claimed_end, |(_, real_end)| real_end);
+        }
+        profiles.push(profile);
+        track_offset = track.end;
+    }
+    if track_offset != dataset.len() {
+        return Err(malformed(track_offset, "trailing bytes after mhlt tracks"));
+    }
+
+    // Prefer an existing MP3 profile that includes the filetype description.
+    // This also heals a library produced by the old libopod writer: most new
+    // rows omitted type 6, while a smaller set of working rows retained the
+    // Nano 2G-compatible order. Then take
+    // optional fields in the most complete row's order and include rarities.
+    let mut types = profiles
+        .iter()
+        .filter(|profile| profile.contains(&MHOD_TYPE_FILETYPE))
+        .max_by_key(|profile| profile.len())
+        .or_else(|| profiles.first())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(longest) = profiles.iter().max_by_key(|profile| profile.len()) {
+        for mhod_type in longest {
+            if !types.contains(mhod_type) {
+                types.push(*mhod_type);
+            }
+        }
+    }
+    for profile in &profiles {
+        for mhod_type in profile {
+            if !types.contains(mhod_type) {
+                types.push(*mhod_type);
+            }
+        }
     }
     Ok(types)
 }
@@ -1101,7 +1203,9 @@ fn build_mhit(
     write_u32(&mut header, 0x98, 0).ok(); // genius_category_id
     write_u32(&mut header, 0x9c, 0).ok(); // skip_count
     write_u32(&mut header, 0xa0, 0).ok(); // last_skipped
-    header[0xa4] = if artwork.is_some() { 1 } else { 2 }; // has_artwork
+    if header.len() > 0xa4 {
+        header[0xa4] = if artwork.is_some() { 1 } else { 2 }; // has_artwork
+    }
     write_u64(&mut header, 0xa8, addition.persistent_id.to_bits()).ok(); // db_track_id_2
     write_u32(&mut header, 0xb8, 0).ok(); // pregap
     write_u64(&mut header, 0xbc, 0).ok(); // sample_count
@@ -1116,7 +1220,9 @@ fn build_mhit(
     write_u64(&mut header, MHIT_DB_ID2_REF, db_id_2).ok();
     write_u32(&mut header, 0x12c, addition.file_size).ok(); // size_2
     write_u32(&mut header, 0x160, artwork.map_or(0, |art| art.image_id)).ok(); // artwork_id_ref
-    header[0x134..0x13a].copy_from_slice(&[0x80; 6]); // sort indicators, no sort MHODs
+    if header.len() >= 0x13a {
+        header[0x134..0x13a].copy_from_slice(&[0x80; 6]); // sort indicators, no sort MHODs
+    }
     write_u32(&mut header, 0x168, 1).ok(); // opaque marker
     write_u32(&mut header, MHIT_ARTIST_ID_REF, artist_id_ref).ok();
     write_u32(&mut header, 0x1f4, 0).ok(); // composer_id
@@ -1131,8 +1237,10 @@ fn build_mhod_position(position: u32) -> Vec<u8> {
     output.extend_from_slice(&24_u32.to_le_bytes());
     output.extend_from_slice(&44_u32.to_le_bytes());
     output.extend_from_slice(&100_u32.to_le_bytes());
+    output.extend_from_slice(&[0_u8; 8]);
     output.extend_from_slice(&position.to_le_bytes());
     output.extend_from_slice(&[0_u8; 16]);
+    debug_assert_eq!(output.len(), 44);
     output
 }
 
@@ -1238,6 +1346,63 @@ mod tests {
     }
 
     #[test]
+    fn builds_a_complete_master_playlist_position_child() {
+        let mhip = build_mhip(42, 7);
+        assert_eq!(mhip.len(), 120);
+        assert_eq!(read_u32(&mhip, 8).unwrap(), 120);
+        assert_eq!(&mhip[MHIP_HEADER_SIZE..MHIP_HEADER_SIZE + 4], b"mhod");
+        assert_eq!(read_u32(&mhip, MHIP_HEADER_SIZE + 8).unwrap(), 44);
+        assert_eq!(read_u32(&mhip, MHIP_HEADER_SIZE + 12).unwrap(), 100);
+        assert_eq!(read_u32(&mhip, MHIP_HEADER_SIZE + 24).unwrap(), 7);
+        assert!(master_mhip_is_canonical(&mhip, 42, 7).unwrap());
+    }
+
+    #[test]
+    fn parses_a_nano2_sized_mhit_for_index_rebuilds() {
+        let addition = CdbTrackAddition {
+            persistent_id: PersistentId::from_bits(0x1122_3344_5566_7788),
+            location: ":iPod_Control:Music:F00:TEST.mp3".to_owned(),
+            title: "Nano 2G header".to_owned(),
+            artist: Some("Artist".to_owned()),
+            album: Some("Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            file_size: 1_000,
+            length_ms: 60_000,
+            bitrate: 128,
+            sample_rate: 44_100,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            year: 2024,
+            compilation: false,
+            date_mac: 0,
+            artwork: None,
+        };
+        let bytes = build_mhit(
+            &addition,
+            0,
+            1,
+            0,
+            0,
+            0x148,
+            &[
+                MHOD_TYPE_TITLE,
+                MHOD_TYPE_ARTIST,
+                MHOD_TYPE_ALBUM,
+                MHOD_TYPE_FILETYPE,
+                MHOD_TYPE_LOCATION,
+            ],
+        );
+        let parsed = parse_track(&bytes, 0).expect("parse Nano 2G-sized mhit");
+        assert_eq!(parsed.persistent_id, addition.persistent_id);
+        assert_eq!(parsed.title, addition.title);
+        assert_eq!(parsed.artist_id_ref, 0);
+    }
+
+    #[test]
     fn addition_round_trips_the_copied_device_cdb() {
         // The copied device CDB contains the firmware-rewritten master
         // playlist, including its truncated trailing mhip. The adder must
@@ -1318,10 +1483,8 @@ mod tests {
             date_mac: 0,
             artwork: None,
         };
-        let rewritten =
-            super::add_track_to_cdb(&bytes, [0u8; 8], &addition).unwrap_or_else(|error| {
-                panic!("addition to the fixture CDB failed: {error:?}")
-            });
+        let rewritten = super::add_track_to_cdb(&bytes, [0u8; 8], &addition)
+            .unwrap_or_else(|error| panic!("addition to the fixture CDB failed: {error:?}"));
         let rewritten_header = u32::from_le_bytes(rewritten[4..8].try_into().unwrap()) as usize;
         let rewritten_payload =
             super::super::cdb::decode_payload(&rewritten, rewritten_header).unwrap();
@@ -1400,20 +1563,16 @@ pub(crate) fn assert_original_chunks_preserved(original: &[u8], rewritten: &[u8]
                     let out_hyp = chunk_header(output, out_off, b"mhyp").unwrap();
                     let in_playlist = &input[in_off..in_hyp.end];
                     let out_playlist = &output[out_off..out_hyp.end];
-                    let header_length =
-                        usize_value(read_u32(in_playlist, 4).unwrap(), 4).unwrap();
-                    let mhod_count =
-                        usize_value(read_u32(in_playlist, 12).unwrap(), 12).unwrap();
-                    let mhip_count =
-                        usize_value(read_u32(in_playlist, 16).unwrap(), 16).unwrap();
+                    let header_length = usize_value(read_u32(in_playlist, 4).unwrap(), 4).unwrap();
+                    let mhod_count = usize_value(read_u32(in_playlist, 12).unwrap(), 12).unwrap();
+                    let mhip_count = usize_value(read_u32(in_playlist, 16).unwrap(), 16).unwrap();
                     let mut in_child = header_length;
                     let mut out_child = header_length;
                     for _ in 0..mhod_count {
                         let in_mhod = chunk_header(in_playlist, in_child, b"mhod").unwrap();
                         let mhod_type = read_u32(in_playlist, in_child + 12).unwrap();
                         if mhod_type == 52 || mhod_type == 53 {
-                            let out_mhod =
-                                chunk_header(out_playlist, out_child, b"mhod").unwrap();
+                            let out_mhod = chunk_header(out_playlist, out_child, b"mhod").unwrap();
                             in_child = in_mhod.end;
                             out_child = out_mhod.end;
                             continue;

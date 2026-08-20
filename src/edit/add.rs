@@ -1052,7 +1052,10 @@ pub(crate) fn reindex_browse_orders(transaction: &Transaction<'_>, path: &Path) 
             .get(&sort_key(genre))
             .copied()
             .unwrap_or(100);
-        let composer_order = composer_orders.get(&sort_key(composer)).copied().unwrap_or(100);
+        let composer_order = composer_orders
+            .get(&sort_key(composer))
+            .copied()
+            .unwrap_or(100);
         let album_artist_order = album_artist_orders
             .get(&sort_key(album_artist))
             .copied()

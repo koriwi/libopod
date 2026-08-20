@@ -105,16 +105,34 @@ pub(crate) fn add_track(
         .iter()
         .position(|dataset| read_u32(dataset, 12).ok() == Some(4))
         .ok_or_else(|| verification("iTunesDB has no type-4 album dataset"))?;
-    let master_dataset = datasets
+    // Both playlist universes carry a master library on classic databases.
+    // iOpenPod rebuilds the type-2 and type-3 masters from the complete track
+    // list; leaving type 3 stale made the Nano 2G show only the tracks that
+    // predated a libopod sync even though the type-1 list and type-2 master
+    // contained every new track.
+    let master_datasets: Vec<usize> = datasets
         .iter()
-        .position(|dataset| read_u32(dataset, 12).ok() == Some(2))
-        .ok_or_else(|| verification("iTunesDB has no type-2 playlist dataset"))?;
+        .enumerate()
+        .filter_map(|(index, dataset)| {
+            read_u32(dataset, 12)
+                .ok()
+                .filter(|kind| matches!(*kind, 2 | 3))
+                .map(|_| index)
+        })
+        .collect();
+    if master_datasets.is_empty() {
+        return Err(verification(
+            "iTunesDB has no type-2/type-3 playlist dataset",
+        ));
+    }
 
     let (album_id, album_is_new) = resolve_album(&datasets[album_dataset], addition)?;
     // Match the firmware's `mhit` header size: read it from the first
     // existing track so a classic device (e.g. 0x248 on Nano 3G) gets a new
-    // track with a header its parser already expects.
-    let mhit_header_size = existing_mhit_header_size(&datasets[track_dataset])?;
+    // track with a header its parser already expects. For an empty library,
+    // use iOpenPod's database-version mapping so the first track can be added.
+    let db_version = read_u32(itunesdb, 0x10)?;
+    let mhit_header_size = existing_mhit_header_size(&datasets[track_dataset], db_version)?;
     let (existing_tracks, rewritten_tracks, next_track_id, _artist_id_ref) =
         super::cdb_add::rewrite_track_dataset(
             &datasets[track_dataset],
@@ -127,12 +145,14 @@ pub(crate) fn add_track(
     if album_is_new {
         datasets[album_dataset] = append_album(&datasets[album_dataset], album_id, addition)?;
     }
-    datasets[master_dataset] = rewrite_master_playlist_dataset(
-        &datasets[master_dataset],
-        &existing_tracks,
-        addition,
-        next_track_id,
-    )?;
+    for master_dataset in master_datasets {
+        datasets[master_dataset] = rewrite_master_playlist_dataset(
+            &datasets[master_dataset],
+            &existing_tracks,
+            addition,
+            next_track_id,
+        )?;
+    }
 
     let mut rewritten = Vec::new();
     for dataset in datasets {
@@ -143,14 +163,19 @@ pub(crate) fn add_track(
 
 /// Reads the `mhit` header length used by the device's existing tracks, so
 /// newly built tracks use the same header size the firmware expects.
-fn existing_mhit_header_size(dataset: &[u8]) -> Result<usize> {
+fn existing_mhit_header_size(dataset: &[u8], db_version: u32) -> Result<usize> {
     let header = super::cdb_edit::chunk_header(dataset, 0, b"mhsd")?;
     let list = header.header_length;
     require_magic(dataset, list, b"mhlt")?;
     let list_header = usize_value(read_u32(dataset, list + 4)?, list + 4)?;
     let count = usize_value(read_u32(dataset, list + 8)?, list + 8)?;
     if count == 0 {
-        return Err(verification("cannot add to an empty classic library"));
+        return Ok(match db_version {
+            0..=0x12 => 0x9c,
+            0x13..=0x19 => 0x148,
+            0x1a..=0x2d => 0x1f8,
+            _ => 0x270,
+        });
     }
     let body = checked_end(list, list_header, dataset.len(), list + 4)?;
     let track = chunk_header(dataset, body, b"mhit")?;

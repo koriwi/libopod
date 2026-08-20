@@ -370,8 +370,8 @@ impl<'device> EditSession<'device> {
         }
         // Classic artwork uses the same mhfd ArtworkDB and fixed-slot ithmb
         // files as the Nano 7G: removals drop records and reindex slots,
-        // additions append records and frames. Nano 1G/2G have no artwork
-        // formats, so their removals/additions never touch ArtworkDB.
+        // additions append records and frames. Nano 1G/2G artwork writing is
+        // not implemented, so their edits must leave ArtworkDB untouched.
         let artwork_supported = profile.capabilities().supports_artwork();
         if !self.removals.is_empty() && artwork_supported {
             write_artwork_preview(self.device, &destination, &self.removals)?;
@@ -624,7 +624,7 @@ impl<'device> EditSession<'device> {
         let mut resolved = Vec::with_capacity(self.additions.len());
         let mut running_sizes = std::collections::HashMap::new();
         // Only additions that carry artwork need the ArtworkDB image-id base;
-        // cover-less devices (Nano 1G/2G) have no ArtworkDB to read.
+        // profiles without a qualified artwork writer need no ArtworkDB read.
         let mut next_image_id = if self
             .additions
             .iter()
@@ -1532,7 +1532,6 @@ fn write_cdb_additions(
     Ok(())
 }
 
-
 /// Rewrites `ArtworkDB` and rebuilds the `.ithmb` files after removals that
 /// reference artwork.
 ///
@@ -1547,8 +1546,8 @@ fn write_artwork_preview(
     directory: &Path,
     removals: &BTreeSet<PersistentId>,
 ) -> Result<()> {
-    // Devices without artwork formats (Nano 1G/2G) have no `ArtworkDB` to
-    // read; a removal must be a pure database/media edit for them.
+    // Profiles without writable artwork formats (currently Nano 1G/2G) must
+    // leave artwork storage untouched during a database/media removal.
     if !device
         .profile()
         .is_some_and(|profile| profile.capabilities().supports_artwork())
@@ -1631,8 +1630,8 @@ fn write_artwork_additions(
     if linked.is_empty() {
         return Ok(());
     }
-    // Cover-less classic devices (Nano 1G/2G) cannot resolve artwork
-    // additions in the first place; stay defensive anyway.
+    // Classic profiles without a qualified artwork writer cannot resolve
+    // artwork additions in the first place; stay defensive anyway.
     if !device
         .profile()
         .is_some_and(|profile| profile.capabilities().supports_artwork())
