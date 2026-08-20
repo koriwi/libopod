@@ -1,12 +1,35 @@
 [package]
-name = "libopod"
+name = "libopod-rs"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 description = "Safe Rust library for mounted, storage-backed iPods"
+repository = "https://github.com/koriwi/libopod"
+homepage = "https://github.com/koriwi/libopod"
+documentation = "https://docs.rs/libopod-rs"
+readme = "README.md"
 keywords = ["ipod", "itunesdb", "music", "sync"]
 categories = ["filesystem", "multimedia"]
+include = [
+    "/src/**",
+    "/examples/**",
+    "/tests/hashab_vectors.rs",
+    "/tests/private_nano7.rs",
+    "/tests/fixtures/hashab-vectors.json",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/HARDWARE_TESTING.md",
+    "/plan.md",
+    "/LICENSE",
+    "/LICENSES/**",
+    "/THIRD_PARTY.md",
+]
+
+[lib]
+# Keep the Rust import path `libopod` while publishing the package as `libopod-rs`.
+name = "libopod"
 
 [features]
 default = ["bundled-sqlite"]

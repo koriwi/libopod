@@ -444,7 +444,7 @@ assumption.
 
 ## 13. Confirmed decisions
 
-- Name: **libopod** (crate/package name `libopod`).
+- Name: **libopod** (package name `libopod-rs`, library/import name `libopod`).
 - License: MIT. Do not import LGPL implementation code into the crate.
 - 1.0 scope: copyPod's needs—music track enumeration/add/remove, cover artwork,
   model/signing support, safe commits, and preservation of existing playlists.

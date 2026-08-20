@@ -19,8 +19,7 @@ const MAX_ARTWORK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A read-only handle to a mounted iPod.
 ///
-/// Mutating edit sessions are intentionally not exposed until staged commit
-/// and recovery guarantees are implemented.
+/// Mutations use staged edit sessions with validation and transaction recovery.
 #[derive(Debug)]
 pub struct Device {
     mount: MountRoot,
