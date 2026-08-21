@@ -14,7 +14,7 @@ mod tests {
         edit_staged_databases, TrackToAdd,
     };
     use crate::{
-        artwork::parse_artwork_records, Device, Error, MediaDeletionPolicy, MountRoot,
+        artwork::parse_artwork_records, Device, Error, Library, MediaDeletionPolicy, MountRoot,
         PersistentId, SqliteLibraryFile, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
         NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
     };
@@ -1523,6 +1523,111 @@ mod tests {
     }
 
     #[test]
+    fn classic_playlist_crud_round_trip_on_the_attached_nano3() {
+        let Some(device_dir) = build_classic_device_from_attachments() else {
+            return;
+        };
+        let device = Device::open(device_dir.path()).unwrap();
+        let library = device.library().unwrap();
+        let original_playlist_count = library.playlists().len();
+        let master = library
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.is_hidden)
+            .expect("classic master playlist");
+        let mut rejected = device.edit().unwrap();
+        assert!(matches!(
+            rejected.rename_playlist(master.id, "not allowed"),
+            Err(Error::Unsupported {
+                feature: "playlist mutation",
+                ..
+            })
+        ));
+
+        let tracks = [
+            library.tracks()[2].id,
+            library.tracks()[0].id,
+            library.tracks()[2].id,
+        ];
+        let mut edit = device.edit().unwrap();
+        let playlist_id = edit.create_playlist("Road Test", &tracks).unwrap();
+        edit.rename_playlist(playlist_id, "Road Test Created").unwrap();
+        assert_eq!(edit.playlist_edit_count(), 1);
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.remaining_tracks(), 724);
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        staged.install(&virtual_device).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        let created = reopened
+            .library()
+            .unwrap()
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .expect("created playlist");
+        assert_eq!(created.name, "Road Test Created");
+        assert_eq!(created.track_ids(), tracks);
+        assert!(!created.is_hidden);
+        assert!(!created.is_smart);
+        assert_eq!(
+            reopened.library().unwrap().playlists().len(),
+            original_playlist_count + 1
+        );
+        let installed =
+            std::fs::read(virtual_root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        assert_eq!(
+            installed
+                .windows(8)
+                .filter(|window| *window == playlist_id.to_bits().to_le_bytes())
+                .count(),
+            2,
+            "playlist ID must be present in type-2 and type-3 datasets"
+        );
+
+        let mut edit = reopened.edit().unwrap();
+        edit.rename_playlist(playlist_id, "Road Test Updated").unwrap();
+        edit.set_playlist_tracks(playlist_id, &tracks[1..]).unwrap();
+        let update_bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(update_bundle.path()).unwrap();
+        let update_root = update_bundle.path().join("original");
+        staged.install(&Device::open(&update_root).unwrap()).unwrap();
+        let updated_device = Device::open(&update_root).unwrap();
+        let updated = updated_device
+            .library()
+            .unwrap()
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .expect("updated playlist");
+        assert_eq!(updated.name, "Road Test Updated");
+        assert_eq!(updated.track_ids(), &tracks[1..]);
+
+        let mut edit = updated_device.edit().unwrap();
+        edit.delete_playlist(playlist_id).unwrap();
+        let delete_bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(delete_bundle.path()).unwrap();
+        let delete_root = delete_bundle.path().join("original");
+        staged.install(&Device::open(&delete_root).unwrap()).unwrap();
+        let deleted_device = Device::open(&delete_root).unwrap();
+        assert_eq!(
+            deleted_device.library().unwrap().playlists().len(),
+            original_playlist_count
+        );
+        assert!(deleted_device
+            .library()
+            .unwrap()
+            .playlists()
+            .iter()
+            .all(|playlist| playlist.id != playlist_id));
+        let installed =
+            std::fs::read(delete_root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        let guid = deleted_device.evidence().firewire_guid().expect("guid");
+        assert!(crate::crypto::hash58::verify(&guid, &installed));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn classic_artwork_addition_round_trip_on_the_attached_nano3() {
         let Some(device_dir) = build_classic_device_from_attachments() else {
@@ -1631,6 +1736,149 @@ mod tests {
             .find(|record| record.track_id == added.id)
             .expect("artwork record for the added track");
         assert_eq!(record.formats.len(), 4);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sqlite_playlist_crud_round_trip_on_the_attached_nano7() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let library = device.library().unwrap();
+        let original_playlist_count = library.playlists().len();
+        let master = library
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.is_hidden)
+            .expect("Nano 7G master playlist");
+        let smart = library
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.is_smart && !playlist.is_hidden)
+            .expect("Nano 7G smart playlist");
+        let mut rejected = device.edit().unwrap();
+        assert!(matches!(
+            rejected.rename_playlist(master.id, "not allowed"),
+            Err(Error::Unsupported {
+                feature: "playlist mutation",
+                ..
+            })
+        ));
+        assert!(matches!(
+            rejected.rename_playlist(smart.id, "not allowed"),
+            Err(Error::Unsupported {
+                feature: "playlist mutation",
+                ..
+            })
+        ));
+
+        let tracks = [
+            library.tracks()[2].id,
+            library.tracks()[0].id,
+            library.tracks()[2].id,
+        ];
+        let mut edit = device.edit().unwrap();
+        let playlist_id = edit.create_playlist("Road Test", &tracks).unwrap();
+        edit.rename_playlist(playlist_id, "Road Test Created")
+            .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.remaining_tracks(), library.track_count());
+
+        let staged_library = Library::read_sqlite(
+            &bundle.path().join(SqliteLibraryFile::Library.file_name()),
+            &bundle
+                .path()
+                .join(SqliteLibraryFile::Locations.file_name()),
+        )
+        .unwrap();
+        let created = staged_library
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .expect("created SQLite playlist");
+        assert_eq!(created.name, "Road Test Created");
+        assert_eq!(created.track_ids(), tracks);
+        assert!(!created.is_hidden);
+        assert!(!created.is_smart);
+        assert_eq!(staged_library.playlists().len(), original_playlist_count + 1);
+
+        let stored_id = i64::from_ne_bytes(playlist_id.to_bits().to_ne_bytes());
+        let dynamic = Connection::open(bundle.path().join("Dynamic.itdb")).unwrap();
+        assert_eq!(
+            dynamic
+                .query_row(
+                    "SELECT COUNT(*) FROM container_ui WHERE container_pid=?1",
+                    [stored_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(bundle.path().join("iTunesCDB")).unwrap(),
+            std::fs::read(fixture.join("iPod_Control/iTunes/iTunesCDB")).unwrap(),
+            "playlist-only edits must leave the CDB byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(bundle.path().join("Locations.itdb.cbk")).unwrap(),
+            std::fs::read(
+                fixture.join("iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb.cbk")
+            )
+            .unwrap(),
+            "playlist-only edits must leave the Locations signature byte-identical"
+        );
+
+        let create_root = bundle.path().join("original");
+        staged.install(&Device::open(&create_root).unwrap()).unwrap();
+        let created_device = Device::open(&create_root).unwrap();
+        let mut edit = created_device.edit().unwrap();
+        edit.rename_playlist(playlist_id, "Road Test Updated")
+            .unwrap();
+        edit.set_playlist_tracks(playlist_id, &tracks[1..])
+            .unwrap();
+        let update_bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(update_bundle.path()).unwrap();
+        let update_root = update_bundle.path().join("original");
+        staged.install(&Device::open(&update_root).unwrap()).unwrap();
+        let updated_device = Device::open(&update_root).unwrap();
+        let updated = updated_device
+            .library()
+            .unwrap()
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .expect("updated SQLite playlist");
+        assert_eq!(updated.name, "Road Test Updated");
+        assert_eq!(updated.track_ids(), &tracks[1..]);
+
+        let mut edit = updated_device.edit().unwrap();
+        edit.delete_playlist(playlist_id).unwrap();
+        let delete_bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(delete_bundle.path()).unwrap();
+        let delete_root = delete_bundle.path().join("original");
+        staged.install(&Device::open(&delete_root).unwrap()).unwrap();
+        let deleted_device = Device::open(&delete_root).unwrap();
+        assert_eq!(
+            deleted_device.library().unwrap().playlists().len(),
+            original_playlist_count
+        );
+        let dynamic = Connection::open(
+            delete_root.join("iPod_Control/iTunes/iTunes Library.itlp/Dynamic.itdb"),
+        )
+        .unwrap();
+        assert_eq!(
+            dynamic
+                .query_row(
+                    "SELECT COUNT(*) FROM container_ui WHERE container_pid=?1",
+                    [stored_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

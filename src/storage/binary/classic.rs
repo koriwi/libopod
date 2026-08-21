@@ -39,6 +39,10 @@ const MHOD_TYPE_GENRE: u32 = 5;
 const MHOD_TYPE_COMPOSER: u32 = 12;
 const MHOD_TYPE_ALBUM_ARTIST: u32 = 22;
 const MHOD_TYPE_PLAYLIST_NAME: u32 = 1;
+const MHOD_TYPE_SMART_PREFERENCES: u32 = 50;
+const MHOD_TYPE_SMART_RULES: u32 = 51;
+const MHYP_KIND: usize = 0x14;
+const MHYP_PERSISTENT_ID: usize = 0x1c;
 
 /// One classic library track.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,6 +69,8 @@ pub struct ClassicTrack {
 pub struct ClassicPlaylist {
     pub id: PersistentId,
     pub name: String,
+    pub is_hidden: bool,
+    pub is_smart: bool,
     pub track_ids: Vec<u32>,
 }
 
@@ -237,15 +243,26 @@ fn parse_playlist_dataset(dataset: &[u8]) -> Result<Vec<ClassicPlaylist>> {
     Ok(playlists)
 }
 
-fn parse_playlist(chunk: &[u8], index: usize) -> Result<ClassicPlaylist> {
+fn parse_playlist(chunk: &[u8], _index: usize) -> Result<ClassicPlaylist> {
     let header = chunk_header(chunk, 0, b"mhyp")?;
+    if header.header_length < MHYP_PERSISTENT_ID + 8 {
+        return Err(malformed(
+            4,
+            "mhyp header is too short for its persistent ID",
+        ));
+    }
     let mut name = String::new();
+    let mut is_smart = false;
     let mut track_ids = Vec::new();
     let mut offset = header.header_length;
     let mhod_count = usize_value(read_u32(chunk, 12)?, 12)?;
     let mhip_count = usize_value(read_u32(chunk, 16)?, 16)?;
     for _ in 0..mhod_count {
         let (mhod_type, claimed_end, legacy) = mhod_child(chunk, offset)?;
+        is_smart |= matches!(
+            mhod_type,
+            MHOD_TYPE_SMART_PREFERENCES | MHOD_TYPE_SMART_RULES
+        );
         match parse_string_mhod(chunk, offset, legacy)? {
             Some((text, real_end)) => {
                 if mhod_type == MHOD_TYPE_PLAYLIST_NAME {
@@ -265,8 +282,10 @@ fn parse_playlist(chunk: &[u8], index: usize) -> Result<ClassicPlaylist> {
         return Err(malformed(offset, "trailing bytes after mhyp children"));
     }
     Ok(ClassicPlaylist {
-        id: PersistentId::from_bits(u64::try_from(index + 1).unwrap_or(u64::MAX)),
+        id: PersistentId::from_bits(read_u64(chunk, MHYP_PERSISTENT_ID)?),
         name,
+        is_hidden: chunk[MHYP_KIND] != 0,
+        is_smart,
         track_ids,
     })
 }
@@ -396,7 +415,10 @@ mod tests {
         assert!(!track.has_artwork);
         assert_eq!(library.playlists.len(), 1);
         let playlist = &library.playlists[0];
+        assert_eq!(playlist.id, PersistentId::from_bits(0));
         assert_eq!(playlist.name, "Test Playlist");
+        assert!(!playlist.is_hidden);
+        assert!(!playlist.is_smart);
         assert_eq!(playlist.track_ids, vec![7]);
     }
 

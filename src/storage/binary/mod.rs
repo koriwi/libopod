@@ -18,7 +18,8 @@ pub use cbk::CbkInfo;
 pub use cdb::{CdbDatasetInfo, CdbInfo};
 pub use classic::parse_library;
 pub(crate) use classic_edit::{
-    add_track as add_classic_track, remove_tracks as remove_classic_tracks,
+    add_track as add_classic_track, edit_playlists as edit_classic_playlists,
+    remove_tracks as remove_classic_tracks, ClassicPlaylistMutation,
 };
 
 pub(crate) use cbk::{build_hashab_cbk, verify_cbk};

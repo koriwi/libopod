@@ -124,10 +124,18 @@ pub(crate) fn add_track_to_cdb(
         .iter()
         .position(|dataset| read_u32(dataset, 12).ok() == Some(4))
         .ok_or_else(|| verification("CDB has no type-4 album dataset"))?;
+    // Apple-initialized/firmware-reset Nano 7G databases can omit MHSD type 2
+    // entirely. In that bootstrap layout, type 3 contains the sole master
+    // playlist and must carry additions until the firmware emits type 2.
     let master_dataset = datasets
         .iter()
         .position(|dataset| read_u32(dataset, 12).ok() == Some(2))
-        .ok_or_else(|| verification("CDB has no type-2 playlist dataset"))?;
+        .or_else(|| {
+            datasets
+                .iter()
+                .position(|dataset| read_u32(dataset, 12).ok() == Some(3))
+        })
+        .ok_or_else(|| verification("CDB has no type-2/type-3 master playlist dataset"))?;
 
     let (album_id, album_is_new) = resolve_album(&datasets[album_dataset], addition)?;
 
@@ -1446,6 +1454,49 @@ mod tests {
         assert!(
             removed.is_ok(),
             "removal from rewritten device CDB failed: {removed:?}"
+        );
+    }
+
+    #[test]
+    fn adds_to_a_nano7_bootstrap_cdb_without_a_type2_dataset() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("backup_7g/iPod_Control/iTunes/iTunesCDB.backup");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let addition = CdbTrackAddition {
+            persistent_id: PersistentId::from_bits(0x7A11_0000_0000_0002),
+            location: "F00/BOOT.mp3".to_owned(),
+            title: "Bootstrap CDB Test".to_owned(),
+            artist: Some("Artist".to_owned()),
+            album: Some("Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            file_size: 1000,
+            length_ms: 60_000,
+            bitrate: 128,
+            sample_rate: 44_100,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            year: 2024,
+            compilation: false,
+            date_mac: 0,
+            artwork: None,
+        };
+        let added = super::add_track_to_cdb(&bytes, [0; 8], &addition)
+            .unwrap_or_else(|error| panic!("bootstrap CDB addition failed: {error:?}"));
+        let removed = super::super::cdb_edit::remove_tracks_from_cdb(
+            &added,
+            [0; 8],
+            &[addition.persistent_id],
+        );
+        assert!(
+            removed.is_ok(),
+            "removal from rewritten bootstrap CDB failed: {removed:?}"
         );
     }
 

@@ -129,8 +129,8 @@ impl Library {
                 name: playlist.name.clone(),
                 parent_id: None,
                 distinguished_kind: 0,
-                is_hidden: false,
-                is_smart: false,
+                is_hidden: playlist.is_hidden,
+                is_smart: playlist.is_smart,
                 track_ids: playlist
                     .track_ids
                     .iter()

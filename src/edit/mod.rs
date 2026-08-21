@@ -2,12 +2,13 @@ mod add;
 mod commit;
 mod generation;
 mod manifest;
+mod playlist;
 pub(crate) mod sort;
 
 pub use generation::{FileFingerprint, GenerationFingerprint};
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -27,13 +28,14 @@ pub(crate) use commit::{
 
 use self::generation::fingerprint_host_file;
 use self::manifest::{back_up_generation, write_staging_manifest, ManifestDeletionFile};
+use self::playlist::edit_staged_playlists;
 use crate::{
     error::io_error,
     fs::read_limited,
     storage::{
         binary::{
-            add_track_to_cdb, build_hashab_cbk, remove_tracks_from_cdb, verify_cbk, CdbArtworkLink,
-            CdbTrackAddition,
+            add_track_to_cdb, build_hashab_cbk, edit_classic_playlists, remove_tracks_from_cdb,
+            verify_cbk, CdbArtworkLink, CdbTrackAddition, ClassicPlaylistMutation,
         },
         sqlite::inspect_sqlite_database,
     },
@@ -129,6 +131,20 @@ const SQLITE_FILES: [SqliteLibraryFile; 5] = [
     SqliteLibraryFile::Genius,
 ];
 
+fn valid_playlist_name(name: String) -> Result<String> {
+    if name.trim().is_empty() {
+        return Err(Error::InvalidPlaylistName {
+            reason: "the name must not be empty".to_owned(),
+        });
+    }
+    if name.encode_utf16().count() > 255 {
+        return Err(Error::InvalidPlaylistName {
+            reason: "the name must not exceed 255 UTF-16 code units".to_owned(),
+        });
+    }
+    Ok(name)
+}
+
 /// How a removal treats the media file on the device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaDeletionPolicy {
@@ -140,16 +156,29 @@ pub enum MediaDeletionPolicy {
     Delete,
 }
 
+#[derive(Clone, Debug)]
+enum PlaylistEdit {
+    Create {
+        name: String,
+        track_ids: Vec<PersistentId>,
+    },
+    Update {
+        name: Option<String>,
+        track_ids: Option<Vec<PersistentId>>,
+    },
+    Delete,
+}
+
 /// An in-memory set of requested library changes.
 ///
-/// Sessions never modify the opened mount. The current preview staging method
-/// writes only to a separate, empty host directory and does not create a
-/// committable device update yet.
+/// Sessions never modify the opened mount. Staging writes only to a separate,
+/// empty host directory; installation remains an explicit operation.
 #[derive(Debug)]
 pub struct EditSession<'device> {
     device: &'device Device,
     removals: BTreeSet<PersistentId>,
     additions: Vec<TrackToAdd>,
+    playlist_edits: BTreeMap<PersistentId, PlaylistEdit>,
     media_policy: MediaDeletionPolicy,
 }
 
@@ -195,6 +224,7 @@ impl<'device> EditSession<'device> {
             device,
             removals: BTreeSet::new(),
             additions: Vec::new(),
+            playlist_edits: BTreeMap::new(),
             media_policy: MediaDeletionPolicy::KeepOrphan,
         })
     }
@@ -235,6 +265,185 @@ impl<'device> EditSession<'device> {
     #[must_use]
     pub fn removal_count(&self) -> usize {
         self.removals.len()
+    }
+
+    /// Queues creation of a standard playlist and returns its persistent ID.
+    ///
+    /// Membership is ordered and may contain the same track more than once.
+    /// Smart playlists and folders are not created by this API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is invalid, a track is absent, or the
+    /// opened library is unavailable.
+    pub fn create_playlist(
+        &mut self,
+        name: impl Into<String>,
+        track_ids: &[PersistentId],
+    ) -> Result<PersistentId> {
+        let name = valid_playlist_name(name.into())?;
+        self.validate_playlist_tracks(track_ids)?;
+        let library = self.device.library().ok_or_else(|| Error::Unsupported {
+            feature: "playlist mutation",
+            reason: "the music library is unavailable".to_owned(),
+        })?;
+        let id = loop {
+            let candidate = PersistentId::from_bits(crate::random::next_u64());
+            let exists = library
+                .playlists()
+                .iter()
+                .any(|playlist| playlist.id == candidate)
+                || library.tracks().iter().any(|track| track.id == candidate)
+                || self.playlist_edits.contains_key(&candidate);
+            if !exists {
+                break candidate;
+            }
+        };
+        self.playlist_edits.insert(
+            id,
+            PlaylistEdit::Create {
+                name,
+                track_ids: track_ids.to_vec(),
+            },
+        );
+        Ok(id)
+    }
+
+    /// Queues a new name for an existing or newly queued standard playlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is invalid, the playlist is absent, or
+    /// the target is a master, hidden, or smart playlist.
+    pub fn rename_playlist(&mut self, id: PersistentId, name: impl Into<String>) -> Result<()> {
+        let name = valid_playlist_name(name.into())?;
+        if let Some(edit) = self.playlist_edits.get_mut(&id) {
+            match edit {
+                PlaylistEdit::Create {
+                    name: queued_name, ..
+                } => *queued_name = name,
+                PlaylistEdit::Update {
+                    name: queued_name, ..
+                } => *queued_name = Some(name),
+                PlaylistEdit::Delete => return Err(Error::PlaylistNotFound),
+            }
+            return Ok(());
+        }
+        self.require_editable_playlist(id)?;
+        self.playlist_edits.insert(
+            id,
+            PlaylistEdit::Update {
+                name: Some(name),
+                track_ids: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Replaces a standard playlist's ordered membership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a track or playlist is absent, or the target is a
+    /// master, hidden, or smart playlist.
+    pub fn set_playlist_tracks(
+        &mut self,
+        id: PersistentId,
+        track_ids: &[PersistentId],
+    ) -> Result<()> {
+        self.validate_playlist_tracks(track_ids)?;
+        if let Some(edit) = self.playlist_edits.get_mut(&id) {
+            match edit {
+                PlaylistEdit::Create {
+                    track_ids: queued, ..
+                } => *queued = track_ids.to_vec(),
+                PlaylistEdit::Update {
+                    track_ids: queued, ..
+                } => *queued = Some(track_ids.to_vec()),
+                PlaylistEdit::Delete => return Err(Error::PlaylistNotFound),
+            }
+            return Ok(());
+        }
+        self.require_editable_playlist(id)?;
+        self.playlist_edits.insert(
+            id,
+            PlaylistEdit::Update {
+                name: None,
+                track_ids: Some(track_ids.to_vec()),
+            },
+        );
+        Ok(())
+    }
+
+    /// Queues deletion of a standard playlist.
+    ///
+    /// Deleting a playlist does not delete any tracks or media files. If the
+    /// playlist was created in this session, creation is simply cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the playlist is absent or is a master, hidden, or
+    /// smart playlist.
+    pub fn delete_playlist(&mut self, id: PersistentId) -> Result<()> {
+        if matches!(
+            self.playlist_edits.get(&id),
+            Some(PlaylistEdit::Create { .. })
+        ) {
+            self.playlist_edits.remove(&id);
+            return Ok(());
+        }
+        if matches!(self.playlist_edits.get(&id), Some(PlaylistEdit::Delete)) {
+            return Ok(());
+        }
+        self.require_editable_playlist(id)?;
+        self.playlist_edits.insert(id, PlaylistEdit::Delete);
+        Ok(())
+    }
+
+    /// Returns the number of playlists with a queued mutation.
+    #[must_use]
+    pub fn playlist_edit_count(&self) -> usize {
+        self.playlist_edits.len()
+    }
+
+    fn require_editable_playlist(&self, id: PersistentId) -> Result<()> {
+        let playlist = self
+            .device
+            .library()
+            .and_then(|library| {
+                library
+                    .playlists()
+                    .iter()
+                    .find(|playlist| playlist.id == id)
+            })
+            .ok_or(Error::PlaylistNotFound)?;
+        if playlist.is_hidden {
+            return Err(Error::Unsupported {
+                feature: "playlist mutation",
+                reason: "master and hidden playlists cannot be edited".to_owned(),
+            });
+        }
+        if playlist.is_smart {
+            return Err(Error::Unsupported {
+                feature: "playlist mutation",
+                reason: "smart playlists cannot be edited yet".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_playlist_tracks(&self, track_ids: &[PersistentId]) -> Result<()> {
+        let library = self.device.library().ok_or_else(|| Error::Unsupported {
+            feature: "playlist mutation",
+            reason: "the music library is unavailable".to_owned(),
+        })?;
+        if track_ids
+            .iter()
+            .any(|id| !library.tracks().iter().any(|track| track.id == *id))
+        {
+            return Err(Error::TrackNotFound);
+        }
+        Ok(())
     }
 
     /// Queues a track for addition without changing any files.
@@ -293,10 +502,10 @@ impl<'device> EditSession<'device> {
     /// inside the opened mount, required schemas differ, a database operation
     /// fails, or output validation fails.
     pub fn stage_sqlite_preview(&self, destination: impl AsRef<Path>) -> Result<StagedSqliteEdit> {
-        if self.removals.is_empty() && self.additions.is_empty() {
+        if self.removals.is_empty() && self.additions.is_empty() && self.playlist_edits.is_empty() {
             return Err(Error::Unsupported {
                 feature: "empty edit preview",
-                reason: "queue at least one removal or addition before staging".to_owned(),
+                reason: "queue at least one track or playlist edit before staging".to_owned(),
             });
         }
         self.stage_preview(destination.as_ref())
@@ -368,6 +577,43 @@ impl<'device> EditSession<'device> {
                 &classic_addition(addition),
             )?;
         }
+        if !self.playlist_edits.is_empty() {
+            if self.playlist_edits.values().any(|edit| match edit {
+                PlaylistEdit::Create { track_ids, .. }
+                | PlaylistEdit::Update {
+                    track_ids: Some(track_ids),
+                    ..
+                } => track_ids.iter().any(|id| self.removals.contains(id)),
+                PlaylistEdit::Update {
+                    track_ids: None, ..
+                }
+                | PlaylistEdit::Delete => false,
+            }) {
+                return Err(Error::Unsupported {
+                    feature: "playlist mutation",
+                    reason: "a requested playlist membership contains a track queued for removal"
+                        .to_owned(),
+                });
+            }
+            let mutations = self
+                .playlist_edits
+                .iter()
+                .map(|(id, edit)| match edit {
+                    PlaylistEdit::Create { name, track_ids } => ClassicPlaylistMutation::Create {
+                        id: *id,
+                        name: name.clone(),
+                        track_ids: track_ids.clone(),
+                    },
+                    PlaylistEdit::Update { name, track_ids } => ClassicPlaylistMutation::Update {
+                        id: *id,
+                        name: name.clone(),
+                        track_ids: track_ids.clone(),
+                    },
+                    PlaylistEdit::Delete => ClassicPlaylistMutation::Delete { id: *id },
+                })
+                .collect::<Vec<_>>();
+            database = edit_classic_playlists(&database, checksum, guid.as_ref(), &mutations)?;
+        }
         // Classic artwork uses the same mhfd ArtworkDB and fixed-slot ithmb
         // files as the Nano 7G: removals drop records and reindex slots,
         // additions append records and frames. Nano 1G/2G artwork writing is
@@ -386,7 +632,13 @@ impl<'device> EditSession<'device> {
         let staged_bytes = fs::read(&output)
             .map_err(|source| io_error("read staged iTunesDB", &output, source))?;
         let after = Library::read_binary(&staged_bytes, None)?;
-        validate_semantics(before, &after, &self.removals, &resolved)?;
+        validate_semantics(
+            before,
+            &after,
+            &self.removals,
+            &resolved,
+            &self.playlist_edits,
+        )?;
         if checksum == ChecksumKind::Hash58 {
             let guid = guid.ok_or_else(|| Error::Unsupported {
                 feature: "HASH58 staging",
@@ -486,6 +738,9 @@ impl<'device> EditSession<'device> {
         if !resolved.is_empty() {
             add_tracks_to_staged_databases(&destination, &resolved)?;
         }
+        if !self.playlist_edits.is_empty() {
+            edit_staged_playlists(&destination, &self.playlist_edits)?;
+        }
 
         let guid = self
             .device
@@ -523,7 +778,13 @@ impl<'device> EditSession<'device> {
             &destination.join(SqliteLibraryFile::Library.file_name()),
             &destination.join(SqliteLibraryFile::Locations.file_name()),
         )?;
-        validate_semantics(before, &after, &self.removals, &resolved)?;
+        validate_semantics(
+            before,
+            &after,
+            &self.removals,
+            &resolved,
+            &self.playlist_edits,
+        )?;
         self.device
             .generation()
             .verify_unchanged(self.device.mount(), self.device.profile())?;
@@ -1805,11 +2066,13 @@ fn validate_staged_set(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_semantics(
     before: &Library,
     after: &Library,
     removals: &BTreeSet<PersistentId>,
     additions: &[ResolvedAddition],
+    playlist_edits: &BTreeMap<PersistentId, PlaylistEdit>,
 ) -> Result<()> {
     let expected_tracks = before
         .track_count()
@@ -1843,46 +2106,119 @@ fn validate_semantics(
             });
         }
     }
-    if before.playlists().len() != after.playlists().len() {
+    let deleted = playlist_edits
+        .values()
+        .filter(|edit| matches!(edit, PlaylistEdit::Delete))
+        .count();
+    let created = playlist_edits
+        .values()
+        .filter(|edit| matches!(edit, PlaylistEdit::Create { .. }))
+        .count();
+    let expected_playlist_count = before
+        .playlists()
+        .len()
+        .saturating_sub(deleted)
+        .saturating_add(created);
+    if after.playlists().len() != expected_playlist_count {
         return Err(Error::Verification {
-            format: "staged SQLite edit",
-            reason: "playlist containers were not preserved".to_owned(),
+            format: "staged library edit",
+            reason: "reparsed playlist count differs from the requested edit".to_owned(),
         });
     }
+
     let mut added_in_playlists = 0_usize;
-    for (old, new) in before.playlists().iter().zip(after.playlists()) {
-        let expected: Vec<_> = old
-            .track_ids()
+    let mut expected_ids = BTreeSet::new();
+    for old in before.playlists() {
+        let edit = playlist_edits.get(&old.id);
+        if matches!(edit, Some(PlaylistEdit::Delete)) {
+            continue;
+        }
+        expected_ids.insert(old.id);
+        let new = after
+            .playlists()
             .iter()
-            .copied()
-            .filter(|id| !removals.contains(id))
-            .collect();
-        if old.id != new.id
-            || old.name != new.name
+            .find(|playlist| playlist.id == old.id)
+            .ok_or_else(|| Error::Verification {
+                format: "staged library edit",
+                reason: "an expected playlist is missing".to_owned(),
+            })?;
+        let expected_name = match edit {
+            Some(PlaylistEdit::Update {
+                name: Some(name), ..
+            }) => name,
+            _ => &old.name,
+        };
+        if &new.name != expected_name
             || old.parent_id != new.parent_id
             || old.distinguished_kind != new.distinguished_kind
             || old.is_hidden != new.is_hidden
             || old.is_smart != new.is_smart
         {
             return Err(Error::Verification {
-                format: "staged SQLite edit",
-                reason: "playlist metadata was not preserved".to_owned(),
+                format: "staged library edit",
+                reason: "playlist metadata differs from the requested edit".to_owned(),
             });
         }
+        let expected = match edit {
+            Some(PlaylistEdit::Update {
+                track_ids: Some(track_ids),
+                ..
+            }) => track_ids.clone(),
+            _ => old
+                .track_ids()
+                .iter()
+                .copied()
+                .filter(|id| !removals.contains(id))
+                .collect(),
+        };
         let mut expected_with_additions = expected.clone();
         expected_with_additions.extend(additions.iter().map(|addition| addition.pid));
         if new.track_ids() == expected_with_additions {
             added_in_playlists += additions.len();
         } else if new.track_ids() != expected {
             return Err(Error::Verification {
-                format: "staged SQLite edit",
-                reason: "playlist membership was not preserved".to_owned(),
+                format: "staged library edit",
+                reason: "playlist membership differs from the requested edit".to_owned(),
             });
         }
     }
+    for (id, edit) in playlist_edits {
+        if let PlaylistEdit::Create { name, track_ids } = edit {
+            expected_ids.insert(*id);
+            let new = after
+                .playlists()
+                .iter()
+                .find(|playlist| playlist.id == *id)
+                .ok_or_else(|| Error::Verification {
+                    format: "staged library edit",
+                    reason: "a created playlist is missing".to_owned(),
+                })?;
+            if new.name != *name
+                || new.track_ids() != track_ids
+                || new.is_hidden
+                || new.is_smart
+                || new.parent_id.is_some()
+            {
+                return Err(Error::Verification {
+                    format: "staged library edit",
+                    reason: "a created playlist differs from the request".to_owned(),
+                });
+            }
+        }
+    }
+    if after
+        .playlists()
+        .iter()
+        .any(|playlist| !expected_ids.contains(&playlist.id))
+    {
+        return Err(Error::Verification {
+            format: "staged library edit",
+            reason: "the staged library contains an unexpected playlist".to_owned(),
+        });
+    }
     if added_in_playlists != additions.len() {
         return Err(Error::Verification {
-            format: "staged SQLite edit",
+            format: "staged library edit",
             reason: "added tracks were not joined to the master playlist".to_owned(),
         });
     }

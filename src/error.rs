@@ -67,6 +67,14 @@ pub enum Error {
     #[error("the requested track is not present in the opened iPod library")]
     TrackNotFound,
 
+    /// An edit referred to a playlist that is not in the opened library.
+    #[error("the requested playlist is not present in the opened iPod library")]
+    PlaylistNotFound,
+
+    /// A playlist name is empty or otherwise invalid.
+    #[error("invalid playlist name: {reason}")]
+    InvalidPlaylistName { reason: String },
+
     /// A host staging directory is unsafe or unsuitable.
     #[error("invalid staging directory `{path}`: {reason}")]
     InvalidStagingDirectory { path: PathBuf, reason: String },
