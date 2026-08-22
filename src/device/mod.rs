@@ -106,6 +106,38 @@ impl Device {
         &self.generation
     }
 
+    /// Returns IDs for tracks whose database location is absent or is not a
+    /// regular media file.
+    ///
+    /// This is a read-only consistency audit. Use
+    /// [`EditSession::remove_missing_tracks`] to queue removal of the dangling
+    /// database records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the library is unavailable or a media path cannot
+    /// be inspected safely beneath the mount root.
+    pub fn missing_media_track_ids(&self) -> Result<Vec<crate::PersistentId>> {
+        let library = self.library().ok_or_else(|| Error::Unsupported {
+            feature: "missing-media audit",
+            reason: "the music library is unavailable".to_owned(),
+        })?;
+        let mut missing = Vec::new();
+        for track in library.tracks() {
+            if !self.mount.contains(&track.location)? {
+                missing.push(track.id);
+                continue;
+            }
+            let path = self.mount.resolve_existing(&track.location)?;
+            let metadata = std::fs::metadata(&path)
+                .map_err(|source| crate::error::io_error("inspect track media", &path, source))?;
+            if !metadata.is_file() {
+                missing.push(track.id);
+            }
+        }
+        Ok(missing)
+    }
+
     /// Builds a byte-identical host bundle for exercising transaction safety.
     ///
     /// This method never modifies the device, and its output must not be

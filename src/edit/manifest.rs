@@ -137,21 +137,26 @@ pub(crate) fn write_staging_manifest(
         });
     }
     let mut outputs = Vec::new();
-    for (staged, target) in output_targets(destination, profile.capabilities().backend)? {
-        let path = destination.join(&staged);
-        let (bytes, digest) = fingerprint_host_file(&path)?;
-        outputs.push(ManifestOutputFile {
-            staged,
-            target: target.to_string(),
-            bytes,
-            sha256: hex(&digest),
-        });
-    }
+    // Install new media before publishing a database that references it. A
+    // power loss can then leave only harmless orphan media, never a dangling
+    // database location.
     for target in added_targets {
         let path = destination.join(target.as_str());
         let (bytes, digest) = fingerprint_host_file(&path)?;
         outputs.push(ManifestOutputFile {
             staged: target.to_string(),
+            target: target.to_string(),
+            bytes,
+            sha256: hex(&digest),
+        });
+    }
+    let mut database_targets = output_targets(destination, profile.capabilities().backend)?;
+    database_targets.sort_by_key(|(_, target)| installation_priority(target));
+    for (staged, target) in database_targets {
+        let path = destination.join(&staged);
+        let (bytes, digest) = fingerprint_host_file(&path)?;
+        outputs.push(ManifestOutputFile {
+            staged,
             target: target.to_string(),
             bytes,
             sha256: hex(&digest),
@@ -218,6 +223,23 @@ pub(crate) fn read_staging_manifest(path: &Path) -> Result<StagingManifest> {
         });
     }
     Ok(manifest)
+}
+
+fn installation_priority(target: &IpodPath) -> u8 {
+    match target.as_str() {
+        // Payloads go first.
+        path if path.starts_with("iPod_Control/Music/")
+            || path.starts_with("iPod_Control/Artwork/F") =>
+        {
+            0
+        }
+        // Publish the authoritative music library only after every referenced
+        // payload and companion database.
+        "iPod_Control/iTunes/iTunesDB" | "iPod_Control/iTunes/iTunes Library.itlp/Library.itdb" => {
+            2
+        }
+        _ => 1,
+    }
 }
 
 fn output_targets(

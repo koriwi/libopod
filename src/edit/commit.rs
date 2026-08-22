@@ -361,9 +361,11 @@ fn install_inner(
         #[cfg(not(test))]
         let _ = deletion_index;
         let relative = IpodPath::new(deletion.target.clone())?;
-        let target = device.mount().resolve_existing(&relative)?;
-        fs::remove_file(&target)
-            .map_err(|source| io_error("delete removed media", &target, source))?;
+        let target = device.mount().resolve_possible(&relative)?;
+        // Another recovery tool or the firmware may already have removed a
+        // dangling file. Deletion is idempotent; the required final state is
+        // simply absence.
+        remove_if_present(&target, "delete removed media")?;
         #[cfg(test)]
         if failure_mode == FailureMode::SimulateInterruptionDuringDeletionAfter(deletion_index) {
             return Err(Error::Verification {
@@ -439,7 +441,35 @@ pub(crate) fn recover_transaction(mount: &MountRoot) -> Result<()> {
     }
     let journal = read_journal(&transaction)?;
     validate_recovery_state(mount, &transaction, &journal)?;
+    // Only trust target-derived temporary names after the journal and live
+    // interrupted state have passed validation.
+    cleanup_interrupted_temporaries(mount, &transaction, &journal)?;
     if journal.phase != TransactionPhase::Committed {
+        // Free newly installed media first. This gives database restoration
+        // room even when the interrupted addition exhausted the volume.
+        for (index, output) in journal.staging.outputs.iter().enumerate().rev() {
+            if index >= journal.installed {
+                continue;
+            }
+            let source = original_state(&journal.staging, output)?;
+            if matches!((source.bytes, source.sha256.as_deref()), (None, None)) {
+                let relative = IpodPath::new(output.target.clone())?;
+                let target = mount.resolve_possible(&relative)?;
+                if target.exists() {
+                    verify_file(
+                        &target,
+                        output.bytes,
+                        &output.sha256,
+                        "installed new output",
+                    )?;
+                    remove_if_present(&target, "remove rolled-back new output")?;
+                    sync_directory(target.parent().unwrap_or(mount.as_path()))?;
+                }
+                verify_absent(&target, "rolled-back new output")?;
+            }
+        }
+        // Once new payloads are gone, restore every replaced database/artwork
+        // file from its verified transaction backup.
         for (index, output) in journal.staging.outputs.iter().enumerate().rev() {
             if index >= journal.installed {
                 continue;
@@ -452,23 +482,7 @@ pub(crate) fn recover_transaction(mount: &MountRoot) -> Result<()> {
                     install_file(&backup, &target, index)?;
                     verify_file(&target, bytes, digest, "rolled-back output")?;
                 }
-                (None, None) => {
-                    let relative = IpodPath::new(output.target.clone())?;
-                    let target = mount.resolve_possible(&relative)?;
-                    if target.exists() {
-                        verify_file(
-                            &target,
-                            output.bytes,
-                            &output.sha256,
-                            "installed new output",
-                        )?;
-                        fs::remove_file(&target).map_err(|source| {
-                            io_error("remove rolled-back new output", &target, source)
-                        })?;
-                        sync_directory(target.parent().unwrap_or(mount.as_path()))?;
-                    }
-                    verify_absent(&target, "rolled-back new output")?;
-                }
+                (None, None) => {}
                 _ => {
                     return Err(Error::Verification {
                         format: "device transaction",
@@ -504,6 +518,43 @@ pub(crate) fn recover_transaction(mount: &MountRoot) -> Result<()> {
     remove_transaction_directory(&transaction)
 }
 
+fn cleanup_interrupted_temporaries(
+    mount: &MountRoot,
+    transaction: &Path,
+    journal: &TransactionJournal,
+) -> Result<()> {
+    let mut parents = std::collections::BTreeSet::new();
+    for (index, output) in journal.staging.outputs.iter().enumerate() {
+        let relative = IpodPath::new(output.target.clone())?;
+        let target = mount.resolve_possible(&relative)?;
+        let parent = target.parent().ok_or_else(|| Error::Verification {
+            format: "device transaction",
+            reason: "installation target has no parent".to_owned(),
+        })?;
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::Verification {
+                format: "device transaction",
+                reason: "installation target name is not UTF-8".to_owned(),
+            })?;
+        let temporary = parent.join(format!(".{name}.libopod-{index}.tmp"));
+        if temporary.exists() {
+            remove_if_present(&temporary, "remove interrupted sibling installation file")?;
+            parents.insert(parent.to_path_buf());
+        }
+    }
+    let journal_temporary = transaction.join("journal.tmp");
+    if journal_temporary.exists() {
+        remove_if_present(&journal_temporary, "remove interrupted journal temporary")?;
+        parents.insert(transaction.to_path_buf());
+    }
+    for parent in parents {
+        sync_directory(&parent)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn pending_transaction(mount: &MountRoot) -> Result<Option<PathBuf>> {
     let relative = IpodPath::new(TRANSACTION_PATH)?;
     if mount.contains(&relative)? {
@@ -525,7 +576,7 @@ fn validate_recovery_state(
             reason: "journal installation count is invalid".to_owned(),
         });
     }
-    let expected_targets = [
+    let sqlite_targets = [
         "iPod_Control/iTunes/iTunes Library.itlp/Library.itdb",
         "iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb",
         "iPod_Control/iTunes/iTunes Library.itlp/Dynamic.itdb",
@@ -534,12 +585,23 @@ fn validate_recovery_state(
         "iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb.cbk",
         "iPod_Control/iTunes/iTunesCDB",
     ];
+    let classic_targets = ["iPod_Control/iTunes/iTunesDB"];
+    let expected_targets: &[&str] = match journal.staging.profile.as_str() {
+        "nano-7g" => &sqlite_targets,
+        "nano-1g" | "nano-2g" | "nano-3g" | "nano-4g" => &classic_targets,
+        _ => {
+            return Err(Error::Verification {
+                format: "device transaction",
+                reason: "journal device profile is not supported for recovery".to_owned(),
+            });
+        }
+    };
     for expected in expected_targets {
         if journal
             .staging
             .outputs
             .iter()
-            .filter(|output| output.target == expected)
+            .filter(|output| output.target == *expected)
             .count()
             != 1
         {
@@ -774,15 +836,22 @@ fn require_transaction_space(mount: &MountRoot, manifest: &StagingManifest) -> R
                 reason: "required backup space overflowed u64".to_owned(),
             })
     })?;
-    let temporary_bytes = manifest
-        .outputs
-        .iter()
-        .map(|output| output.bytes)
-        .max()
-        .unwrap_or(0);
-    // Fast deletions need no on-device backup space: unlink frees it.
+    // Every new media output remains on the volume, and replacement outputs
+    // temporarily coexist with their live originals. Counting all outputs is
+    // conservative, but prevents a many-track sync from passing preflight by
+    // accounting for only its single largest file.
+    let output_bytes = manifest.outputs.iter().try_fold(0_u64, |total, output| {
+        total
+            .checked_add(output.bytes)
+            .ok_or_else(|| Error::Verification {
+                format: "device transaction",
+                reason: "required output space overflowed u64".to_owned(),
+            })
+    })?;
+    // Fast deletions happen only after database installation, so their future
+    // space cannot safely offset the installation requirement.
     let required = backup_bytes
-        .checked_add(temporary_bytes)
+        .checked_add(output_bytes)
         .and_then(|bytes| bytes.checked_add(4 * 1024 * 1024))
         .ok_or_else(|| Error::Verification {
             format: "device transaction",
@@ -841,22 +910,40 @@ fn install_file(source: &Path, target: &Path, sequence: usize) -> Result<()> {
             reason: "installation target name is not UTF-8".to_owned(),
         })?;
     let temporary = parent.join(format!(".{name}.libopod-{sequence}.tmp"));
-    let _ = fs::remove_file(&temporary);
-    let mut input = File::open(source)
-        .map_err(|error| io_error("open staged installation source", source, error))?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| io_error("create sibling installation file", &temporary, error))?;
-    std::io::copy(&mut input, &mut output)
-        .map_err(|error| io_error("copy sibling installation file", &temporary, error))?;
-    output
-        .sync_all()
-        .map_err(|error| io_error("flush sibling installation file", &temporary, error))?;
-    fs::rename(&temporary, target)
-        .map_err(|error| io_error("replace live database file", target, error))?;
-    sync_directory(parent)
+    remove_if_present(&temporary, "remove stale sibling installation file")?;
+    let result = (|| {
+        let mut input = File::open(source)
+            .map_err(|error| io_error("open staged installation source", source, error))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| io_error("create sibling installation file", &temporary, error))?;
+        std::io::copy(&mut input, &mut output)
+            .map_err(|error| io_error("copy sibling installation file", &temporary, error))?;
+        output
+            .sync_all()
+            .map_err(|error| io_error("flush sibling installation file", &temporary, error))?;
+        drop(output);
+        fs::rename(&temporary, target)
+            .map_err(|error| io_error("replace live database file", target, error))?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        // In particular, ENOSPC must not leave a large hidden sibling that
+        // prevents the rollback database from being restored.
+        remove_if_present(&temporary, "remove failed sibling installation file")?;
+        sync_directory(parent)?;
+    }
+    result
+}
+
+fn remove_if_present(path: &Path, operation: &'static str) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error(operation, path, source)),
+    }
 }
 
 fn verify_file(path: &Path, bytes: u64, digest: &str, format: &'static str) -> Result<()> {

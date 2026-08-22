@@ -150,9 +150,9 @@ fn valid_playlist_name(name: String) -> Result<String> {
 pub enum MediaDeletionPolicy {
     /// Leave the media file on the device as an unreferenced orphan.
     KeepOrphan,
-    /// Delete the media file as part of the removal transaction. The file is
-    /// backed up during the transaction and restored on rollback, so an
-    /// interrupted or failed commit never loses the file.
+    /// Delete the media file as part of the removal transaction when it is
+    /// present. An already-missing file is accepted so a dangling database
+    /// record can be repaired.
     Delete,
 }
 
@@ -265,6 +265,23 @@ impl<'device> EditSession<'device> {
     #[must_use]
     pub fn removal_count(&self) -> usize {
         self.removals.len()
+    }
+
+    /// Queues removal of every database track whose media file is missing.
+    ///
+    /// This repairs dangling database references left by an interrupted copy.
+    /// It does not remove any media file that is still present. The returned
+    /// count is the number of newly queued removals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the library is unavailable or a media path cannot
+    /// be inspected safely beneath the mount root.
+    pub fn remove_missing_tracks(&mut self) -> Result<usize> {
+        let missing = self.device.missing_media_track_ids()?;
+        let before = self.removals.len();
+        self.removals.extend(missing);
+        Ok(self.removals.len().saturating_sub(before))
     }
 
     /// Queues creation of a standard playlist and returns its persistent ID.
@@ -678,12 +695,13 @@ impl<'device> EditSession<'device> {
             let mut deletions = Vec::new();
             for track in &removed_tracks {
                 let relative = track.location.clone();
-                // Fast deletion: record only the path; the install unlinks the file
-                // immediately and retains no byte backup for rollback.
-                self.device.mount().resolve_existing(&relative)?;
-                deletions.push(ManifestDeletionFile {
-                    target: relative.to_string(),
-                });
+                // A missing target is already in the requested final state.
+                // Omit it so staging can repair the dangling database record.
+                if self.device.mount().contains(&relative)? {
+                    deletions.push(ManifestDeletionFile {
+                        target: relative.to_string(),
+                    });
+                }
             }
             deletions
         } else {
@@ -811,12 +829,13 @@ impl<'device> EditSession<'device> {
             let mut deletions = Vec::new();
             for track in &removed_tracks {
                 let relative = track.location.clone();
-                // Fast deletion: record only the path; the install unlinks the file
-                // immediately and retains no byte backup for rollback.
-                self.device.mount().resolve_existing(&relative)?;
-                deletions.push(ManifestDeletionFile {
-                    target: relative.to_string(),
-                });
+                // A missing target is already in the requested final state.
+                // Omit it so staging can repair the dangling database record.
+                if self.device.mount().contains(&relative)? {
+                    deletions.push(ManifestDeletionFile {
+                        target: relative.to_string(),
+                    });
+                }
             }
             deletions
         } else {

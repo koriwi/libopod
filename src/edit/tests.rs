@@ -379,6 +379,20 @@ mod tests {
         assert_eq!(staged.remaining_tracks(), 727);
         assert_eq!(staged.added_media().len(), 1);
         assert!(staged.added_media()[0].as_str().starts_with("iPod_Control/Music/"));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
+        let targets: Vec<&str> = manifest["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|output| output["target"].as_str().unwrap())
+            .collect();
+        assert_eq!(targets[0], staged.added_media()[0].as_str());
+        assert_eq!(
+            targets.last().copied(),
+            Some("iPod_Control/iTunes/iTunes Library.itlp/Library.itdb"),
+            "the authoritative library must be published after its media"
+        );
         // Regression: the new track's CDB title and location strings must
         // round-trip through the exact MHOD string layout (8-byte header gap).
         let cdb = std::fs::read(bundle.path().join("iTunesCDB")).unwrap();
@@ -425,9 +439,19 @@ mod tests {
             Device::open(&virtual_root),
             Err(Error::RecoveryRequired { .. })
         ));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
+        let first_target = manifest["outputs"][0]["target"].as_str().unwrap();
+        let first_target = virtual_root.join(first_target);
+        let stale_temporary = first_target.parent().unwrap().join(format!(
+            ".{}.libopod-0.tmp",
+            first_target.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::write(&stale_temporary, vec![0_u8; 1024 * 1024]).unwrap();
 
         let mount = MountRoot::open(&virtual_root).unwrap();
         recover_transaction(&mount).unwrap();
+        assert!(!stale_temporary.exists());
         let media_target = virtual_root.join(staged.added_media()[0].as_str());
         assert!(!media_target.exists());
         let reopened = Device::open(&virtual_root).unwrap();
@@ -1413,6 +1437,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn classic_removal_and_addition_round_trip_on_the_attached_nano3() {
         let Some(device_dir) = build_classic_device_from_attachments() else {
             return;
@@ -1420,15 +1445,29 @@ mod tests {
         let device = Device::open(device_dir.path()).unwrap();
         assert_eq!(device.profile().map(crate::DeviceProfile::key), Some("nano-3g"));
         assert_eq!(device.library().unwrap().track_count(), 724);
+        assert_eq!(
+            device.missing_media_track_ids().unwrap().len(),
+            724,
+            "the database-only attachment intentionally has no Music tree"
+        );
+        let mut repair = device.edit().unwrap();
+        assert_eq!(repair.remove_missing_tracks().unwrap(), 724);
+        assert_eq!(repair.removal_count(), 724);
 
-        // Removal staging produces only the iTunesDB output.
+        // A dangling media location can be removed even with Delete policy:
+        // the absent file is already in the requested final state.
         let track = device.library().unwrap().tracks()[0].clone();
         let mut edit = device.edit().unwrap();
+        edit.set_media_policy(MediaDeletionPolicy::Delete);
         edit.remove_track(track.id).unwrap();
         let bundle = tempdir().unwrap();
         let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
         assert_eq!(staged.removed_tracks(), 1);
         assert_eq!(staged.remaining_tracks(), 723);
+        assert!(
+            staged.deletions().is_empty(),
+            "missing media must not become an install-time deletion"
+        );
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
         // The removed first track carries artwork, so the bundle also stages
@@ -1501,6 +1540,26 @@ mod tests {
         assert_eq!(staged.remaining_tracks(), 725);
         let virtual_root = bundle.path().join("original");
         create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(1),
+        )
+        .unwrap_err();
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        assert_eq!(
+            Device::open(&virtual_root)
+                .unwrap()
+                .library()
+                .unwrap()
+                .track_count(),
+            724,
+            "classic recovery must restore the original iTunesDB"
+        );
+        assert!(!virtual_root.join(staged.added_media()[0].as_str()).exists());
+
         let virtual_device = Device::open(&virtual_root).unwrap();
         staged.install(&virtual_device).unwrap();
         let reopened = Device::open(&virtual_root).unwrap();
