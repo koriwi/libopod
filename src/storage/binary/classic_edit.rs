@@ -269,7 +269,8 @@ fn rewrite_playlist_crud_dataset(
     let body = checked_end(list, list_header, dataset.len(), list + 4)?;
     let mut output = dataset[..body].to_vec();
     let mut found = BTreeSet::new();
-    let mut template = None;
+    let mut standard_template = None;
+    let mut master_template = None;
     let mut retained = 0_usize;
     let mut offset = body;
     for _ in 0..count {
@@ -277,8 +278,12 @@ fn rewrite_playlist_crud_dataset(
         let playlist = &dataset[offset..header.end];
         let id = playlist_id(playlist)?;
         let mutation = mutations.iter().find(|mutation| mutation.id() == id);
-        if playlist[0x14] == 0 && !playlist_is_smart(playlist)? {
-            template.get_or_insert_with(|| playlist.to_vec());
+        if !playlist_is_smart(playlist)? {
+            if playlist[0x14] == 0 {
+                standard_template.get_or_insert_with(|| playlist.to_vec());
+            } else if playlist[0x14] == 1 {
+                master_template.get_or_insert_with(|| playlist.to_vec());
+            }
         }
         match mutation {
             Some(ClassicPlaylistMutation::Delete { .. }) => {
@@ -323,11 +328,14 @@ fn rewrite_playlist_crud_dataset(
                 track_ids: members,
             } => {
                 output.extend_from_slice(&build_standard_playlist(
-                    template.as_deref().ok_or_else(|| {
-                        verification(
-                            "cannot create a playlist without a standard playlist template",
-                        )
-                    })?,
+                    standard_template
+                        .as_deref()
+                        .or(master_template.as_deref())
+                        .ok_or_else(|| {
+                            verification(
+                                "cannot create a playlist without a usable playlist template",
+                            )
+                        })?,
                     *id,
                     name,
                     &resolve_track_ids(members, track_ids),
@@ -473,8 +481,10 @@ fn build_standard_playlist(
     name: &str,
     members: &[u32],
 ) -> Result<Vec<u8>> {
-    require_editable_playlist(template)?;
     let header = chunk_header(template, 0, b"mhyp")?;
+    if header.header_length < 0x30 {
+        return Err(malformed(4, "playlist template header is too short"));
+    }
     let (mhods, _) = playlist_mhods(template)?;
     let long_mhod = mhods
         .iter()
@@ -491,6 +501,8 @@ fn build_standard_playlist(
     output[0x14..0x18].fill(0);
     write_u32(&mut output, 0x18, mac_timestamp())?;
     write_u64(&mut output, 0x1c, id.to_bits())?;
+    output[0x2a..0x2c].fill(0);
+    write_u32(&mut output, 0x2c, 1)?; // manual playlist sort order
     output.extend_from_slice(&build_string_mhod(1, name)?);
     output.extend_from_slice(long_mhod);
     for (position, track_id) in members.iter().copied().enumerate() {
@@ -607,5 +619,77 @@ fn finalize(
             feature: "classic iTunesDB edit",
             reason: format!("checksum scheme {other:?} is not a classic scheme"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn master_playlist_template() -> Vec<u8> {
+        let mut template = vec![0_u8; 108];
+        template[..4].copy_from_slice(b"mhyp");
+        write_u32(&mut template, 4, 108).unwrap();
+        write_u32(&mut template, 12, 2).unwrap();
+        template[0x14] = 1;
+        write_u64(&mut template, 0x1c, 0x1111).unwrap();
+        write_u32(&mut template, 0x2c, 5).unwrap();
+        template.extend_from_slice(&build_string_mhod(1, "iPod").unwrap());
+        let mut long_mhod = vec![0_u8; 24];
+        long_mhod[..4].copy_from_slice(b"mhod");
+        write_u32(&mut long_mhod, 4, 24).unwrap();
+        write_u32(&mut long_mhod, 8, 24).unwrap();
+        write_u32(&mut long_mhod, 12, 100).unwrap();
+        template.extend_from_slice(&long_mhod);
+        let total = u32::try_from(template.len()).unwrap();
+        write_u32(&mut template, 8, total).unwrap();
+        template
+    }
+
+    #[test]
+    fn creates_the_first_standard_playlist_from_a_master_only_dataset() {
+        let template = master_playlist_template();
+        let mut dataset = vec![0_u8; 16];
+        dataset[..4].copy_from_slice(b"mhsd");
+        write_u32(&mut dataset, 4, 16).unwrap();
+        write_u32(&mut dataset, 12, 2).unwrap();
+        dataset.extend_from_slice(b"mhlp");
+        dataset.extend_from_slice(&12_u32.to_le_bytes());
+        dataset.extend_from_slice(&1_u32.to_le_bytes());
+        dataset.extend_from_slice(&template);
+        let total = u32::try_from(dataset.len()).unwrap();
+        write_u32(&mut dataset, 8, total).unwrap();
+
+        let id = PersistentId::from_bits(0x2222);
+        let rewritten = rewrite_playlist_crud_dataset(
+            &dataset,
+            &[ClassicPlaylistMutation::Create {
+                id,
+                name: "Fresh Playlist".to_owned(),
+                track_ids: Vec::new(),
+            }],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(read_u32(&rewritten, 16 + 8).unwrap(), 2);
+        let created_offset = 16 + 12 + template.len();
+        let created = &rewritten[created_offset..];
+        require_editable_playlist(created).unwrap();
+        assert_eq!(playlist_id(created).unwrap(), id);
+        assert_eq!(read_u32(created, 0x2c).unwrap(), 1);
+    }
+
+    #[test]
+    fn builds_a_standard_playlist_from_the_master_template() {
+        let id = PersistentId::from_bits(0x2222);
+        let playlist =
+            build_standard_playlist(&master_playlist_template(), id, "Fresh Playlist", &[7, 3])
+                .unwrap();
+        require_editable_playlist(&playlist).unwrap();
+        assert_eq!(playlist_id(&playlist).unwrap(), id);
+        assert_eq!(read_u32(&playlist, 12).unwrap(), 2);
+        assert_eq!(read_u32(&playlist, 16).unwrap(), 2);
+        assert_eq!(read_u32(&playlist, 0x2c).unwrap(), 1);
+        assert_eq!(playlist_mhods(&playlist).unwrap().0.len(), 2);
     }
 }
