@@ -11,7 +11,7 @@ mod tests {
             install_staged_removal, recover_transaction, FailureMode, ADDITION_CONFIRMATION,
             ARTWORK_REMOVAL_CONFIRMATION, TRANSACTION_PATH,
         },
-        edit_staged_databases, referenced_artwork_files, TrackToAdd,
+        choose_artwork_format_ids, edit_staged_databases, referenced_artwork_files, TrackToAdd,
     };
     use crate::{
         artwork::parse_artwork_records, ArtworkFormatProfile, ArtworkFormatRef, ArtworkRecord,
@@ -20,6 +20,21 @@ mod tests {
         NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
     };
     use std::io::Read as _;
+
+    #[test]
+    fn artwork_addition_matches_the_database_format_subset() {
+        let available = BTreeSet::from([1055, 1068, 1071, 1074, 1078, 1084]);
+        let referenced = BTreeSet::from([1055, 1071, 1074, 1078, 1084]);
+        let existing = referenced.clone();
+        assert_eq!(
+            choose_artwork_format_ids(&referenced, &existing, &available),
+            referenced
+        );
+        assert_eq!(
+            choose_artwork_format_ids(&BTreeSet::new(), &BTreeSet::new(), &available),
+            available
+        );
+    }
 
     #[test]
     fn artwork_reindex_uses_only_files_referenced_by_the_database() {

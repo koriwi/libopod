@@ -868,6 +868,7 @@ impl<'device> EditSession<'device> {
 
     /// Allocates media paths, stages copies of each source file, and assigns
     /// persistent IDs and timestamps for every queued addition.
+    #[allow(clippy::too_many_lines)]
     fn resolve_additions(&self, destination: &Path) -> Result<Vec<ResolvedAddition>> {
         if self.additions.is_empty() {
             return Ok(Vec::new());
@@ -878,10 +879,7 @@ impl<'device> EditSession<'device> {
         })?;
         let classic = profile.capabilities().backend == BackendKind::Binary;
         if classic
-            && self
-                .device
-                .profile()
-                .is_some_and(|profile| profile.capabilities().artwork_formats.is_empty())
+            && profile.capabilities().artwork_formats.is_empty()
             && self
                 .additions
                 .iter()
@@ -904,6 +902,12 @@ impl<'device> EditSession<'device> {
         let date_mac = u32::try_from(now.saturating_add(2_082_844_800)).unwrap_or(u32::MAX);
         let mut resolved = Vec::with_capacity(self.additions.len());
         let mut running_sizes = std::collections::HashMap::new();
+        let active_artwork_formats = addition_artwork_format_ids(
+            self.device,
+            &profile.capabilities().artwork_formats,
+            &self.removals,
+            &self.additions,
+        )?;
         // Only additions that carry artwork need the ArtworkDB image-id base;
         // profiles without a qualified artwork writer need no ArtworkDB read.
         let mut next_image_id = if self
@@ -936,6 +940,7 @@ impl<'device> EditSession<'device> {
                     &mut next_image_id,
                     classic,
                     profile.key(),
+                    &active_artwork_formats,
                 )?
             } else {
                 None
@@ -1315,8 +1320,8 @@ fn base_image_id(device: &Device) -> Result<u32> {
         })
 }
 
-/// Decodes a source image, encodes the four Nano 7G cover formats, and
-/// allocates a fresh `.ithmb` slot after the running end of each format file.
+/// Decodes a source image into the device's active cover formats and allocates
+/// a fresh `.ithmb` slot after the running end of each active format file.
 fn resolve_new_artwork(
     device: &Device,
     track: &TrackToAdd,
@@ -1324,6 +1329,7 @@ fn resolve_new_artwork(
     next_image_id: &mut u32,
     classic: bool,
     profile_key: &str,
+    active_format_ids: &BTreeSet<u32>,
 ) -> Result<Option<ArtworkLink>> {
     let source = track.artwork_source.as_ref().expect("checked by caller");
     let source_bytes =
@@ -1339,14 +1345,29 @@ fn resolve_new_artwork(
     } else {
         crate::artwork::encode_new_frames(&source_bytes)?
     };
-    let mut out_frames = Vec::with_capacity(frames.len());
-    let mut refs = Vec::with_capacity(frames.len());
-    for frame in &frames {
+    let encoded_format_ids: BTreeSet<_> = frames.iter().map(|frame| frame.format_id).collect();
+    if !active_format_ids.is_subset(&encoded_format_ids) {
+        return Err(Error::Verification {
+            format: "artwork encoding",
+            reason: "the active device artwork formats do not match the selected encoder"
+                .to_owned(),
+        });
+    }
+    let mut out_frames = Vec::with_capacity(active_format_ids.len());
+    let mut refs = Vec::with_capacity(active_format_ids.len());
+    for frame in frames
+        .iter()
+        .filter(|frame| active_format_ids.contains(&frame.format_id))
+    {
         let relative = IpodPath::new(format!("iPod_Control/Artwork/{}", frame.filename))?;
-        let path = device.mount().resolve_existing(&relative)?;
-        let device_size = fs::metadata(&path)
-            .map_err(|error| io_error("inspect artwork frame file", &path, error))?
-            .len();
+        let device_size = if device.mount().contains(&relative)? {
+            let path = device.mount().resolve_existing(&relative)?;
+            fs::metadata(&path)
+                .map_err(|error| io_error("inspect artwork frame file", &path, error))?
+                .len()
+        } else {
+            0
+        };
         let slot_bytes = frame.slot_bytes();
         if device_size % slot_bytes != 0 {
             return Err(Error::Verification {
@@ -1386,6 +1407,79 @@ fn resolve_new_artwork(
         mhod_children,
         frames: out_frames,
     }))
+}
+
+fn addition_artwork_format_ids(
+    device: &Device,
+    formats: &[crate::ArtworkFormatProfile],
+    removals: &BTreeSet<PersistentId>,
+    additions: &[TrackToAdd],
+) -> Result<BTreeSet<u32>> {
+    if additions.iter().any(|track| track.artwork_source.is_some()) {
+        active_artwork_format_ids(device, formats, removals)
+    } else {
+        Ok(BTreeSet::new())
+    }
+}
+
+fn choose_artwork_format_ids(
+    referenced: &BTreeSet<u32>,
+    existing: &BTreeSet<u32>,
+    available: &BTreeSet<u32>,
+) -> BTreeSet<u32> {
+    if !referenced.is_empty() {
+        referenced.clone()
+    } else if !existing.is_empty() {
+        existing.clone()
+    } else {
+        available.clone()
+    }
+}
+
+fn active_artwork_format_ids(
+    device: &Device,
+    formats: &[crate::ArtworkFormatProfile],
+    removals: &BTreeSet<PersistentId>,
+) -> Result<BTreeSet<u32>> {
+    let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
+    let source = device.mount().resolve_existing(&relative)?;
+    let bytes = read_limited(&source, MAX_ARTWORK_BYTES, "ArtworkDB")?;
+    let records: Vec<_> = crate::artwork::parse_artwork_records(&bytes)?
+        .into_iter()
+        .filter(|record| !removals.contains(&record.track_id))
+        .collect();
+    let referenced_files = referenced_artwork_files(&records, formats)?;
+    let referenced: BTreeSet<_> = records
+        .iter()
+        .flat_map(|record| &record.formats)
+        .map(|reference| reference.format_id)
+        .collect();
+    for name in referenced_files.keys() {
+        let relative = IpodPath::new(format!("iPod_Control/Artwork/{name}"))?;
+        if !device.mount().contains(&relative)? {
+            return Err(Error::Verification {
+                format: "ArtworkDB",
+                reason: format!("{name} is referenced but missing from the device"),
+            });
+        }
+    }
+
+    let mut existing = BTreeSet::new();
+    for format in formats {
+        let relative = IpodPath::new(format!(
+            "iPod_Control/Artwork/F{}_1.ithmb",
+            format.format_id
+        ))?;
+        if device.mount().contains(&relative)? {
+            existing.insert(format.format_id);
+        }
+    }
+    let available = formats.iter().map(|format| format.format_id).collect();
+    Ok(choose_artwork_format_ids(
+        &referenced,
+        &existing,
+        &available,
+    ))
 }
 
 fn referenced_artwork_files(
@@ -2033,9 +2127,11 @@ fn write_artwork_frames(
         let base = if output.exists() {
             fs::read(&output)
                 .map_err(|error| io_error("read staged artwork frame", &output, error))?
-        } else {
+        } else if device.mount().contains(&relative)? {
             let path = device.mount().resolve_existing(&relative)?;
             fs::read(&path).map_err(|error| io_error("read artwork frame file", &path, error))?
+        } else {
+            Vec::new()
         };
         if u64::try_from(base.len()).unwrap_or(u64::MAX) != u64::from(frame.ithmb_offset) {
             return Err(Error::Verification {
