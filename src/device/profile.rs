@@ -251,10 +251,9 @@ fn classic_nano(
     }
 }
 
-/// The Nano 3G/4G cover formats, measured from a real Nano 3G: 55x55 with a
-/// 56-pixel stride (6160-byte slots), two 128x128 (32768), one 320x320
-/// (204800).
-fn classic_cover_formats() -> Vec<ArtworkFormatProfile> {
+/// Nano 3G cover formats measured from a real device: 55x55 with a 56-pixel
+/// stride (6160-byte slots), two 128x128 (32768), and one 320x320 (204800).
+fn nano_3g_cover_formats() -> Vec<ArtworkFormatProfile> {
     vec![
         ArtworkFormatProfile {
             format_id: 1061,
@@ -271,6 +270,37 @@ fn classic_cover_formats() -> Vec<ArtworkFormatProfile> {
         ArtworkFormatProfile {
             format_id: 1060,
             slot_bytes: 204_800,
+        },
+    ]
+}
+
+/// Nano 4G cover formats from Apple's on-device profile (also documented by
+/// libgpod): two 128x128, two 240x240, one 50x50, and one 80x80 RGB565 image.
+fn nano_4g_cover_formats() -> Vec<ArtworkFormatProfile> {
+    vec![
+        ArtworkFormatProfile {
+            format_id: 1055,
+            slot_bytes: 32_768,
+        },
+        ArtworkFormatProfile {
+            format_id: 1068,
+            slot_bytes: 32_768,
+        },
+        ArtworkFormatProfile {
+            format_id: 1071,
+            slot_bytes: 115_200,
+        },
+        ArtworkFormatProfile {
+            format_id: 1074,
+            slot_bytes: 5_000,
+        },
+        ArtworkFormatProfile {
+            format_id: 1078,
+            slot_bytes: 12_800,
+        },
+        ArtworkFormatProfile {
+            format_id: 1084,
+            slot_bytes: 115_200,
         },
     ]
 }
@@ -304,7 +334,7 @@ fn nano_3g() -> DeviceProfile {
         ChecksumKind::Hash58,
         0x30,
         20,
-        classic_cover_formats(),
+        nano_3g_cover_formats(),
     )
 }
 
@@ -315,7 +345,7 @@ fn nano_4g() -> DeviceProfile {
         ChecksumKind::Hash58,
         0x30,
         20,
-        classic_cover_formats(),
+        nano_4g_cover_formats(),
     )
 }
 
@@ -334,5 +364,27 @@ mod tests {
         for profile in [nano_3g(), nano_4g(), nano_7g()] {
             assert!(profile.capabilities().supports_artwork());
         }
+    }
+
+    #[test]
+    fn nano4_uses_its_six_native_cover_formats() {
+        let profile = nano_4g();
+        let formats = &profile.capabilities().artwork_formats;
+        let actual: Vec<_> = formats
+            .iter()
+            .map(|format| (format.format_id, format.slot_bytes))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (1055, 32_768),
+                (1068, 32_768),
+                (1071, 115_200),
+                (1074, 5_000),
+                (1078, 12_800),
+                (1084, 115_200),
+            ]
+        );
+        assert!(!formats.iter().any(|format| format.format_id == 1061));
     }
 }

@@ -872,10 +872,11 @@ impl<'device> EditSession<'device> {
         if self.additions.is_empty() {
             return Ok(Vec::new());
         }
-        let classic = self
-            .device
-            .profile()
-            .is_some_and(|profile| profile.capabilities().backend == BackendKind::Binary);
+        let profile = self.device.profile().ok_or_else(|| Error::Unsupported {
+            feature: "track addition",
+            reason: "the device profile is unknown".to_owned(),
+        })?;
+        let classic = profile.capabilities().backend == BackendKind::Binary;
         if classic
             && self
                 .device
@@ -934,6 +935,7 @@ impl<'device> EditSession<'device> {
                     &mut running_sizes,
                     &mut next_image_id,
                     classic,
+                    profile.key(),
                 )?
             } else {
                 None
@@ -1321,6 +1323,7 @@ fn resolve_new_artwork(
     running_sizes: &mut std::collections::HashMap<String, u64>,
     next_image_id: &mut u32,
     classic: bool,
+    profile_key: &str,
 ) -> Result<Option<ArtworkLink>> {
     let source = track.artwork_source.as_ref().expect("checked by caller");
     let source_bytes =
@@ -1332,7 +1335,7 @@ fn resolve_new_artwork(
         });
     }
     let frames = if classic {
-        crate::artwork::encode_classic_frames(&source_bytes)?
+        crate::artwork::encode_classic_frames(&source_bytes, profile_key)?
     } else {
         crate::artwork::encode_new_frames(&source_bytes)?
     };
@@ -1385,8 +1388,47 @@ fn resolve_new_artwork(
     }))
 }
 
-/// The `.ithmb` files a removal rewrites: every profile format when at least
-/// one removed track carries artwork, otherwise none.
+fn referenced_artwork_files(
+    records: &[crate::ArtworkRecord],
+    formats: &[crate::ArtworkFormatProfile],
+) -> Result<BTreeMap<String, u32>> {
+    let mut files = BTreeMap::new();
+    for reference in records.iter().flat_map(|record| &record.formats) {
+        let profile = formats
+            .iter()
+            .find(|format| format.format_id == reference.format_id)
+            .ok_or_else(|| Error::Verification {
+                format: "ArtworkDB",
+                reason: format!(
+                    "format {} is not supported by the device profile",
+                    reference.format_id
+                ),
+            })?;
+        let name = reference.filename.trim_start_matches(':').to_owned();
+        let expected = format!("F{}_1.ithmb", reference.format_id);
+        if name != expected {
+            return Err(Error::Verification {
+                format: "ArtworkDB",
+                reason: format!(
+                    "format {} references unexpected file {name}",
+                    reference.format_id
+                ),
+            });
+        }
+        if let Some(previous) = files.insert(name, profile.slot_bytes) {
+            if previous != profile.slot_bytes {
+                return Err(Error::Verification {
+                    format: "ArtworkDB",
+                    reason: "one ithmb file has conflicting slot sizes".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// The `.ithmb` files a removal rewrites: every file referenced by `ArtworkDB`
+/// when at least one removed track carries artwork, otherwise none.
 fn removed_ithmb_targets(
     device: &Device,
     removals: &BTreeSet<PersistentId>,
@@ -1407,16 +1449,13 @@ fn removed_ithmb_targets(
         feature: "artwork reindex",
         reason: "the device profile is unknown".to_owned(),
     })?;
-    profile
-        .capabilities()
-        .artwork_formats
-        .iter()
-        .map(|format| {
-            IpodPath::new(format!(
-                "iPod_Control/Artwork/F{}_1.ithmb",
-                format.format_id
-            ))
-        })
+    let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
+    let source = device.mount().resolve_existing(&relative)?;
+    let bytes = read_limited(&source, MAX_ARTWORK_BYTES, "ArtworkDB")?;
+    let records = crate::artwork::parse_artwork_records(&bytes)?;
+    referenced_artwork_files(&records, &profile.capabilities().artwork_formats)?
+        .into_keys()
+        .map(|name| IpodPath::new(format!("iPod_Control/Artwork/{name}")))
         .collect()
 }
 
@@ -1850,16 +1889,14 @@ fn write_artwork_preview(
         feature: "artwork reindex",
         reason: "the device profile is unknown".to_owned(),
     })?;
+    let slot_bytes = referenced_artwork_files(&records, &profile.capabilities().artwork_formats)?;
     let mut files = std::collections::BTreeMap::new();
-    let mut slot_bytes = std::collections::BTreeMap::new();
-    for format in &profile.capabilities().artwork_formats {
-        let name = format!("F{}_1.ithmb", format.format_id);
+    for name in slot_bytes.keys() {
         let file_relative = IpodPath::new(format!("iPod_Control/Artwork/{name}"))?;
         let file_path = device.mount().resolve_existing(&file_relative)?;
         let file_bytes = fs::read(&file_path)
             .map_err(|source| io_error("read on-device ithmb file", &file_path, source))?;
         files.insert(name.clone(), file_bytes);
-        slot_bytes.insert(name, format.slot_bytes);
     }
     let (rewritten, new_files) =
         crate::artwork::reindex_artwork_removals(&bytes, &requested, &files, &slot_bytes)?;

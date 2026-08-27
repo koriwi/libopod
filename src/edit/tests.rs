@@ -11,14 +11,46 @@ mod tests {
             install_staged_removal, recover_transaction, FailureMode, ADDITION_CONFIRMATION,
             ARTWORK_REMOVAL_CONFIRMATION, TRANSACTION_PATH,
         },
-        edit_staged_databases, TrackToAdd,
+        edit_staged_databases, referenced_artwork_files, TrackToAdd,
     };
     use crate::{
-        artwork::parse_artwork_records, Device, Error, Library, MediaDeletionPolicy, MountRoot,
-        PersistentId, SqliteLibraryFile, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+        artwork::parse_artwork_records, ArtworkFormatProfile, ArtworkFormatRef, ArtworkRecord,
+        Device, Error, Library, MediaDeletionPolicy, MountRoot, PersistentId, SqliteLibraryFile,
+        NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
         NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
     };
     use std::io::Read as _;
+
+    #[test]
+    fn artwork_reindex_uses_only_files_referenced_by_the_database() {
+        let records = vec![ArtworkRecord {
+            image_id: 100,
+            track_id: PersistentId::from_bits(1),
+            src_img_size: 123,
+            formats: vec![ArtworkFormatRef {
+                format_id: 1074,
+                ithmb_offset: 0,
+                image_size: 5_000,
+                width: 50,
+                height: 50,
+                filename: ":F1074_1.ithmb".to_owned(),
+            }],
+        }];
+        let profile = vec![
+            ArtworkFormatProfile {
+                format_id: 1061,
+                slot_bytes: 6_160,
+            },
+            ArtworkFormatProfile {
+                format_id: 1074,
+                slot_bytes: 5_000,
+            },
+        ];
+        let files = referenced_artwork_files(&records, &profile).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files["F1074_1.ithmb"], 5_000);
+        assert!(!files.contains_key("F1061_1.ithmb"));
+    }
 
     #[test]
     fn removes_direct_references_and_repairs_derived_rows() {

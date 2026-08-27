@@ -73,11 +73,8 @@ impl EncodedFrame {
     }
 }
 
-/// Classic (Nano 3G/4G) cover-art formats, measured from the operator's real
-/// Nano 3G files: `F1061_1.ithmb` carries 55x55 frames with a 56-pixel stride
-/// (6160-byte slots), `F1055_1`/`F1068_1` are 128x128 (32768-byte slots), and
-/// `F1060_1` is 320x320 (204800-byte slots).
-pub(crate) const CLASSIC_COVER_FORMATS: [Nano7gFormat; 4] = [
+/// Nano 3G cover-art formats measured from the operator's real device.
+pub(crate) const NANO3G_COVER_FORMATS: [Nano7gFormat; 4] = [
     Nano7gFormat {
         format_id: 1061,
         width: 55,
@@ -108,6 +105,53 @@ pub(crate) const CLASSIC_COVER_FORMATS: [Nano7gFormat; 4] = [
     },
 ];
 
+/// Nano 4G cover-art formats from Apple's device profile and libgpod's static
+/// format table. These are not interchangeable with the Nano 3G formats.
+pub(crate) const NANO4G_COVER_FORMATS: [Nano7gFormat; 6] = [
+    Nano7gFormat {
+        format_id: 1055,
+        width: 128,
+        height: 128,
+        stride_pixels: 128,
+        filename: "F1055_1.ithmb",
+    },
+    Nano7gFormat {
+        format_id: 1068,
+        width: 128,
+        height: 128,
+        stride_pixels: 128,
+        filename: "F1068_1.ithmb",
+    },
+    Nano7gFormat {
+        format_id: 1071,
+        width: 240,
+        height: 240,
+        stride_pixels: 240,
+        filename: "F1071_1.ithmb",
+    },
+    Nano7gFormat {
+        format_id: 1074,
+        width: 50,
+        height: 50,
+        stride_pixels: 50,
+        filename: "F1074_1.ithmb",
+    },
+    Nano7gFormat {
+        format_id: 1078,
+        width: 80,
+        height: 80,
+        stride_pixels: 80,
+        filename: "F1078_1.ithmb",
+    },
+    Nano7gFormat {
+        format_id: 1084,
+        width: 240,
+        height: 240,
+        stride_pixels: 240,
+        filename: "F1084_1.ithmb",
+    },
+];
+
 /// Decodes a JPEG/PNG source image and encodes one RGB565 frame per Nano 7G
 /// cover format.
 ///
@@ -118,10 +162,20 @@ pub(crate) fn encode_new_frames(source: &[u8]) -> Result<Vec<EncodedFrame>> {
     encode_frames(source, &NANO7G_COVER_FORMATS)
 }
 
-/// Decodes a JPEG/PNG source image and encodes one RGB565 frame per classic
-/// (Nano 3G/4G) cover format.
-pub(crate) fn encode_classic_frames(source: &[u8]) -> Result<Vec<EncodedFrame>> {
-    encode_frames(source, &CLASSIC_COVER_FORMATS)
+/// Decodes a JPEG/PNG source image into the profile-correct classic formats.
+///
+/// # Errors
+///
+/// Returns an error for an unsupported classic profile or invalid image.
+pub(crate) fn encode_classic_frames(source: &[u8], profile_key: &str) -> Result<Vec<EncodedFrame>> {
+    match profile_key {
+        "nano-3g" => encode_frames(source, &NANO3G_COVER_FORMATS),
+        "nano-4g" => encode_frames(source, &NANO4G_COVER_FORMATS),
+        _ => Err(Error::Unsupported {
+            feature: "classic artwork encoding",
+            reason: format!("profile {profile_key} has no artwork encoder"),
+        }),
+    }
 }
 
 /// Decodes and resizes a source image into RGB565 frames for a format table.
@@ -198,6 +252,27 @@ mod tests {
         .unwrap();
         let _ = red;
         buffer
+    }
+
+    #[test]
+    fn encodes_the_six_nano4g_formats() {
+        let png = make_rgb_image(64, 64, 200);
+        let frames = encode_classic_frames(&png, "nano-4g").unwrap();
+        let actual: Vec<_> = frames
+            .iter()
+            .map(|frame| (frame.format_id, frame.slot_bytes()))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (1055, 32_768),
+                (1068, 32_768),
+                (1071, 115_200),
+                (1074, 5_000),
+                (1078, 12_800),
+                (1084, 115_200),
+            ]
+        );
     }
 
     #[test]
