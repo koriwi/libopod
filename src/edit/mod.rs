@@ -39,8 +39,8 @@ use crate::{
         },
         sqlite::inspect_sqlite_database,
     },
-    BackendKind, ChecksumKind, Device, Error, IpodPath, Library, MountRoot, PersistentId, Result,
-    SqliteLibraryFile,
+    BackendKind, ChecksumKind, Device, Error, IpodPath, Library, MediaKind, MountRoot,
+    PersistentId, Result, SqliteLibraryFile,
 };
 
 /// Exact acknowledgement required by the Nano 7G no-op hardware write gate.
@@ -110,6 +110,8 @@ pub struct TrackToAdd {
     pub length_ms: u32,
     /// Whether this track belongs to a compilation album.
     pub compilation: bool,
+    /// Whether the item appears as a song or podcast episode.
+    pub media_kind: MediaKind,
     /// When true, a track joining an album that already has on-device artwork
     /// inherits that album's `.ithmb` slots (no image decoding or encoding).
     pub reuse_album_art: bool,
@@ -479,6 +481,14 @@ impl<'device> EditSession<'device> {
             return Err(Error::InvalidStagingDirectory {
                 path: track.source_path.clone(),
                 reason: "track source must be a regular file".to_owned(),
+            });
+        }
+        if track.media_kind == MediaKind::Podcast
+            && self.device.profile().map(crate::DeviceProfile::key) != Some("nano-7g")
+        {
+            return Err(Error::Unsupported {
+                feature: "podcast addition",
+                reason: "podcasts are currently qualified only for the Nano 7G profile".to_owned(),
             });
         }
         if track.title.trim().is_empty() || track.sample_rate == 0 {
@@ -965,6 +975,7 @@ impl<'device> EditSession<'device> {
                 sample_rate: track.sample_rate,
                 length_ms: track.length_ms,
                 compilation: track.compilation,
+                media_kind: track.media_kind,
                 file_size: metadata.len(),
                 date_coredata,
                 media_relative,
@@ -1927,6 +1938,7 @@ fn write_cdb_additions(
             total_discs: addition.total_discs,
             year: addition.year,
             compilation: addition.compilation,
+            media_kind: addition.media_kind,
             date_mac: addition.date_mac,
             artwork: addition.artwork.as_ref().map(|art| CdbArtworkLink {
                 image_id: art.image_id,
@@ -2181,6 +2193,7 @@ fn classic_addition(addition: &ResolvedAddition) -> CdbTrackAddition {
         total_discs: addition.total_discs,
         year: addition.year,
         compilation: addition.compilation,
+        media_kind: addition.media_kind,
         date_mac: addition.date_mac,
         artwork: addition.artwork.as_ref().map(|art| CdbArtworkLink {
             image_id: art.image_id,
@@ -2251,6 +2264,7 @@ fn validate_semantics(
         };
         if track.location.as_str() != format!("iPod_Control/Music/{}", addition.media_relative)
             || track.size != addition.file_size
+            || track.media_kind != addition.media_kind
         {
             return Err(Error::Verification {
                 format: "staged SQLite edit",
@@ -2266,11 +2280,22 @@ fn validate_semantics(
         .values()
         .filter(|edit| matches!(edit, PlaylistEdit::Create { .. }))
         .count();
+    let podcast_additions: Vec<_> = additions
+        .iter()
+        .filter(|addition| addition.media_kind == MediaKind::Podcast)
+        .map(|addition| addition.pid)
+        .collect();
+    let creates_podcast_container = !podcast_additions.is_empty()
+        && !before
+            .playlists()
+            .iter()
+            .any(|playlist| playlist.distinguished_kind == 11);
     let expected_playlist_count = before
         .playlists()
         .len()
         .saturating_sub(deleted)
-        .saturating_add(created);
+        .saturating_add(created)
+        .saturating_add(usize::from(creates_podcast_container));
     if after.playlists().len() != expected_playlist_count {
         return Err(Error::Verification {
             format: "staged library edit",
@@ -2323,6 +2348,18 @@ fn validate_semantics(
                 .filter(|id| !removals.contains(id))
                 .collect(),
         };
+        if old.distinguished_kind == 11 {
+            let mut expected_with_podcasts = expected.clone();
+            expected_with_podcasts.extend(podcast_additions.iter().copied());
+            if new.track_ids() != expected_with_podcasts {
+                return Err(Error::Verification {
+                    format: "staged library edit",
+                    reason: "podcast container membership differs from the requested edit"
+                        .to_owned(),
+                });
+            }
+            continue;
+        }
         let mut expected_with_additions = expected.clone();
         expected_with_additions.extend(additions.iter().map(|addition| addition.pid));
         if new.track_ids() == expected_with_additions {
@@ -2357,6 +2394,29 @@ fn validate_semantics(
                 });
             }
         }
+    }
+    if creates_podcast_container {
+        let podcast = after
+            .playlists()
+            .iter()
+            .find(|playlist| {
+                playlist.distinguished_kind == 11 && !expected_ids.contains(&playlist.id)
+            })
+            .ok_or_else(|| Error::Verification {
+                format: "staged library edit",
+                reason: "the podcast container was not created".to_owned(),
+            })?;
+        if podcast.name != "Podcasts"
+            || !podcast.is_hidden
+            || podcast.is_smart
+            || podcast.track_ids() != podcast_additions
+        {
+            return Err(Error::Verification {
+                format: "staged library edit",
+                reason: "the created podcast container is invalid".to_owned(),
+            });
+        }
+        expected_ids.insert(podcast.id);
     }
     if after
         .playlists()

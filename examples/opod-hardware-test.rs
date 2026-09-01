@@ -1,7 +1,7 @@
 use std::{error::Error, ffi::OsString, io::Error as IoError, path::PathBuf, process::ExitCode};
 
 use libopod::{
-    recover_interrupted_transaction, Device, MediaDeletionPolicy, TrackToAdd,
+    recover_interrupted_transaction, Device, MediaDeletionPolicy, MediaKind, TrackToAdd,
     NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION,
     NANO7_ARTWORK_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION,
     NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION, NANO7_ARTWORK_REUSE_ADDITION_CONFIRMATION,
@@ -171,6 +171,7 @@ fn run_addition(
         sample_rate: 44_100,
         length_ms,
         compilation: false,
+        media_kind: MediaKind::Song,
         reuse_album_art: false,
         artwork_source: None,
     };
@@ -217,6 +218,7 @@ fn run_art_addition(
         sample_rate: 44_100,
         length_ms,
         compilation: false,
+        media_kind: MediaKind::Song,
         reuse_album_art: reuse,
         artwork_source: art_image.map(PathBuf::from),
     };

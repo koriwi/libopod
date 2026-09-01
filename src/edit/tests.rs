@@ -15,7 +15,8 @@ mod tests {
     };
     use crate::{
         artwork::parse_artwork_records, ArtworkFormatProfile, ArtworkFormatRef, ArtworkRecord,
-        Device, Error, Library, MediaDeletionPolicy, MountRoot, PersistentId, SqliteLibraryFile,
+        Device, Error, Library, MediaDeletionPolicy, MediaKind, MountRoot, PersistentId,
+        SqliteLibraryFile,
         NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
         NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
     };
@@ -768,6 +769,7 @@ mod tests {
             sample_rate: 44100,
             length_ms: 155_742,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             reuse_album_art: true,
             artwork_source: None,
         })
@@ -775,6 +777,121 @@ mod tests {
         let bundle = tempdir().unwrap();
         let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
         Some((bundle, staged))
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn stages_a_nano7_podcast_with_its_special_container() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let source = fixture.join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "LibOpod Podcast Episode".to_owned(),
+            artist: Some("LibOpod Podcast".to_owned()),
+            album: Some("LibOpod Podcast".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2025,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 192,
+            sample_rate: 44_100,
+            length_ms: 155_742,
+            compilation: false,
+            media_kind: MediaKind::Podcast,
+            reuse_album_art: false,
+            artwork_source: None,
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.added_tracks(), 1);
+
+        let library = Connection::open(bundle.path().join("Library.itdb")).unwrap();
+        let pid: i64 = library
+            .query_row(
+                "SELECT pid FROM item WHERE title='LibOpod Podcast Episode' AND media_kind=4 \
+                 AND is_song=0 AND is_podcast=1 AND remember_bookmark=1 \
+                 AND exclude_from_shuffle=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            library
+                .query_row(
+                    "SELECT COUNT(*) FROM podcast_info WHERE item_pid=?1",
+                    [pid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let podcast_container: i64 = library
+            .query_row(
+                "SELECT pid FROM container WHERE distinguished_kind=11 AND name='Podcasts' \
+                 AND media_kinds=4 AND is_hidden=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            library
+                .query_row(
+                    "SELECT COUNT(*) FROM item_to_container WHERE item_pid=?1 \
+                     AND container_pid=?2",
+                    rusqlite::params![pid, podcast_container],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let dynamic = Connection::open(bundle.path().join("Dynamic.itdb")).unwrap();
+        assert_eq!(
+            dynamic
+                .query_row(
+                    "SELECT has_been_played FROM item_stats WHERE item_pid=?1",
+                    [pid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(dynamic);
+        drop(library);
+
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        staged.install(&Device::open(&virtual_root).unwrap()).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        let podcast = reopened
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| track.title == "LibOpod Podcast Episode")
+            .unwrap();
+        assert_eq!(podcast.media_kind, MediaKind::Podcast);
+        let container = reopened
+            .library()
+            .unwrap()
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.distinguished_kind == 11)
+            .unwrap();
+        assert!(container.is_hidden);
+        assert_eq!(container.track_ids(), [podcast.id]);
     }
 
     #[test]
@@ -980,6 +1097,7 @@ mod tests {
                 sample_rate: 44100,
                 length_ms: 155_742,
                 compilation: false,
+                media_kind: crate::MediaKind::Song,
                 reuse_album_art: false,
                 artwork_source: Some(art_path.clone()),
             })
@@ -1056,6 +1174,7 @@ mod tests {
             sample_rate: 44100,
             length_ms: 155_742,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             reuse_album_art: false,
             artwork_source: Some(art_path),
         })
@@ -1115,8 +1234,9 @@ mod tests {
             sample_rate: 44100,
             length_ms: 155_742,
             compilation: false,
-        reuse_album_art: false,
-        artwork_source: None,
+            media_kind: crate::MediaKind::Song,
+            reuse_album_art: false,
+            artwork_source: None,
         })
         .unwrap();
         assert_eq!(edit.addition_count(), 1);
@@ -1336,6 +1456,7 @@ mod tests {
             sample_rate: 44100,
             length_ms: 60_000,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             reuse_album_art: false,
             artwork_source: None,
         })
@@ -1577,6 +1698,7 @@ mod tests {
             sample_rate: 44100,
             length_ms: 60_000,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             reuse_album_art: false,
             artwork_source: None,
         })
@@ -1784,6 +1906,7 @@ mod tests {
             sample_rate: 44100,
             length_ms: 60_000,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             reuse_album_art: false,
             artwork_source: Some(art_path),
         })
@@ -2032,6 +2155,7 @@ mod tests {
             sample_rate: 44100,
             length_ms: 60_000,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             reuse_album_art: false,
             artwork_source: None,
         })

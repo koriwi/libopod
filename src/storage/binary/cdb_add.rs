@@ -35,6 +35,9 @@ const MHIT_SAMPLE_RATE_1: usize = 0x3c;
 const MHIT_DISC_NUMBER: usize = 0x5c;
 const MHIT_TOTAL_DISCS: usize = 0x60;
 const MHIT_DB_TRACK_ID: usize = 0x70;
+const MHIT_SKIP_WHEN_SHUFFLING: usize = 0xa5;
+const MHIT_REMEMBER_PLAYBACK_POSITION: usize = 0xa6;
+const MHIT_MARK_UNPLAYED: usize = 0xb2;
 const MHIT_MEDIA_TYPE: usize = 0xd0;
 const MHIT_SEASON: usize = 0xd4;
 const MHIT_EPISODE: usize = 0xd8;
@@ -99,6 +102,7 @@ pub(crate) struct CdbTrackAddition {
     pub total_discs: u32,
     pub year: u32,
     pub compilation: bool,
+    pub media_kind: crate::MediaKind,
     pub date_mac: u32,
     pub artwork: Option<CdbArtworkLink>,
 }
@@ -1219,7 +1223,17 @@ fn build_mhit(
     write_u64(&mut header, 0xbc, 0).ok(); // sample_count
     write_u32(&mut header, 0xc8, 0).ok(); // postgap
     write_u32(&mut header, 0xcc, 0).ok(); // encoder
-    write_u32(&mut header, MHIT_MEDIA_TYPE, 1).ok(); // audio
+    if addition.media_kind == crate::MediaKind::Podcast {
+        header[MHIT_SKIP_WHEN_SHUFFLING] = 1;
+        header[MHIT_REMEMBER_PLAYBACK_POSITION] = 1;
+        header[MHIT_MARK_UNPLAYED] = 2;
+    }
+    write_u32(
+        &mut header,
+        MHIT_MEDIA_TYPE,
+        u32::try_from(addition.media_kind.sqlite_value()).unwrap_or(1),
+    )
+    .ok();
     write_u32(&mut header, MHIT_SEASON, 0).ok();
     write_u32(&mut header, MHIT_EPISODE, 0).ok();
     write_u32(&mut header, 0x100, 0).ok(); // gapless_track_flag
@@ -1346,11 +1360,58 @@ mod tests {
             total_discs: 1,
             year: 2024,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             date_mac: 0,
             artwork: None,
         };
         let fields = sort_fields(&CdbSortView::from_addition(&addition), SORT_TITLE);
         assert_eq!(fields.0[0], SortField::Text("same title".to_owned()));
+    }
+
+    #[test]
+    fn marks_podcast_mhit_for_resume_shuffle_and_unplayed_state() {
+        let addition = CdbTrackAddition {
+            persistent_id: PersistentId::from_bits(2),
+            location: ":iPod_Control:Music:F00:POD.mp3".to_owned(),
+            title: "Episode".to_owned(),
+            artist: Some("Show".to_owned()),
+            album: Some("Show".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            file_size: 1,
+            length_ms: 1,
+            bitrate: 1,
+            sample_rate: 44_100,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            year: 2024,
+            compilation: false,
+            media_kind: crate::MediaKind::Podcast,
+            date_mac: 0,
+            artwork: None,
+        };
+        let mhit = build_mhit(
+            &addition,
+            0,
+            1,
+            0,
+            0,
+            MHIT_HEADER_SIZE,
+            &[
+                MHOD_TYPE_TITLE,
+                MHOD_TYPE_ARTIST,
+                MHOD_TYPE_ALBUM,
+                MHOD_TYPE_FILETYPE,
+                MHOD_TYPE_LOCATION,
+            ],
+        );
+        assert_eq!(mhit[MHIT_SKIP_WHEN_SHUFFLING], 1);
+        assert_eq!(mhit[MHIT_REMEMBER_PLAYBACK_POSITION], 1);
+        assert_eq!(mhit[MHIT_MARK_UNPLAYED], 2);
+        assert_eq!(read_u32(&mhit, MHIT_MEDIA_TYPE).unwrap(), 4);
     }
 
     #[test]
@@ -1386,6 +1447,7 @@ mod tests {
             total_discs: 1,
             year: 2024,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             date_mac: 0,
             artwork: None,
         };
@@ -1440,6 +1502,7 @@ mod tests {
             total_discs: 1,
             year: 2024,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             date_mac: 0,
             artwork: None,
         };
@@ -1484,6 +1547,7 @@ mod tests {
             total_discs: 1,
             year: 2024,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             date_mac: 0,
             artwork: None,
         };
@@ -1531,6 +1595,7 @@ mod tests {
             total_discs: 1,
             year: 2024,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             date_mac: 0,
             artwork: None,
         };

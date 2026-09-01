@@ -5,7 +5,7 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 
 use super::sort::sort_key;
-use crate::{Error, PersistentId, Result, SqliteLibraryFile};
+use crate::{Error, MediaKind, PersistentId, Result, SqliteLibraryFile};
 
 /// A fully resolved staged track addition: metadata, persistent ID, media
 /// target, and timestamps are fixed before any database write.
@@ -27,6 +27,7 @@ pub(crate) struct ResolvedAddition {
     pub sample_rate: u32,
     pub length_ms: u32,
     pub compilation: bool,
+    pub media_kind: MediaKind,
     pub file_size: u64,
     pub date_coredata: i64,
     pub date_mac: u32,
@@ -73,6 +74,12 @@ pub(crate) fn add_tracks_to_staged_databases(
         directory,
         SqliteLibraryFile::Locations,
         "locations",
+    )?;
+    attach(
+        &connection,
+        directory,
+        SqliteLibraryFile::Dynamic,
+        "dynamic",
     )?;
     let transaction = connection
         .transaction()
@@ -198,7 +205,7 @@ fn insert_track(
     )?;
     insert_avformat_row(transaction, path, addition, pid)?;
     insert_location_row(transaction, path, addition, pid)?;
-    insert_container_row(transaction, path, pid)?;
+    insert_container_rows(transaction, path, addition, pid)?;
     update_derived_rows(
         transaction,
         path,
@@ -636,6 +643,7 @@ fn insert_item_row(
         .map_err(|source| sqlite_error("read physical order", path, source))?;
     let artwork_status = i64::from(addition.artwork.is_some());
     let artwork_cache_id = addition.artwork.as_ref().map_or(0, |art| art.image_id);
+    let podcast = addition.media_kind == MediaKind::Podcast;
 
     transaction
         .execute(
@@ -653,8 +661,9 @@ fn insert_item_row(
              album_artist_order, album_by_artist_order, series_name_order, comment, grouping, \
              description, description_long, collection_description, copyright, track_artist_pid, \
              physical_order, has_lyrics, date_released) \
-             VALUES (:pid, NULL, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, :modified, \
-             :year, 0, 0, :compilation, 0, 0, 0, 0, 0, :artwork_status, :artwork_cache_id, 0, 0, \
+             VALUES (:pid, NULL, :media_kind, :is_song, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+             :is_podcast, :modified, :year, 0, 0, :compilation, 0, :remember_bookmark, \
+             :exclude_from_shuffle, 0, 0, :artwork_status, :artwork_cache_id, 0, 0, \
              :length, NULL, :track_number, \
              :total_tracks, :disc_number, :total_discs, 0, NULL, NULL, NULL, 0, :genre_id, 0, \
              :album_pid, :artist_pid, :composer_pid, :title, :artist, :album, :album_artist, \
@@ -664,8 +673,13 @@ fn insert_item_row(
              NULL, NULL, NULL, NULL, :track_artist_pid, :physical_order, 0, 0)",
             rusqlite::named_params! {
                 ":pid": pid,
+                ":media_kind": addition.media_kind.sqlite_value(),
+                ":is_song": i64::from(!podcast),
+                ":is_podcast": i64::from(podcast),
                 ":modified": addition.date_coredata,
                 ":year": i64::from(addition.year),
+                ":remember_bookmark": i64::from(podcast),
+                ":exclude_from_shuffle": i64::from(podcast),
                 ":compilation": i64::from(addition.compilation),
                 ":artwork_status": artwork_status,
                 ":artwork_cache_id": artwork_cache_id,
@@ -770,7 +784,12 @@ fn insert_location_row(
     Ok(())
 }
 
-fn insert_container_row(transaction: &Transaction<'_>, path: &Path, pid: i64) -> Result<()> {
+fn insert_container_rows(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    addition: &ResolvedAddition,
+    pid: i64,
+) -> Result<()> {
     let master: i64 = transaction
         .query_row(
             "SELECT primary_container_pid FROM db_info LIMIT 1",
@@ -778,16 +797,107 @@ fn insert_container_row(transaction: &Transaction<'_>, path: &Path, pid: i64) ->
             |row| row.get(0),
         )
         .map_err(|source| sqlite_error("read master container", path, source))?;
+    insert_container_membership(transaction, path, pid, master)?;
+    if addition.media_kind == MediaKind::Podcast {
+        let podcast = resolve_podcast_container(transaction, path, addition.date_coredata)?;
+        insert_container_membership(transaction, path, pid, podcast)?;
+        transaction
+            .execute(
+                "INSERT INTO podcast_info (item_pid, date_released, external_guid, feed_url, \
+                 feed_keywords) VALUES (?1, 0, NULL, NULL, NULL)",
+                [pid],
+            )
+            .map_err(|source| sqlite_error("insert podcast_info", path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO dynamic.item_stats (item_pid, has_been_played) VALUES (?1, 0)",
+                [pid],
+            )
+            .map_err(|source| sqlite_error("insert podcast playback state", path, source))?;
+    }
+    Ok(())
+}
+
+fn insert_container_membership(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    item_pid: i64,
+    container_pid: i64,
+) -> Result<()> {
     transaction
         .execute(
             "INSERT INTO item_to_container (item_pid, container_pid, physical_order, \
              shuffle_order) \
              VALUES (?1, ?2, (SELECT COALESCE(MAX(physical_order), -1) + 1 FROM \
              item_to_container WHERE container_pid = ?2), NULL)",
-            rusqlite::params![pid, master],
+            rusqlite::params![item_pid, container_pid],
         )
         .map_err(|source| sqlite_error("insert item_to_container", path, source))?;
     Ok(())
+}
+
+fn resolve_podcast_container(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    timestamp: i64,
+) -> Result<i64> {
+    let existing = transaction
+        .query_row(
+            "SELECT pid FROM container WHERE distinguished_kind = 11 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| sqlite_error("resolve podcast container", path, source))?;
+    if let Some(pid) = existing {
+        return Ok(pid);
+    }
+    let pid = loop {
+        let candidate = i64::from_ne_bytes(crate::random::next_u64().to_ne_bytes());
+        if candidate == 0 {
+            continue;
+        }
+        let exists: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM container WHERE pid = ?1) OR \
+                 EXISTS(SELECT 1 FROM item WHERE pid = ?1)",
+                [candidate],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error("allocate podcast container", path, source))?;
+        if exists == 0 {
+            break candidate;
+        }
+    };
+    let name_order: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(name_order), 0) + 100 FROM container",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("allocate podcast container order", path, source))?;
+    transaction
+        .execute(
+            "INSERT INTO container (pid, distinguished_kind, date_created, date_modified, name, \
+             name_order, parent_pid, media_kinds, workout_template_id, is_hidden, \
+             smart_is_folder, smart_is_dynamic, smart_is_filtered, smart_is_genius, \
+             smart_enabled_only, smart_is_limited, smart_limit_kind, smart_limit_order, \
+             smart_evaluation_order, smart_limit_value, smart_reverse_limit_order, \
+             smart_criteria, description) VALUES \
+             (?1, 11, ?2, ?2, 'Podcasts', ?3, 0, 4, 0, 1, 0, NULL, NULL, 0, 0, NULL, NULL, \
+              NULL, NULL, NULL, NULL, NULL, NULL)",
+            rusqlite::params![pid, timestamp, name_order],
+        )
+        .map_err(|source| sqlite_error("create podcast container", path, source))?;
+    transaction
+        .execute(
+            "INSERT INTO dynamic.container_ui (container_pid, play_order, is_reversed, \
+             album_field_order, repeat_mode, shuffle_items, has_been_shuffled) \
+             VALUES (?1, 39, 0, 1, 0, 0, 0)",
+            [pid],
+        )
+        .map_err(|source| sqlite_error("create podcast container UI state", path, source))?;
+    Ok(pid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -884,28 +994,31 @@ fn validate_added_invariants(
     additions: &[ResolvedAddition],
     path: &Path,
 ) -> Result<()> {
-    let pids: Vec<i64> = additions
-        .iter()
-        .map(|addition| i64::from_ne_bytes(addition.pid.to_bits().to_ne_bytes()))
-        .collect();
-    let mut missing = 0_i64;
-    for pid in &pids {
-        missing += transaction
+    for addition in additions {
+        let pid = i64::from_ne_bytes(addition.pid.to_bits().to_ne_bytes());
+        let rows: i64 = transaction
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM item WHERE pid = ?1) + \
                  (SELECT COUNT(*) FROM locations.location WHERE item_pid = ?1 AND sub_id = 0) + \
                  (SELECT COUNT(*) FROM avformat_info WHERE item_pid = ?1 AND sub_id = 0) + \
-                 (SELECT COUNT(*) FROM item_to_container WHERE item_pid = ?1)",
+                 (SELECT COUNT(*) FROM item_to_container WHERE item_pid = ?1) + \
+                 (SELECT COUNT(*) FROM podcast_info WHERE item_pid = ?1) + \
+                 (SELECT COUNT(*) FROM dynamic.item_stats WHERE item_pid = ?1)",
                 [pid],
-                |row| row.get::<_, i64>(0),
+                |row| row.get(0),
             )
             .map_err(|source| sqlite_error("validate added rows", path, source))?;
-    }
-    if missing != i64::try_from(pids.len() * 4).unwrap_or(i64::MAX) {
-        return Err(Error::Verification {
-            format: "staged SQLite add",
-            reason: "one or more added tracks lack their required companion rows".to_owned(),
-        });
+        let expected = if addition.media_kind == MediaKind::Podcast {
+            7
+        } else {
+            4
+        };
+        if rows != expected {
+            return Err(Error::Verification {
+                format: "staged SQLite add",
+                reason: "an added track lacks its required companion rows".to_owned(),
+            });
+        }
     }
     let violations: i64 = transaction
         .query_row(

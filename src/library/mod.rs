@@ -22,6 +22,33 @@ impl PersistentId {
     }
 }
 
+/// The user-visible media section for an audio item.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum MediaKind {
+    /// A normal music-library song.
+    #[default]
+    Song,
+    /// A podcast episode, hidden from the normal Songs view.
+    Podcast,
+}
+
+impl MediaKind {
+    pub(crate) const fn sqlite_value(self) -> i64 {
+        match self {
+            Self::Song => 1,
+            Self::Podcast => 4,
+        }
+    }
+
+    pub(crate) const fn from_disk(value: i64, podcast: bool) -> Self {
+        if value == 4 || podcast {
+            Self::Podcast
+        } else {
+            Self::Song
+        }
+    }
+}
+
 /// Read-only normalized track metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Track {
@@ -36,6 +63,7 @@ pub struct Track {
     pub track_number: u32,
     pub disc_number: u32,
     pub has_artwork: bool,
+    pub media_kind: MediaKind,
 }
 
 /// A playlist and its ordered track membership.
@@ -118,6 +146,7 @@ impl Library {
                     track_number: track.track_number,
                     disc_number: track.disc_number,
                     has_artwork: track.has_artwork,
+                    media_kind: track.media_kind,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -150,8 +179,9 @@ impl Library {
                  COALESCE(artist, ''), COALESCE(album_artist, ''), \
                  COALESCE(total_time_ms, 0), COALESCE(track_number, 0), \
                  COALESCE(disc_number, 0), COALESCE(artwork_status, 0), \
-                 COALESCE(artwork_cache_id, 0) \
-                 FROM item WHERE is_song = 1 OR media_kind = 1 \
+                 COALESCE(artwork_cache_id, 0), COALESCE(media_kind, 0), \
+                 COALESCE(is_podcast, 0) \
+                 FROM item WHERE is_song = 1 OR media_kind IN (1, 4) OR is_podcast = 1 \
                  ORDER BY COALESCE(physical_order, 0), pid",
             )
             .map_err(|source| sqlite_error("prepare track query", library_path, source))?;
@@ -168,6 +198,8 @@ impl Library {
                     disc_number: row.get(7)?,
                     artwork_status: row.get(8)?,
                     artwork_cache_id: row.get(9)?,
+                    media_kind: row.get(10)?,
+                    is_podcast: row.get(11)?,
                 })
             })
             .map_err(|source| sqlite_error("query tracks", library_path, source))?;
@@ -192,6 +224,7 @@ impl Library {
                 track_number: clamp_u32(raw.track_number),
                 disc_number: clamp_u32(raw.disc_number),
                 has_artwork: raw.artwork_status != 0 || raw.artwork_cache_id != 0,
+                media_kind: MediaKind::from_disk(raw.media_kind, raw.is_podcast != 0),
             });
         }
         let playlists = read_playlists(&connection, library_path)?;
@@ -272,6 +305,8 @@ struct RawTrack {
     disc_number: i64,
     artwork_status: i64,
     artwork_cache_id: i64,
+    media_kind: i64,
+    is_podcast: i64,
 }
 
 struct Location {

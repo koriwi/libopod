@@ -29,5 +29,5 @@ pub use edit::{
 };
 pub use error::{Error, Result};
 pub use fs::{IpodPath, MountRoot};
-pub use library::{Library, PersistentId, Playlist, Track};
+pub use library::{Library, MediaKind, PersistentId, Playlist, Track};
 pub use storage::{CbkInfo, CdbDatasetInfo, CdbInfo, SqliteDatabaseInfo, SqliteLibraryFile};

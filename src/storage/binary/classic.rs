@@ -10,7 +10,7 @@ use super::cdb_edit::{
     checked_end, chunk_header, malformed, read_u32, read_u64, require_magic, split_datasets,
     usize_value,
 };
-use crate::{Error, PersistentId, Result};
+use crate::{Error, MediaKind, PersistentId, Result};
 
 /// The Nano 7G `mhit` header size, used by the synthetic test builder; the
 /// classic parser accepts any header long enough for its fields (see
@@ -29,6 +29,7 @@ const MHIT_LENGTH: usize = 0x28;
 const MHIT_TRACK_NUMBER: usize = 0x2c;
 const MHIT_DISC_NUMBER: usize = 0x5c;
 const MHIT_DB_TRACK_ID: usize = 0x70;
+const MHIT_MEDIA_TYPE: usize = 0xd0;
 const MHIP_TRACK_ID: usize = 0x18;
 
 const MHOD_TYPE_TITLE: u32 = 1;
@@ -62,6 +63,7 @@ pub struct ClassicTrack {
     pub track_number: u32,
     pub disc_number: u32,
     pub has_artwork: bool,
+    pub media_kind: MediaKind,
 }
 
 /// One classic playlist (`mhyp`).
@@ -156,6 +158,11 @@ fn parse_track(
     let duration_ms = read_u32(chunk, MHIT_LENGTH)?;
     let track_number = read_u32(chunk, MHIT_TRACK_NUMBER)?;
     let disc_number = read_u32(chunk, MHIT_DISC_NUMBER)?;
+    let media_kind = if header.header_length >= MHIT_MEDIA_TYPE + 4 {
+        MediaKind::from_disk(i64::from(read_u32(chunk, MHIT_MEDIA_TYPE)?), false)
+    } else {
+        MediaKind::Song
+    };
 
     let mut title = String::new();
     let mut location = String::new();
@@ -208,6 +215,7 @@ fn parse_track(
         track_number,
         disc_number,
         has_artwork: artwork_tracks.contains(&persistent_id),
+        media_kind,
     })
 }
 
@@ -502,6 +510,7 @@ mod nano2_add_regression {
             total_discs: 1,
             year: 2024,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             date_mac: 0,
             artwork: None,
         };
@@ -545,6 +554,7 @@ mod nano2_add_regression {
             total_discs: 1,
             year: 2024,
             compilation: false,
+            media_kind: crate::MediaKind::Song,
             date_mac: 0,
             artwork: None,
         };
