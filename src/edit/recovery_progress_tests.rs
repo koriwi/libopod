@@ -5,7 +5,7 @@ use tempfile::{tempdir, TempDir};
 
 use super::{
     classic_tests::{addition, virtual_classic},
-    commit::{install_staged_removal, FailureMode, TRANSACTION_PATH},
+    commit::{install_staged_removal, install_staged_with_progress, FailureMode, TRANSACTION_PATH},
 };
 use crate::{
     recover_interrupted_transaction_with_progress, Device, ProgressEvent, StagedSqliteEdit,
@@ -258,6 +258,91 @@ fn automatic_install_rollback_forwards_recovery_events() {
         .contains(&"Removing recovery journal and backups"));
     assert_eq!(fs::read(directory.path().join(DB)).unwrap(), original);
     assert!(!directory.path().join(TRANSACTION_PATH).exists());
+}
+
+#[test]
+fn later_batch_recovery_preserves_committed_tracks_without_revisiting_their_audio() {
+    for mode in [crate::InstallMode::Full, crate::InstallMode::Fast] {
+        let (directory, _first_bundle, device, first_batch) = fixture();
+        let root = directory.path();
+        first_batch
+            .install_with_mode(&device, mode, |_| {})
+            .unwrap();
+        let committed_device = Device::open(root).unwrap();
+        let committed_track = &committed_device.library().unwrap().tracks()[0];
+        let first_id = committed_track.id;
+        let first_media = committed_track.location.as_str().to_owned();
+        let first_audio = fs::read(root.join(&first_media)).unwrap();
+        let first_modified = fs::metadata(root.join(&first_media))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let first_database = fs::read(root.join(DB)).unwrap();
+
+        // The next batch starts from the committed generation, not the
+        // original library from before the complete mirror run.
+        let mut edit = committed_device.edit().unwrap();
+        for title in ["Batch two, track one", "Batch two, track two"] {
+            let mut track = addition(root, false);
+            track.title = title.to_owned();
+            edit.add_track(track).unwrap();
+        }
+        let second_bundle = tempdir().unwrap();
+        let second_batch = edit.stage_sqlite_preview(second_bundle.path()).unwrap();
+        install_staged_with_progress(
+            &committed_device,
+            &second_batch,
+            FailureMode::SimulateInterruptionDuringValidation,
+            mode,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        let mut events = Events::default();
+        assert!(
+            recover_interrupted_transaction_with_progress(root, |event| events.record(event))
+                .unwrap()
+        );
+        let removed: Vec<_> = events
+            .items
+            .iter()
+            .filter(|(operation, ..)| *operation == "Removing new file during recovery")
+            .collect();
+        assert_eq!(
+            removed.len(),
+            2,
+            "only the current batch's audio needs rollback"
+        );
+        assert!(events
+            .items
+            .iter()
+            .all(|(_, _, _, name)| name != &first_media));
+        assert_eq!(fs::read(root.join(DB)).unwrap(), first_database);
+        assert_eq!(fs::read(root.join(&first_media)).unwrap(), first_audio);
+        assert_eq!(
+            fs::metadata(root.join(&first_media))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            first_modified
+        );
+        let recovered = Device::open(root).unwrap();
+        let tracks = recovered.library().unwrap().tracks();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].id, first_id);
+        assert!(tracks[0].has_artwork);
+
+        second_batch
+            .install_with_mode(&recovered, mode, |_| {})
+            .unwrap();
+        let finished = Device::open(root).unwrap();
+        assert_eq!(finished.library().unwrap().track_count(), 3);
+        assert!(finished
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .any(|track| track.id == first_id));
+    }
 }
 
 #[test]
