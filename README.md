@@ -67,6 +67,17 @@ cargo run --example opod-inspect -- /path/to/ipod/mount
 
 The inspector hides serial numbers, `FireWire` GUIDs, and track metadata.
 
+## Installation verification modes
+
+`StagedSqliteEdit::install` and `install_with_progress` keep full verification
+by default. `install_with_mode(device, InstallMode::Fast, callback)` avoids
+repeated MP3 reads: it verifies newly allocated MP3s against their manifest
+hash while copying, flushes them, and checks the installed sizes instead of
+reading their contents back. Same-size destination corruption can go
+undetected in fast mode. Database/artwork verification, signing, backups,
+journals and recovery remain unchanged. Fast mode does not reduce source
+scanning, staging or database-rewrite work.
+
 ## Progress callbacks
 
 The existing staging and installation methods remain silent. For live UI or

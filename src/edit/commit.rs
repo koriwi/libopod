@@ -1,16 +1,18 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{
     generation::fingerprint_host_file,
     manifest::{read_staging_manifest, ManifestOutputFile, StagingManifest},
     progress::Progress,
-    ProgressEvent, StagedSqliteEdit,
+    InstallMode, ProgressEvent, StagedSqliteEdit,
 };
 use crate::{error::io_error, Device, Error, IpodPath, MountRoot, Result};
 
@@ -224,13 +226,14 @@ pub fn install_staged_removal(
     staged: &StagedSqliteEdit,
     failure_mode: FailureMode,
 ) -> Result<()> {
-    install_staged_with_progress(device, staged, failure_mode, &mut |_| {})
+    install_staged_with_progress(device, staged, failure_mode, InstallMode::Full, &mut |_| {})
 }
 
 pub(crate) fn install_staged_with_progress(
     device: &Device,
     staged: &StagedSqliteEdit,
     failure_mode: FailureMode,
+    mode: InstallMode,
     progress: &mut Progress<'_>,
 ) -> Result<()> {
     progress(ProgressEvent::Phase("Verifying device before installation"));
@@ -238,7 +241,8 @@ pub(crate) fn install_staged_with_progress(
         .source_generation
         .verify_unchanged(device.mount(), device.profile())?;
     let manifest = read_staging_manifest(staged.manifest())?;
-    verify_bundle(device, staged, &manifest, progress)?;
+    let fast_media = fast_media_targets(staged, &manifest, mode)?;
+    verify_bundle(device, staged, &manifest, &fast_media, progress)?;
     progress(ProgressEvent::Phase("Checking space and preparing transaction"));
     require_transaction_space(device.mount(), &manifest)?;
     let transaction = transaction_host_path(device.mount())?;
@@ -253,7 +257,7 @@ pub(crate) fn install_staged_with_progress(
     })?;
     sync_directory(transaction.parent().unwrap_or(device.mount().as_path()))?;
 
-    let result = install_inner(device, staged, manifest, &transaction, failure_mode, progress);
+    let result = install_inner(device, staged, manifest, &transaction, failure_mode, &fast_media, progress);
     if result.is_err() && failure_mode == FailureMode::RollBack {
         progress(ProgressEvent::Phase("Installation failed; recovering transaction"));
         let rollback_result = recover_transaction(device.mount());
@@ -274,6 +278,7 @@ fn install_inner(
     manifest: StagingManifest,
     transaction: &Path,
     failure_mode: FailureMode,
+    fast_media: &BTreeSet<String>,
     progress: &mut Progress<'_>,
 ) -> Result<()> {
     #[cfg(not(test))]
@@ -355,19 +360,19 @@ fn install_inner(
                 reason: format!("stopped before installing file {index}"),
             });
         }
+        let stream_verified = fast_media.contains(&output.target);
         progress(ProgressEvent::Item {
-            operation: "Installing", current: index + 1,
-            total: journal.staging.outputs.len(), name: &output.target,
+            operation: if stream_verified { "Copying and hashing media (fast)" } else { "Installing" },
+            current: index + 1, total: journal.staging.outputs.len(), name: &output.target,
         });
         journal.installed = index + 1;
         write_journal(transaction, &journal)?;
         let staged_file = staged.directory().join(&output.staged);
-        verify_file(
-            &staged_file,
-            output.bytes,
-            &output.sha256,
-            "staged transaction output",
-        )?;
+        if !stream_verified {
+            verify_file(
+                &staged_file, output.bytes, &output.sha256, "staged transaction output",
+            )?;
+        }
         let original = original_state(&journal.staging, output)?;
         let target = if original.bytes.is_some() {
             resolve_target(device.mount(), output)?
@@ -375,7 +380,7 @@ fn install_inner(
             let relative = IpodPath::new(output.target.clone())?;
             device.mount().resolve_possible(&relative)?
         };
-        install_file(&staged_file, &target, index)?;
+        install_file_impl(&staged_file, &target, index, stream_verified.then_some(output))?;
     }
 
     for (deletion_index, deletion) in journal.staging.deletions.iter().enumerate() {
@@ -415,17 +420,21 @@ fn install_inner(
     journal.phase = TransactionPhase::Validating;
     write_journal(transaction, &journal)?;
     for (index, output) in journal.staging.outputs.iter().enumerate() {
+        let stream_verified = fast_media.contains(&output.target);
         progress(ProgressEvent::Item {
-            operation: "Verifying installed file", current: index + 1,
-            total: journal.staging.outputs.len(), name: &output.target,
+            operation: if stream_verified { "Checking installed media size (fast)" } else { "Verifying installed file" },
+            current: index + 1, total: journal.staging.outputs.len(), name: &output.target,
         });
         let original = original_state(&journal.staging, output)?;
-        if original.bytes.is_some() {
-            let target = resolve_target(device.mount(), output)?;
-            verify_file(&target, output.bytes, &output.sha256, "installed output")?;
+        let target = if original.bytes.is_some() {
+            resolve_target(device.mount(), output)?
         } else {
             let relative = IpodPath::new(output.target.clone())?;
-            let target = device.mount().resolve_possible(&relative)?;
+            device.mount().resolve_possible(&relative)?
+        };
+        if stream_verified {
+            verify_file_size(&target, output.bytes, "installed media")?;
+        } else {
             verify_file(&target, output.bytes, &output.sha256, "installed output")?;
         }
         #[cfg(test)]
@@ -772,6 +781,7 @@ fn verify_bundle(
     device: &Device,
     staged: &StagedSqliteEdit,
     manifest: &StagingManifest,
+    fast_media: &BTreeSet<String>,
     progress: &mut Progress<'_>,
 ) -> Result<()> {
     let profile = device.profile().ok_or_else(|| Error::Unsupported {
@@ -810,16 +820,17 @@ fn verify_bundle(
         });
     }
     for (index, output) in manifest.outputs.iter().enumerate() {
+        let stream_verified = fast_media.contains(&output.target);
         progress(ProgressEvent::Item {
-            operation: "Verifying staged file", current: index + 1,
-            total: manifest.outputs.len(), name: &output.target,
+            operation: if stream_verified { "Checking staged media size (fast)" } else { "Verifying staged file" },
+            current: index + 1, total: manifest.outputs.len(), name: &output.target,
         });
-        verify_file(
-            &staged.directory().join(&output.staged),
-            output.bytes,
-            &output.sha256,
-            "staging bundle output",
-        )?;
+        let path = staged.directory().join(&output.staged);
+        if stream_verified {
+            verify_file_size(&path, output.bytes, "staged media")?;
+        } else {
+            verify_file(&path, output.bytes, &output.sha256, "staging bundle output")?;
+        }
     }
     Ok(())
 }
@@ -934,6 +945,15 @@ fn copy_new_verified(source: &Path, destination: &Path, bytes: u64, digest: &str
 }
 
 fn install_file(source: &Path, target: &Path, sequence: usize) -> Result<()> {
+    install_file_impl(source, target, sequence, None)
+}
+
+fn install_file_impl(
+    source: &Path,
+    target: &Path,
+    sequence: usize,
+    expected: Option<&ManifestOutputFile>,
+) -> Result<()> {
     let parent = target.parent().ok_or_else(|| Error::Verification {
         format: "device transaction",
         reason: "installation target has no parent".to_owned(),
@@ -955,8 +975,12 @@ fn install_file(source: &Path, target: &Path, sequence: usize) -> Result<()> {
             .create_new(true)
             .open(&temporary)
             .map_err(|error| io_error("create sibling installation file", &temporary, error))?;
-        std::io::copy(&mut input, &mut output)
-            .map_err(|error| io_error("copy sibling installation file", &temporary, error))?;
+        if let Some(expected) = expected {
+            copy_verified_media(&mut input, &mut output, expected, &temporary)?;
+        } else {
+            std::io::copy(&mut input, &mut output)
+                .map_err(|error| io_error("copy sibling installation file", &temporary, error))?;
+        }
         output
             .sync_all()
             .map_err(|error| io_error("flush sibling installation file", &temporary, error))?;
@@ -980,6 +1004,78 @@ fn remove_if_present(path: &Path, operation: &'static str) -> Result<()> {
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(io_error(operation, path, source)),
     }
+}
+
+/// Only newly allocated MP3 paths can opt out of full destination read-back.
+/// Never infer this from a manifest path prefix alone: the staged edit must
+/// explicitly identify it as added media, and the original must be absent.
+fn fast_media_targets(
+    staged: &StagedSqliteEdit,
+    manifest: &StagingManifest,
+    mode: InstallMode,
+) -> Result<BTreeSet<String>> {
+    if mode == InstallMode::Full {
+        return Ok(BTreeSet::new());
+    }
+    let added: BTreeSet<_> = staged.added_media().iter().map(IpodPath::as_str).collect();
+    let mut targets = BTreeSet::new();
+    for output in &manifest.outputs {
+        if added.contains(output.target.as_str())
+            && output.target.starts_with("iPod_Control/Music/")
+            && Path::new(&output.target).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp3"))
+        {
+            let original = original_state(manifest, output)?;
+            if original.bytes.is_none() && original.sha256.is_none() {
+                targets.insert(output.target.clone());
+            }
+        }
+    }
+    Ok(targets)
+}
+
+/// Verify the actual bytes handed to the destination writer before publishing
+/// the sibling file. Bound the copy by the manifest size, including if a
+/// staged source grows while being read. A mismatch leaves no live output.
+fn copy_verified_media(
+    input: &mut File,
+    output: &mut File,
+    expected: &ManifestOutputFile,
+    temporary: &Path,
+) -> Result<()> {
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)
+            .map_err(|error| io_error("read staged media during copy", temporary, error))?;
+        if count == 0 { break; }
+        let count_u64 = u64::try_from(count).unwrap_or(u64::MAX);
+        if count_u64 > expected.bytes.saturating_sub(copied) {
+            return Err(Error::Verification {
+                format: "streamed media", reason: "media exceeds its manifest size".to_owned(),
+            });
+        }
+        output.write_all(&buffer[..count])
+            .map_err(|error| io_error("write verified media copy", temporary, error))?;
+        hasher.update(&buffer[..count]);
+        copied += count_u64;
+    }
+    if copied != expected.bytes || hex(&hasher.finalize()) != expected.sha256 {
+        return Err(Error::Verification {
+            format: "streamed media", reason: "copied media does not match its manifest fingerprint".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_file_size(path: &Path, bytes: u64, format: &'static str) -> Result<()> {
+    let metadata = fs::metadata(path).map_err(|error| io_error("inspect media size", path, error))?;
+    if !metadata.is_file() || metadata.len() != bytes {
+        return Err(Error::Verification {
+            format, reason: format!("{} does not match its manifest size", path.display()),
+        });
+    }
+    Ok(())
 }
 
 fn verify_file(path: &Path, bytes: u64, digest: &str, format: &'static str) -> Result<()> {

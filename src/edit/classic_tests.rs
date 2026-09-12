@@ -60,7 +60,7 @@ fn empty_database() -> Vec<u8> {
     bytes
 }
 
-fn virtual_classic(identity: &str, artwork: bool) -> TempDir {
+pub(super) fn virtual_classic(identity: &str, artwork: bool) -> TempDir {
     let directory = tempdir().unwrap();
     let root = directory.path();
     for folder in ["Device", "iTunes", "Artwork"] {
@@ -87,7 +87,7 @@ fn virtual_classic(identity: &str, artwork: bool) -> TempDir {
     directory
 }
 
-fn addition(root: &Path, artwork: bool) -> TrackToAdd {
+pub(super) fn addition(root: &Path, artwork: bool) -> TrackToAdd {
     let source = root.join("source.mp3");
     fs::write(&source, b"synthetic media; libopod does not decode audio").unwrap();
     let artwork_source = artwork.then(|| {

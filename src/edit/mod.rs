@@ -1064,6 +1064,20 @@ pub struct StagedSqliteEdit {
     manifest: PathBuf,
 }
 
+/// Verification policy for a staged installation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InstallMode {
+    /// Fully hash staged files and read back every installed output.
+    #[default]
+    Full,
+    /// Hash new MP3s during copying instead of repeatedly reading them.
+    /// After flushing, check their sizes but do not read back their contents.
+    /// This cannot detect same-size corruption on the destination media.
+    /// Database/artwork verification, signing, backups, journals, disk flushes
+    /// and recovery checks remain unchanged. Existing media is not eligible.
+    Fast,
+}
+
 impl StagedSqliteEdit {
     /// Installs the staged transaction on the device the session was opened
     /// from.
@@ -1096,10 +1110,27 @@ impl StagedSqliteEdit {
     pub fn install_with_progress(
         &self,
         device: &Device,
+        progress: impl FnMut(ProgressEvent<'_>),
+    ) -> Result<()> {
+        self.install_with_mode(device, InstallMode::Full, progress)
+    }
+
+    /// Installs with an explicit verification policy and progress callback.
+    /// [`InstallMode::Fast`] trades full MP3 destination read-back for fewer
+    /// reads; database and transaction safeguards remain enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::install`], except that fast mode
+    /// cannot detect same-size destination corruption in newly copied MP3s.
+    pub fn install_with_mode(
+        &self,
+        device: &Device,
+        mode: InstallMode,
         mut progress: impl FnMut(ProgressEvent<'_>),
     ) -> Result<()> {
         self::commit::install_staged_with_progress(
-            device, self, self::commit::FailureMode::RollBack, &mut progress,
+            device, self, self::commit::FailureMode::RollBack, mode, &mut progress,
         )
     }
 
@@ -2531,3 +2562,5 @@ include!("tests.rs");
 
 #[cfg(test)]
 mod classic_tests;
+#[cfg(test)]
+mod fast_tests;
