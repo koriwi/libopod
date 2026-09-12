@@ -260,7 +260,7 @@ pub(crate) fn install_staged_with_progress(
     let result = install_inner(device, staged, manifest, &transaction, failure_mode, &fast_media, progress);
     if result.is_err() && failure_mode == FailureMode::RollBack {
         progress(ProgressEvent::Phase("Installation failed; recovering transaction"));
-        let rollback_result = recover_transaction(device.mount());
+        let rollback_result = recover_transaction_with_progress(device.mount(), progress);
         if let Err(rollback_error) = rollback_result {
             return Err(Error::Verification {
                 format: "device transaction",
@@ -473,55 +473,40 @@ fn install_inner(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn recover_transaction(mount: &MountRoot) -> Result<()> {
+    recover_transaction_with_progress(mount, &mut |_| {})
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn recover_transaction_with_progress(
+    mount: &MountRoot,
+    progress: &mut Progress<'_>,
+) -> Result<()> {
+    progress(ProgressEvent::Phase("Reading recovery journal"));
     let transaction = transaction_host_path(mount)?;
     if !transaction.exists() {
         return Ok(());
     }
     let journal = read_journal(&transaction)?;
-    validate_recovery_state(mount, &transaction, &journal)?;
+    progress(ProgressEvent::Phase("Validating recovery journal and interrupted state"));
+    validate_recovery_state(mount, &transaction, &journal, progress)?;
     // Only trust target-derived temporary names after the journal and live
     // interrupted state have passed validation.
-    cleanup_interrupted_temporaries(mount, &transaction, &journal)?;
-    if journal.phase != TransactionPhase::Committed {
-        // Free newly installed media first. This gives database restoration
-        // room even when the interrupted addition exhausted the volume.
-        for (index, output) in journal.staging.outputs.iter().enumerate().rev() {
-            if index >= journal.installed {
-                continue;
-            }
-            let source = original_state(&journal.staging, output)?;
-            if matches!((source.bytes, source.sha256.as_deref()), (None, None)) {
-                let relative = IpodPath::new(output.target.clone())?;
-                let target = mount.resolve_possible(&relative)?;
-                if target.exists() {
-                    verify_file(
-                        &target,
-                        output.bytes,
-                        &output.sha256,
-                        "installed new output",
-                    )?;
-                    remove_if_present(&target, "remove rolled-back new output")?;
-                    sync_directory(target.parent().unwrap_or(mount.as_path()))?;
-                }
-                verify_absent(&target, "rolled-back new output")?;
-            }
-        }
-        // Once new payloads are gone, restore every replaced database/artwork
-        // file from its verified transaction backup.
-        for (index, output) in journal.staging.outputs.iter().enumerate().rev() {
-            if index >= journal.installed {
-                continue;
-            }
+    progress(ProgressEvent::Phase("Cleaning interrupted temporary files"));
+    cleanup_interrupted_temporaries(mount, &transaction, &journal, progress)?;
+    if journal.phase == TransactionPhase::Committed {
+        progress(ProgressEvent::Phase("Transaction already committed; keeping installed files"));
+    } else {
+        // Preserve reverse installation order while counting only the files
+        // relevant to each rollback operation. Validation bounded installed.
+        let mut new_outputs = Vec::new();
+        let mut replacements = Vec::new();
+        for (index, output) in journal.staging.outputs[..journal.installed].iter().enumerate().rev() {
             let source = original_state(&journal.staging, output)?;
             match (source.bytes, source.sha256.as_deref()) {
-                (Some(bytes), Some(digest)) => {
-                    let target = resolve_target(mount, output)?;
-                    let backup = transaction.join("backup").join(&output.staged);
-                    install_file(&backup, &target, index)?;
-                    verify_file(&target, bytes, digest, "rolled-back output")?;
-                }
-                (None, None) => {}
+                (None, None) => new_outputs.push(output),
+                (Some(bytes), Some(digest)) => replacements.push((index, output, bytes, digest)),
                 _ => {
                     return Err(Error::Verification {
                         format: "device transaction",
@@ -530,7 +515,43 @@ pub(crate) fn recover_transaction(mount: &MountRoot) -> Result<()> {
                 }
             }
         }
-        for output in &journal.staging.outputs {
+        // Free newly installed media first. This gives database restoration
+        // room even when the interrupted addition exhausted the volume.
+        for (index, output) in new_outputs.iter().enumerate() {
+            progress(ProgressEvent::Item {
+                operation: "Removing new file during recovery", current: index + 1,
+                total: new_outputs.len(), name: &output.target,
+            });
+            let relative = IpodPath::new(output.target.clone())?;
+            let target = mount.resolve_possible(&relative)?;
+            if target.exists() {
+                verify_file(&target, output.bytes, &output.sha256, "installed new output")?;
+                remove_if_present(&target, "remove rolled-back new output")?;
+                sync_directory(target.parent().unwrap_or(mount.as_path()))?;
+            }
+            verify_absent(&target, "rolled-back new output")?;
+        }
+        // Once new payloads are gone, restore every replaced database/artwork
+        // file from its verified transaction backup.
+        for (current, (index, output, bytes, digest)) in replacements.iter().enumerate() {
+            progress(ProgressEvent::Item {
+                operation: "Restoring recovery backup", current: current + 1,
+                total: replacements.len(), name: &output.target,
+            });
+            let target = resolve_target(mount, output)?;
+            let backup = transaction.join("backup").join(&output.staged);
+            install_file(&backup, &target, *index)?;
+            progress(ProgressEvent::Item {
+                operation: "Verifying restored file", current: current + 1,
+                total: replacements.len(), name: &output.target,
+            });
+            verify_file(&target, *bytes, digest, "rolled-back output")?;
+        }
+        for (index, output) in journal.staging.outputs.iter().enumerate() {
+            progress(ProgressEvent::Item {
+                operation: "Checking recovered file", current: index + 1,
+                total: journal.staging.outputs.len(), name: &output.target,
+            });
             let source = original_state(&journal.staging, output)?;
             match (source.bytes, source.sha256.as_deref()) {
                 (Some(bytes), Some(digest)) => {
@@ -554,6 +575,7 @@ pub(crate) fn recover_transaction(mount: &MountRoot) -> Result<()> {
         // unlinked a media file it is gone by design, so recovery restores
         // only the database outputs above and leaves deletions absent.
     }
+    progress(ProgressEvent::Phase("Removing recovery journal and backups"));
     remove_transaction_directory(&transaction)
 }
 
@@ -561,9 +583,14 @@ fn cleanup_interrupted_temporaries(
     mount: &MountRoot,
     transaction: &Path,
     journal: &TransactionJournal,
+    progress: &mut Progress<'_>,
 ) -> Result<()> {
     let mut parents = std::collections::BTreeSet::new();
     for (index, output) in journal.staging.outputs.iter().enumerate() {
+        progress(ProgressEvent::Item {
+            operation: "Checking recovery temporary files", current: index + 1,
+            total: journal.staging.outputs.len(), name: &output.target,
+        });
         let relative = IpodPath::new(output.target.clone())?;
         let target = mount.resolve_possible(&relative)?;
         let parent = target.parent().ok_or_else(|| Error::Verification {
@@ -588,6 +615,7 @@ fn cleanup_interrupted_temporaries(
         remove_if_present(&journal_temporary, "remove interrupted journal temporary")?;
         parents.insert(transaction.to_path_buf());
     }
+    progress(ProgressEvent::Phase("Flushing recovery temporary-file cleanup"));
     for parent in parents {
         sync_directory(&parent)?;
     }
@@ -608,6 +636,7 @@ fn validate_recovery_state(
     mount: &MountRoot,
     transaction: &Path,
     journal: &TransactionJournal,
+    progress: &mut Progress<'_>,
 ) -> Result<()> {
     if journal.installed > journal.staging.outputs.len() {
         return Err(Error::Verification {
@@ -685,15 +714,14 @@ fn validate_recovery_state(
         let _ = relative;
     }
 
-    for source in &journal.staging.source {
-        if journal
-            .staging
-            .outputs
-            .iter()
-            .any(|output| output.target == source.path)
-        {
-            continue;
-        }
+    let unchanged_inputs: Vec<_> = journal.staging.source.iter().filter(|source| {
+        !journal.staging.outputs.iter().any(|output| output.target == source.path)
+    }).collect();
+    for (index, source) in unchanged_inputs.iter().enumerate() {
+        progress(ProgressEvent::Item {
+            operation: "Verifying recovery input", current: index + 1,
+            total: unchanged_inputs.len(), name: &source.path,
+        });
         let relative = IpodPath::new(source.path.clone())?;
         match (source.bytes, source.sha256.as_deref()) {
             (Some(bytes), Some(digest)) => {
@@ -717,6 +745,10 @@ fn validate_recovery_state(
     }
 
     for (index, output) in journal.staging.outputs.iter().enumerate() {
+        progress(ProgressEvent::Item {
+            operation: "Verifying interrupted file and backup", current: index + 1,
+            total: journal.staging.outputs.len(), name: &output.target,
+        });
         let original = original_state(&journal.staging, output)?;
         match (original.bytes, original.sha256.as_deref()) {
             (Some(original_bytes), Some(original_digest)) => {

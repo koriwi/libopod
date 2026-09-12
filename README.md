@@ -80,10 +80,13 @@ scanning, staging or database-rewrite work.
 
 ## Progress callbacks
 
-The existing staging and installation methods remain silent. For live UI or
-logging, use `EditSession::stage_sqlite_preview_with_progress` and
-`StagedSqliteEdit::install_with_progress`, each with an `FnMut(ProgressEvent)`
-callback. Events run synchronously before the named work; item counters are
+The existing staging, installation and recovery methods remain silent. For
+live UI or logging, use `EditSession::stage_sqlite_preview_with_progress`,
+`StagedSqliteEdit::install_with_progress`, or
+`recover_interrupted_transaction_with_progress`, each with an
+`FnMut(ProgressEvent)` callback. Installation callbacks also receive automatic
+rollback progress. Recovery reports paths without opening the inconsistent
+library, and it validates the interrupted state before any destructive work. Events run synchronously before the named work; item counters are
 one-based and per operation. Events can contain track titles or paths, so they
 are not redacted. Callbacks must not panic or mutate the device/bundle.
 

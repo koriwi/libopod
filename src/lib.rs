@@ -20,7 +20,8 @@ pub use device::{
     DeviceProfile, EvidenceSource, IdentityEvidence, Sourced, VolumeFormat,
 };
 pub use edit::{
-    recover_interrupted_transaction, EditSession, FileFingerprint, GenerationFingerprint,
+    recover_interrupted_transaction, recover_interrupted_transaction_with_progress,
+    EditSession, FileFingerprint, GenerationFingerprint,
     InstallMode, MediaDeletionPolicy, ProgressEvent, StagedSqliteEdit, TrackToAdd, NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION,
     NANO7_ARTWORK_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION,
     NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION, NANO7_ARTWORK_REUSE_ADDITION_CONFIRMATION,

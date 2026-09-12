@@ -1,7 +1,8 @@
-use std::{error::Error, ffi::OsString, io::Error as IoError, path::PathBuf, process::ExitCode};
+use std::{error::Error, ffi::OsString, io::{Error as IoError, Write as _}, path::PathBuf, process::ExitCode};
 
 use libopod::{
-    recover_interrupted_transaction, Device, MediaDeletionPolicy, MediaKind, TrackToAdd,
+    recover_interrupted_transaction_with_progress, Device, MediaDeletionPolicy, MediaKind,
+    ProgressEvent, TrackToAdd,
     NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION,
     NANO7_ARTWORK_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION,
     NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION, NANO7_ARTWORK_REUSE_ADDITION_CONFIRMATION,
@@ -246,7 +247,19 @@ fn optional_text(value: &OsString) -> Option<String> {
 }
 
 fn run_recovery(mount: &OsString) -> CliResult<()> {
-    if recover_interrupted_transaction(PathBuf::from(mount))? {
+    if recover_interrupted_transaction_with_progress(PathBuf::from(mount), |event| {
+        let mut output = std::io::stdout().lock();
+        // Logging failures must not interrupt recovery. Debug-quote names so
+        // untrusted journal paths cannot inject terminal controls.
+        match event {
+            ProgressEvent::Phase(phase) => { let _ = writeln!(output, "{phase}…"); }
+            ProgressEvent::Item { operation, current, total, name } => {
+                let _ = writeln!(output, "{operation} [{current}/{total}]: {name:?}");
+            }
+            _ => {}
+        }
+        let _ = output.flush();
+    })? {
         println!("Verified transaction backups were restored or committed cleanup completed.");
     } else {
         println!("No interrupted libopod transaction was present.");

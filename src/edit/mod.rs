@@ -1227,11 +1227,34 @@ impl StagedSqliteEdit {
 /// Returns an error without changing live files if the journal, volume
 /// identity inputs, backups, or current interrupted state do not verify.
 pub fn recover_interrupted_transaction(path: impl AsRef<Path>) -> Result<bool> {
+    recover_interrupted_transaction_with_progress(path, |_| {})
+}
+
+/// Recovers an interrupted transaction with synchronous progress observations.
+/// Reports journal/input verification, temporary-file cleanup, rollback and
+/// final cleanup. Names are device-relative paths: recovery does not open a
+/// potentially inconsistent music library merely to look up song titles.
+/// See [`ProgressEvent`] for callback semantics.
+///
+/// Returns `false` when there is no pending transaction. A successful return,
+/// not a progress event, indicates recovery has finished. All recovery checks
+/// remain enabled, including after a fast-mode installation.
+///
+/// # Errors
+///
+/// Returns the same errors as [`recover_interrupted_transaction`].
+/// No destructive recovery work starts until interrupted-state validation
+/// succeeds; progress callbacks must not mutate the device or journal.
+pub fn recover_interrupted_transaction_with_progress(
+    path: impl AsRef<Path>,
+    mut progress: impl FnMut(ProgressEvent<'_>),
+) -> Result<bool> {
+    progress(ProgressEvent::Phase("Opening device for recovery"));
     let mount = MountRoot::open(path)?;
     if commit::pending_transaction(&mount)?.is_none() {
         return Ok(false);
     }
-    commit::recover_transaction(&mount)?;
+    commit::recover_transaction_with_progress(&mount, &mut progress)?;
     Ok(true)
 }
 
@@ -2564,3 +2587,5 @@ include!("tests.rs");
 mod classic_tests;
 #[cfg(test)]
 mod fast_tests;
+#[cfg(test)]
+mod recovery_progress_tests;
