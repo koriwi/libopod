@@ -78,6 +78,24 @@ undetected in fast mode. Database/artwork verification, signing, backups,
 journals and recovery remain unchanged. Fast mode does not reduce source
 scanning, staging or database-rewrite work.
 
+## Repeated commits and I/O
+
+`install_and_open(device, mode, callback)` returns the device handle from the
+mandatory installation read-back after the transaction has committed and its
+journal is gone. Batched callers can use it for their next edit without
+reopening and fingerprinting all database/artwork files again.
+
+Staging verifies the initial generation through its host backup rather than
+hashing every live input before copying it. Staging reads the main databases
+from those host snapshots. Thumbnail staging copies the existing host prefix
+once per format, then appends new frames and flushes once. Installation also uses host
+snapshots to supply on-device rollback backups; it still flushes and fully
+verifies those backups and rechecks the live generation before installation.
+Keep the entire staging bundle, including `original`, intact until installation
+finishes. Recovery still needs no host bundle and keeps full byte verification.
+Media allocation inventories `Music/Fxx` once per staging batch, not per song,
+and reserves complete filenames case-insensitively before copying.
+
 ## Progress callbacks
 
 The existing staging, installation and recovery methods remain silent. For

@@ -61,6 +61,18 @@ pub(crate) fn back_up_generation(
     generation: &GenerationFingerprint,
     progress: &mut super::progress::Progress<'_>,
 ) -> Result<()> {
+    // The verified snapshot also performs staging's initial generation check:
+    // copied bytes must match the open-time fingerprint, and absent inputs
+    // must remain absent. Do not hash every live file before reading it again
+    // for this copy. Staging still rechecks the whole generation at the end.
+    for fingerprint in generation.files().iter().filter(|file| file.bytes().is_none()) {
+        if device.mount().contains(fingerprint.path())? {
+            return Err(Error::Verification {
+                format: "device generation",
+                reason: format!("{} appeared after the device was opened", fingerprint.path()),
+            });
+        }
+    }
     let backup_root = destination.join("original");
     fs::create_dir(&backup_root)
         .map_err(|source| io_error("create host backup directory", &backup_root, source))?;

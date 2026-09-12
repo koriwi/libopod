@@ -2,6 +2,7 @@ mod add;
 mod commit;
 mod generation;
 mod manifest;
+mod media;
 mod playlist;
 mod progress;
 pub(crate) mod sort;
@@ -29,7 +30,6 @@ pub(crate) use commit::{
     install_single_removal_hardware_test, pending_transaction,
 };
 
-use self::generation::fingerprint_host_file;
 use self::manifest::{back_up_generation, write_staging_manifest, ManifestDeletionFile};
 use self::playlist::edit_staged_playlists;
 use crate::{
@@ -583,10 +583,7 @@ impl<'device> EditSession<'device> {
     /// writes a manifest whose only output is the `iTunesDB`.
     #[allow(clippy::too_many_lines)]
     fn stage_classic(&self, destination: &Path, progress: &mut Progress<'_>) -> Result<StagedSqliteEdit> {
-        progress(ProgressEvent::Phase("Verifying source databases"));
-        self.device
-            .generation()
-            .verify_unchanged(self.device.mount(), self.device.profile())?;
+        progress(ProgressEvent::Phase("Backing up and verifying source databases"));
         let destination = validate_destination(self.device, destination)?;
         back_up_generation(self.device, &destination, self.device.generation(), progress)?;
 
@@ -598,7 +595,8 @@ impl<'device> EditSession<'device> {
         let guid = self.device.evidence().firewire_guid();
 
         let relative = IpodPath::new("iPod_Control/iTunes/iTunesDB")?;
-        let source = self.device.mount().resolve_existing(&relative)?;
+        let original = MountRoot::open(destination.join("original"))?;
+        let source = original.resolve_existing(&relative)?;
         let mut database = read_limited(&source, MAX_CLASSIC_DATABASE_BYTES, "classic iTunesDB")?;
 
         let before = self.device.library().ok_or_else(|| Error::Unsupported {
@@ -691,7 +689,7 @@ impl<'device> EditSession<'device> {
         }
         if !resolved.is_empty() && artwork_supported {
             write_artwork_additions(self.device, &destination, &resolved)?;
-            write_artwork_frames(self.device, &destination, &resolved)?;
+            write_artwork_frames(&destination, &resolved)?;
         }
 
         progress(ProgressEvent::Phase("Writing and verifying staged iTunesDB"));
@@ -786,16 +784,11 @@ impl<'device> EditSession<'device> {
 
     #[allow(clippy::too_many_lines)]
     fn stage_sqlite(&self, destination: &Path, progress: &mut Progress<'_>) -> Result<StagedSqliteEdit> {
-        progress(ProgressEvent::Phase("Verifying source databases"));
-        self.device
-            .generation()
-            .verify_unchanged(self.device.mount(), self.device.profile())?;
+        progress(ProgressEvent::Phase("Backing up and verifying source databases"));
         let destination = validate_destination(self.device, destination)?;
         back_up_generation(self.device, &destination, self.device.generation(), progress)?;
-        let source = self
-            .device
-            .mount()
-            .resolve_existing(&IpodPath::new(ITLP_PATH)?)?;
+        let original = MountRoot::open(destination.join("original"))?;
+        let source = original.resolve_existing(&IpodPath::new(ITLP_PATH)?)?;
         progress(ProgressEvent::Phase("Copying SQLite databases to staging"));
         copy_sqlite_set(&source, &destination)?;
 
@@ -846,7 +839,7 @@ impl<'device> EditSession<'device> {
                 progress(ProgressEvent::Phase("Updating artwork database and thumbnails"));
                 if artwork_supported {
                     write_artwork_additions(self.device, &destination, &resolved)?;
-                    write_artwork_frames(self.device, &destination, &resolved)?;
+                    write_artwork_frames(&destination, &resolved)?;
                 }
             }
         }
@@ -981,13 +974,14 @@ impl<'device> EditSession<'device> {
         } else {
             100
         };
+        progress(ProgressEvent::Phase("Scanning device media directories"));
+        let mut media = media::MediaAllocator::scan(self.device)?;
         for (index, track) in self.additions.iter().enumerate() {
             progress(ProgressEvent::Item {
                 operation: "Staging audio and artwork", current: index + 1, total: self.additions.len(),
                 name: &track.title,
             });
-            let (media_relative, _staged_path) =
-                allocate_media_path(self.device, destination, &track.source_path)?;
+            let media_relative = media.stage_copy(destination, &track.source_path)?;
             let metadata = fs::metadata(&track.source_path)
                 .map_err(|source| io_error("inspect track source", &track.source_path, source))?;
             let pid = generate_unique_pid(&existing_pids);
@@ -1088,7 +1082,9 @@ impl StagedSqliteEdit {
     /// session used [`MediaDeletionPolicy::Delete`]) are applied, and the
     /// result is signed. On any failure the transaction is rolled back from
     /// its on-device backup; an interrupted install is completed or rolled
-    /// back by [`crate::recover_interrupted_transaction`].
+    /// back by [`crate::recover_interrupted_transaction`]. Keep the host bundle,
+    /// including `original`, intact until installation finishes: it supplies
+    /// bytes for the flushed and verified on-device rollback backups.
     ///
     /// # Errors
     ///
@@ -1127,9 +1123,29 @@ impl StagedSqliteEdit {
         &self,
         device: &Device,
         mode: InstallMode,
-        mut progress: impl FnMut(ProgressEvent<'_>),
+        progress: impl FnMut(ProgressEvent<'_>),
     ) -> Result<()> {
-        self::commit::install_staged_with_progress(
+        self.install_and_open(device, mode, progress).map(|_| ())
+    }
+
+    /// Installs this bundle and returns the validated installed device handle.
+    /// Reuses the mandatory installation read-back instead of opening and
+    /// fingerprinting the whole database/artwork generation again. The returned
+    /// handle is available only after the transaction has committed and its
+    /// journal has been removed; a subsequent edit still checks for changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::install_with_mode`]. Keep the host
+    /// bundle (including its `original` snapshot) intact until installation
+    /// finishes; it supplies bytes for the verified on-device recovery backup.
+    pub fn install_and_open(
+        &self,
+        device: &Device,
+        mode: InstallMode,
+        mut progress: impl FnMut(ProgressEvent<'_>),
+    ) -> Result<Device> {
+        self::commit::install_staged_and_open(
             device, self, self::commit::FailureMode::RollBack, mode, &mut progress,
         )
     }
@@ -1256,125 +1272,6 @@ pub fn recover_interrupted_transaction_with_progress(
     }
     commit::recover_transaction_with_progress(&mount, &mut progress)?;
     Ok(true)
-}
-
-#[allow(clippy::too_many_lines)]
-/// Chooses the least-populated `Music/Fxx` directory, stages a verified copy
-/// of the source MP3 inside the bundle, and returns the relative media path
-/// (`Fxx/NAME.mp3`) plus the bundle-relative staged path.
-fn allocate_media_path(
-    device: &Device,
-    destination: &Path,
-    source_path: &Path,
-) -> Result<(String, String)> {
-    let music_relative = IpodPath::new("iPod_Control/Music")?;
-    let music = device.mount().resolve_existing(&music_relative)?;
-    let mut directories = Vec::new();
-    for entry in
-        fs::read_dir(&music).map_err(|source| io_error("read Music directory", &music, source))?
-    {
-        let entry = entry.map_err(|source| io_error("read Music entry", &music, source))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if entry.file_type().is_ok_and(|kind| kind.is_dir())
-            && name.len() == 3
-            && name.starts_with('F')
-            && name[1..]
-                .chars()
-                .all(|character| character.is_ascii_digit())
-        {
-            directories.push(entry.path());
-        }
-    }
-    directories.sort();
-    if directories.is_empty() {
-        return Err(Error::Unsupported {
-            feature: "media allocation",
-            reason: "the device has no Music/Fxx media directories".to_owned(),
-        });
-    }
-    let directory = directories
-        .into_iter()
-        .min_by_key(|path| fs::read_dir(path).map_or(usize::MAX, std::iter::Iterator::count))
-        .ok_or_else(|| Error::Verification {
-            format: "media allocation",
-            reason: "no media directory could be selected".to_owned(),
-        })?;
-    let folder = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::Verification {
-            format: "media allocation",
-            reason: "media directory name is not UTF-8".to_owned(),
-        })?
-        .to_owned();
-    let existing: BTreeSet<String> = fs::read_dir(&directory)
-        .map_err(|source| io_error("read media directory", &directory, source))?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .map(|name| name.to_ascii_uppercase())
-        .collect();
-    let extension = source_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("mp3")
-        .to_ascii_lowercase();
-    if extension != "mp3" {
-        return Err(Error::Unsupported {
-            feature: "media allocation",
-            reason: "only MP3 sources are supported by the first addition gate".to_owned(),
-        });
-    }
-    let mut name = None;
-    for _ in 0..64 {
-        let candidate = random_media_name();
-        if !existing.contains(&candidate) {
-            name = Some(candidate);
-            break;
-        }
-    }
-    let name = name.ok_or_else(|| Error::Verification {
-        format: "media allocation",
-        reason: "could not find a free media filename".to_owned(),
-    })?;
-    let staged_dir = destination.join("iPod_Control").join("Music").join(&folder);
-    fs::create_dir_all(&staged_dir)
-        .map_err(|source| io_error("create staged media directory", &staged_dir, source))?;
-    let file_name = format!("{name}.{extension}");
-    let staged_file = staged_dir.join(&file_name);
-    fs::copy(source_path, &staged_file)
-        .map_err(|source| io_error("stage media file", &staged_file, source))?;
-    let (expected_bytes, expected_digest) = fingerprint_host_file(source_path)?;
-    let (actual_bytes, actual_digest) = fingerprint_host_file(&staged_file)?;
-    if actual_bytes != expected_bytes || actual_digest != expected_digest {
-        let _ = fs::remove_file(&staged_file);
-        return Err(Error::Verification {
-            format: "staged media file",
-            reason: "staged copy did not verify against its source".to_owned(),
-        });
-    }
-    if actual_bytes == 0 {
-        let _ = fs::remove_file(&staged_file);
-        return Err(Error::Verification {
-            format: "staged media file",
-            reason: "the source audio file is empty".to_owned(),
-        });
-    }
-    Ok((
-        format!("{folder}/{file_name}"),
-        format!("iPod_Control/Music/{folder}/{file_name}"),
-    ))
-}
-
-fn random_media_name() -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut output = String::with_capacity(4);
-    for _ in 0..4 {
-        output.push(char::from(
-            ALPHABET[(crate::random::next_u64() % 36) as usize],
-        ));
-    }
-    output
 }
 
 fn generate_unique_pid(existing: &BTreeSet<PersistentId>) -> PersistentId {
@@ -2251,60 +2148,76 @@ fn write_artwork_additions(
 /// Appends the encoded `.ithmb` frames of every addition with new artwork.
 /// Each frame lands at the slot offset fixed during resolution.
 fn write_artwork_frames(
-    device: &Device,
     directory: &Path,
     additions: &[ResolvedAddition],
 ) -> Result<()> {
-    let mut frames = Vec::new();
+    let mut files: BTreeMap<&str, Vec<&ArtworkFrameOut>> = BTreeMap::new();
     for addition in additions {
         if let Some(artwork) = &addition.artwork {
-            frames.extend(artwork.frames.iter().cloned());
+            for frame in &artwork.frames {
+                files.entry(&frame.filename).or_default().push(frame);
+            }
         }
     }
-    if frames.is_empty() {
+    if files.is_empty() {
         return Ok(());
     }
-    for frame in frames {
-        let relative = IpodPath::new(format!("iPod_Control/Artwork/{}", frame.filename))?;
-        let output = directory
-            .join("iPod_Control")
-            .join("Artwork")
-            .join(&frame.filename);
-        // Chain against the already-staged file when present so multiple
-        // additions append into distinct slots.
-        let base = if output.exists() {
-            fs::read(&output)
-                .map_err(|error| io_error("read staged artwork frame", &output, error))?
-        } else if device.mount().contains(&relative)? {
-            let path = device.mount().resolve_existing(&relative)?;
-            fs::read(&path).map_err(|error| io_error("read artwork frame file", &path, error))?
-        } else {
-            Vec::new()
-        };
-        if u64::try_from(base.len()).unwrap_or(u64::MAX) != u64::from(frame.ithmb_offset) {
-            return Err(Error::Verification {
-                format: "staged artwork frames",
-                reason: format!("{} changed since slot allocation", frame.filename),
-            });
-        }
-        let mut updated = base;
-        updated.extend_from_slice(&frame.frame);
-        let output = directory
-            .join("iPod_Control")
-            .join("Artwork")
-            .join(&frame.filename);
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| io_error("create staged artwork directory", parent, error))?;
-        }
-        let mut file = File::create(&output)
-            .map_err(|error| io_error("create staged artwork frame", &output, error))?;
-        file.write_all(&updated)
-            .map_err(|error| io_error("write staged artwork frame", &output, error))?;
-        file.sync_all()
-            .map_err(|error| io_error("flush staged artwork frame", &output, error))?;
+    let original = MountRoot::open(directory.join("original"))?;
+    for (filename, frames) in files {
+        append_artwork_frames(directory, &original, filename, &frames)?;
     }
     Ok(())
+}
+
+/// Copy the verified host prefix once, append only the new slots, and flush
+/// once per format. Do not reread/rewrite the entire growing file per image.
+/// An already-staged (e.g. reindexed) prefix wins over the original snapshot.
+fn append_artwork_frames(
+    directory: &Path,
+    original: &MountRoot,
+    filename: &str,
+    frames: &[&ArtworkFrameOut],
+) -> Result<()> {
+    let relative = IpodPath::new(format!("iPod_Control/Artwork/{filename}"))?;
+    let staging = MountRoot::open(directory)?;
+    for parent in ["iPod_Control", "iPod_Control/Artwork"] {
+        let relative = IpodPath::new(parent)?;
+        if !staging.contains(&relative)? {
+            let path = staging.resolve_possible(&relative)?;
+            fs::create_dir(&path)
+                .map_err(|error| io_error("create staged artwork directory", &path, error))?;
+        }
+    }
+    let output = staging.resolve_possible(&relative)?;
+    let output = if staging.contains(&relative)? {
+        staging.resolve_existing(&relative)?
+    } else {
+        if original.contains(&relative)? {
+            let source = original.resolve_existing(&relative)?;
+            fs::copy(&source, &output)
+                .map_err(|error| io_error("copy host artwork prefix", &output, error))?;
+        }
+        output
+    };
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(&output)
+        .map_err(|error| io_error("open staged artwork frames", &output, error))?;
+    let mut length = file.metadata()
+        .map_err(|error| io_error("inspect staged artwork frames", &output, error))?.len();
+    for frame in frames {
+        if length != u64::from(frame.ithmb_offset) {
+            return Err(Error::Verification {
+                format: "staged artwork frames",
+                reason: format!("{filename} changed since slot allocation"),
+            });
+        }
+        file.write_all(&frame.frame)
+            .map_err(|error| io_error("append staged artwork frame", &output, error))?;
+        length = length.checked_add(u64::try_from(frame.frame.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| Error::Verification {
+                format: "staged artwork frames", reason: "artwork file length overflow".to_owned(),
+            })?;
+    }
+    file.sync_all().map_err(|error| io_error("flush staged artwork frames", &output, error))
 }
 
 /// Maps a resolved addition onto the binary `CdbTrackAddition` used by the
@@ -2589,3 +2502,5 @@ mod classic_tests;
 mod fast_tests;
 #[cfg(test)]
 mod recovery_progress_tests;
+#[cfg(test)]
+mod throughput_tests;

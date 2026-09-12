@@ -236,11 +236,22 @@ pub(crate) fn install_staged_with_progress(
     mode: InstallMode,
     progress: &mut Progress<'_>,
 ) -> Result<()> {
+    install_staged_and_open(device, staged, failure_mode, mode, progress).map(|_| ())
+}
+
+pub(crate) fn install_staged_and_open(
+    device: &Device,
+    staged: &StagedSqliteEdit,
+    failure_mode: FailureMode,
+    mode: InstallMode,
+    progress: &mut Progress<'_>,
+) -> Result<Device> {
     progress(ProgressEvent::Phase("Verifying device before installation"));
     staged
         .source_generation
         .verify_unchanged(device.mount(), device.profile())?;
     let manifest = read_staging_manifest(staged.manifest())?;
+    verify_manifest_generation(staged, &manifest)?;
     let fast_media = fast_media_targets(staged, &manifest, mode)?;
     verify_bundle(device, staged, &manifest, &fast_media, progress)?;
     progress(ProgressEvent::Phase("Checking space and preparing transaction"));
@@ -280,7 +291,7 @@ fn install_inner(
     failure_mode: FailureMode,
     fast_media: &BTreeSet<String>,
     progress: &mut Progress<'_>,
-) -> Result<()> {
+) -> Result<Device> {
     #[cfg(not(test))]
     let _ = failure_mode;
     let backup = transaction.join("backup");
@@ -294,6 +305,7 @@ fn install_inner(
         staging: manifest,
     };
     write_journal(transaction, &journal)?;
+    let host_original = MountRoot::open(staged.directory().join("original"))?;
 
     for (outputs_backed_up, output) in journal.staging.outputs.iter().enumerate() {
         progress(ProgressEvent::Item {
@@ -303,15 +315,20 @@ fn install_inner(
         let original = original_state(&journal.staging, output)?;
         match (original.bytes, original.sha256.as_deref()) {
             (Some(bytes), Some(digest)) => {
-                let target = resolve_target(device.mount(), output)?;
-                verify_file(&target, bytes, digest, "live transaction input")?;
+                // Staging already made a verified host snapshot of this
+                // generation. Read it from the host rather than rereading
+                // the live USB file twice (hash, then copy). The on-device
+                // backup is still flushed and fully read back below, and the
+                // whole live generation is rechecked before installation.
+                let relative = IpodPath::new(output.target.clone())?;
+                let source = host_original.resolve_existing(&relative)?;
                 let backup_file = backup.join(&output.staged);
                 if let Some(parent) = backup_file.parent() {
                     fs::create_dir_all(parent).map_err(|source| {
                         io_error("create transaction backup parent", parent, source)
                     })?;
                 }
-                copy_new_verified(&target, &backup_file, bytes, digest)?;
+                copy_new_verified(&source, &backup_file, bytes, digest)?;
             }
             (None, None) => {
                 let relative = IpodPath::new(output.target.clone())?;
@@ -470,7 +487,9 @@ fn install_inner(
     }
     progress(ProgressEvent::Phase("Finalizing transaction"));
     remove_transaction_directory(transaction)?;
-    Ok(())
+    // This handle already contains the verified installed library and its
+    // freshly captured generation; reopening it would repeat all those reads.
+    Ok(reopened)
 }
 
 #[cfg(test)]
@@ -757,9 +776,12 @@ fn validate_recovery_state(
                     let backup = transaction.join("backup").join(&output.staged);
                     verify_file(&backup, original_bytes, original_digest, "recovery backup")?;
                 }
-                let original_matches =
-                    fingerprint_matches(&target, original_bytes, original_digest)?;
-                let output_matches = fingerprint_matches(&target, output.bytes, &output.sha256)?;
+                // Compare one live fingerprint with both permitted states,
+                // rather than hashing the same potentially huge file twice.
+                let (actual_bytes, actual_digest) = fingerprint_host_file(&target)?;
+                let actual_digest = hex(&actual_digest);
+                let original_matches = actual_bytes == original_bytes && actual_digest == original_digest;
+                let output_matches = actual_bytes == output.bytes && actual_digest == output.sha256;
                 let may_be_output = index < journal.installed;
                 if (!(original_matches || may_be_output && output_matches))
                     || (journal.phase == TransactionPhase::Committed && !output_matches)
@@ -862,6 +884,36 @@ fn verify_bundle(
             verify_file_size(&path, output.bytes, "staged media")?;
         } else {
             verify_file(&path, output.bytes, &output.sha256, "staging bundle output")?;
+        }
+    }
+    Ok(())
+}
+
+/// Bind disk-manifest inputs to the in-memory generation already checked
+/// against the live device. Otherwise a changed host snapshot plus a changed
+/// manifest digest could falsely pass backup verification.
+fn verify_manifest_generation(staged: &StagedSqliteEdit, manifest: &StagingManifest) -> Result<()> {
+    let invalid = || Error::Verification {
+        format: "staging manifest",
+        reason: "source fingerprints do not match the staged device generation".to_owned(),
+    };
+    let mut expected: std::collections::BTreeMap<_, _> = staged.source_generation.files().iter()
+        .map(|file| (file.path().as_str(), (file.bytes(), file.sha256().map(|digest| hex(digest)))))
+        .collect();
+    for media in staged.added_media() {
+        if expected.insert(media.as_str(), (None, None)).is_some() {
+            return Err(invalid());
+        }
+    }
+    if manifest.source.len() != expected.len() {
+        return Err(invalid());
+    }
+    for source in &manifest.source {
+        let (bytes, digest) = expected.remove(source.path.as_str()).ok_or_else(invalid)?;
+        if source.bytes != bytes || source.sha256 != digest || source.present != bytes.is_some()
+            || source.backup != bytes.map(|_| format!("original/{}", source.path))
+        {
+            return Err(invalid());
         }
     }
     Ok(())
