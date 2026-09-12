@@ -1226,6 +1226,7 @@ fn build_mhit(
     if addition.media_kind == crate::MediaKind::Podcast {
         header[MHIT_SKIP_WHEN_SHUFFLING] = 1;
         header[MHIT_REMEMBER_PLAYBACK_POSITION] = 1;
+        header[0xa7] = 1; // use podcast Now Playing presentation
         header[MHIT_MARK_UNPLAYED] = 2;
     }
     write_u32(
@@ -1410,6 +1411,7 @@ mod tests {
         );
         assert_eq!(mhit[MHIT_SKIP_WHEN_SHUFFLING], 1);
         assert_eq!(mhit[MHIT_REMEMBER_PLAYBACK_POSITION], 1);
+        assert_eq!(mhit[0xa7], 1);
         assert_eq!(mhit[MHIT_MARK_UNPLAYED], 2);
         assert_eq!(read_u32(&mhit, MHIT_MEDIA_TYPE).unwrap(), 4);
     }

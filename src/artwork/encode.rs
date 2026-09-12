@@ -105,6 +105,19 @@ pub(crate) const NANO3G_COVER_FORMATS: [Nano7gFormat; 4] = [
     },
 ];
 
+/// Classic 6G/6.5G/7G formats (iOpenPod and libgpod device tables).
+/// F1061 has 56 rows, not the Nano 3G's measured 55 rows.
+const CLASSIC_COVER_FORMATS: [Nano7gFormat; 4] = [
+    Nano7gFormat {
+        width: 56,
+        height: 56,
+        ..NANO3G_COVER_FORMATS[0]
+    },
+    NANO3G_COVER_FORMATS[1],
+    NANO3G_COVER_FORMATS[2],
+    NANO3G_COVER_FORMATS[3],
+];
+
 /// Nano 4G cover-art formats from Apple's device profile and libgpod's static
 /// format table. These are not interchangeable with the Nano 3G formats.
 pub(crate) const NANO4G_COVER_FORMATS: [Nano7gFormat; 6] = [
@@ -171,6 +184,9 @@ pub(crate) fn encode_classic_frames(source: &[u8], profile_key: &str) -> Result<
     match profile_key {
         "nano-3g" => encode_frames(source, &NANO3G_COVER_FORMATS),
         "nano-4g" => encode_frames(source, &NANO4G_COVER_FORMATS),
+        "classic" | "classic-6g" | "classic-6.5g" | "classic-7g" => {
+            encode_frames(source, &CLASSIC_COVER_FORMATS)
+        }
         _ => Err(Error::Unsupported {
             feature: "classic artwork encoding",
             reason: format!("profile {profile_key} has no artwork encoder"),
@@ -252,6 +268,33 @@ mod tests {
         .unwrap();
         let _ = red;
         buffer
+    }
+
+    #[test]
+    fn encodes_classic_formats_without_the_nano3_short_frame() {
+        let png = make_rgb_image(64, 64, 200);
+        for key in ["classic", "classic-6g", "classic-6.5g", "classic-7g"] {
+            let frames = encode_classic_frames(&png, key).unwrap();
+            let actual: Vec<_> = frames
+                .iter()
+                .map(|f| (f.format_id, f.slot_bytes()))
+                .collect();
+            assert_eq!(
+                actual,
+                vec![
+                    (1061, 6_272),
+                    (1055, 32_768),
+                    (1068, 32_768),
+                    (1060, 204_800)
+                ]
+            );
+            assert_eq!((frames[0].width, frames[0].height), (56, 56));
+            for frame in frames {
+                assert_eq!(frame.rgb565.len() as u64, frame.slot_bytes());
+            }
+        }
+        let nano = encode_classic_frames(&png, "nano-3g").unwrap();
+        assert_eq!(nano[0].slot_bytes(), 6_160);
     }
 
     #[test]

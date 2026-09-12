@@ -73,6 +73,7 @@ pub struct ClassicPlaylist {
     pub name: String,
     pub is_hidden: bool,
     pub is_smart: bool,
+    pub is_podcast: bool,
     pub track_ids: Vec<u32>,
 }
 
@@ -115,6 +116,18 @@ pub fn parse_library(itunesdb: &[u8], artworkdb: Option<&[u8]>) -> Result<Classi
             1 => tracks.extend(parse_track_dataset(dataset, &artwork_tracks)?),
             2 => playlists.extend(parse_playlist_dataset(dataset)?),
             _ => {}
+        }
+    }
+    // Some writers store the special Podcasts playlist only in dataset 3.
+    // Prefer the flat dataset-2 view when both exist; group headers are not
+    // tracks and must never leak into the normalized membership list.
+    for dataset in &datasets {
+        if read_u32(dataset, 12)? == 3 {
+            for playlist in parse_playlist_dataset(dataset)? {
+                if playlist.is_podcast && !playlists.iter().any(|p| p.id == playlist.id) {
+                    playlists.push(playlist);
+                }
+            }
         }
     }
     Ok(ClassicLibrary { tracks, playlists })
@@ -283,7 +296,10 @@ fn parse_playlist(chunk: &[u8], _index: usize) -> Result<ClassicPlaylist> {
     }
     for _ in 0..mhip_count {
         let mhip = chunk_header(chunk, offset, b"mhip")?;
-        track_ids.push(read_u32(chunk, offset + MHIP_TRACK_ID)?);
+        let track_id = read_u32(chunk, offset + MHIP_TRACK_ID)?;
+        if track_id != 0 {
+            track_ids.push(track_id);
+        }
         offset = mhip.end;
     }
     if offset != chunk.len() {
@@ -294,6 +310,7 @@ fn parse_playlist(chunk: &[u8], _index: usize) -> Result<ClassicPlaylist> {
         name,
         is_hidden: chunk[MHYP_KIND] != 0,
         is_smart,
+        is_podcast: header.header_length >= 0x2c && chunk[0x2a] & 1 != 0,
         track_ids,
     })
 }

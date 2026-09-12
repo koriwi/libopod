@@ -72,14 +72,23 @@ impl DeviceProfile {
         &self.capabilities
     }
 
+    /// Whether the writer supports podcast tracks and their special container.
+    #[must_use]
+    pub fn supports_podcasts(&self) -> bool {
+        matches!(
+            self.key,
+            "nano-7g" | "classic" | "classic-6g" | "classic-6.5g" | "classic-7g"
+        )
+    }
+
     /// Reports whether the known profile has the signing evidence needed for a
     /// future write. This does not imply that write support is implemented.
     #[must_use]
     pub fn has_required_signing_identity(&self, evidence: &IdentityEvidence) -> bool {
         match self.capabilities.checksum {
-            ChecksumKind::HashAb => evidence.firewire_guid().is_some(),
+            ChecksumKind::HashAb | ChecksumKind::Hash58 => evidence.firewire_guid().is_some(),
             ChecksumKind::Hash72 => false,
-            ChecksumKind::None | ChecksumKind::Hash58 => true,
+            ChecksumKind::None => true,
         }
     }
 }
@@ -127,6 +136,9 @@ fn nano_generation(evidence: &IdentityEvidence) -> Option<u8> {
 }
 
 pub(crate) fn resolve(evidence: &IdentityEvidence) -> Result<Option<DeviceProfile>> {
+    if let Some(profile) = resolve_classic(evidence)? {
+        return Ok(Some(profile));
+    }
     let family = evidence
         .model_family()
         .map(|value| value.value.to_ascii_lowercase());
@@ -188,6 +200,93 @@ pub(crate) fn resolve(evidence: &IdentityEvidence) -> Result<Option<DeviceProfil
     Ok(Some(profile))
 }
 
+/// Model numbers and the shared normal-mode PID follow iOpenPod's device
+/// table. Apple calls the 2009 160 GB Classic "revision B"; the community
+/// calls it 7G. A1238 and USB PID 0x1261 alone do NOT identify the revision.
+fn resolve_classic(evidence: &IdentityEvidence) -> Result<Option<DeviceProfile>> {
+    let family = evidence
+        .model_family()
+        .map(|v| v.value.to_ascii_lowercase());
+    let named_classic = family.as_deref().is_some_and(|v| v.contains("classic"));
+    let pid = evidence.usb_product_id().map(|v| v.value);
+    let model_revision = evidence.model_number().and_then(|v| {
+        let model = v.value.trim().to_ascii_uppercase();
+        let model = model.strip_prefix('M').unwrap_or(&model);
+        match model.get(..4)? {
+            "B029" | "B147" | "B145" | "B150" => Some("classic-6g"),
+            "B562" | "B565" => Some("classic-6.5g"),
+            "C293" | "C297" => Some("classic-7g"),
+            _ => None,
+        }
+    });
+    if !named_classic && pid != Some(0x1261) && model_revision.is_none() {
+        return Ok(None);
+    }
+    if family
+        .as_deref()
+        .is_some_and(|v| !v.contains("classic") && v != "ipod")
+        || pid.is_some_and(|pid| NANO_PRODUCT_IDS.iter().any(|(id, _)| *id == pid))
+        || evidence
+            .family_id_value()
+            .is_some_and(|v| NANO_FAMILY_IDS.iter().any(|(id, _)| *id == v.value))
+        || evidence.sqlite_db().is_some_and(|v| v.value)
+    {
+        return Err(Error::ConflictingEvidence {
+            reason: "Classic identity conflicts with device family or database evidence".to_owned(),
+        });
+    }
+    let named_revision = if named_classic {
+        evidence.generation().and_then(|v| {
+            let generation = v.value.to_ascii_lowercase();
+            if generation.contains("rev b")
+                || generation.contains("revision b")
+                || generation.starts_with('7')
+            {
+                Some("classic-7g")
+            } else if generation.starts_with("6.5") {
+                Some("classic-6.5g")
+            } else if generation.starts_with('6') {
+                Some("classic-6g")
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    if model_revision
+        .zip(named_revision)
+        .is_some_and(|(a, b)| a != b)
+    {
+        return Err(Error::ConflictingEvidence {
+            reason: "Classic model number and generation disagree".to_owned(),
+        });
+    }
+    let key = model_revision.or(named_revision).unwrap_or("classic");
+    let display_name = match key {
+        "classic-6g" => "iPod Classic (6th generation)",
+        "classic-6.5g" => "iPod Classic (120 GB, revision A)",
+        "classic-7g" => "iPod Classic (160 GB, revision B / 7th generation)",
+        _ => "iPod Classic (revision unknown)",
+    };
+    Ok(Some(binary_profile(
+        key,
+        display_name,
+        ChecksumKind::Hash58,
+        0x30,
+        50,
+        classic_cover_formats(),
+    )))
+}
+
+/// Classic F1061 is 56x56, unlike the measured Nano 3G 55x55 format.
+/// The remaining cover formats have the same dimensions on both devices.
+fn classic_cover_formats() -> Vec<ArtworkFormatProfile> {
+    let mut formats = nano_3g_cover_formats();
+    formats[0].slot_bytes = 6_272;
+    formats
+}
+
 fn nano_7g() -> DeviceProfile {
     DeviceProfile {
         key: "nano-7g",
@@ -221,14 +320,13 @@ fn nano_7g() -> DeviceProfile {
     }
 }
 
-/// Classic Nano 1–4 profile: uncompressed binary `iTunesDB`, no `SQLite`, and
-/// artwork preserved when present. Nano 3G/4G have qualified writable cover
-/// formats; Nano 1G/2G artwork writing remains unimplemented.
+/// Uncompressed binary `iTunesDB` profile, without `SQLite`.
+/// Nano 1G/2G artwork writing remains unimplemented.
 ///
 /// Covers the signing matrix entry NONE for Nano 1–2G and HASH58 for
 /// Nano 3–4G. `cdb_version` matches the device's `mhbd` version field
 /// (Nano 1–2G 0x13, Nano 3–4G 0x30).
-fn classic_nano(
+fn binary_profile(
     key: &'static str,
     display_name: &'static str,
     checksum: ChecksumKind,
@@ -306,7 +404,7 @@ fn nano_4g_cover_formats() -> Vec<ArtworkFormatProfile> {
 }
 
 fn nano_1g() -> DeviceProfile {
-    classic_nano(
+    binary_profile(
         "nano-1g",
         "iPod Nano (1st generation)",
         ChecksumKind::None,
@@ -317,7 +415,7 @@ fn nano_1g() -> DeviceProfile {
 }
 
 fn nano_2g() -> DeviceProfile {
-    classic_nano(
+    binary_profile(
         "nano-2g",
         "iPod Nano (2nd generation)",
         ChecksumKind::None,
@@ -328,7 +426,7 @@ fn nano_2g() -> DeviceProfile {
 }
 
 fn nano_3g() -> DeviceProfile {
-    classic_nano(
+    binary_profile(
         "nano-3g",
         "iPod Nano (3rd generation)",
         ChecksumKind::Hash58,
@@ -339,7 +437,7 @@ fn nano_3g() -> DeviceProfile {
 }
 
 fn nano_4g() -> DeviceProfile {
-    classic_nano(
+    binary_profile(
         "nano-4g",
         "iPod Nano (4th generation)",
         ChecksumKind::Hash58,
@@ -352,6 +450,113 @@ fn nano_4g() -> DeviceProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn device_with_identity(sysinfo: &str, extended: Option<&str>) -> Result<crate::Device> {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("iPod_Control/Device");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("SysInfo"), sysinfo).unwrap();
+        if let Some(xml) = extended {
+            std::fs::write(root.join("SysInfoExtended"), xml).unwrap();
+        }
+        crate::Device::open(directory.path())
+    }
+
+    #[test]
+    fn detects_classic_revision_b_model_numbers_and_names() {
+        for identity in [
+            "ModelNumStr: MC293LL/A",
+            "ModelNumStr: C297",
+            "ModelNumStr: mc297zd/a",
+            "ModelFamily: iPod Classic\nGeneration: 7th Gen",
+            "ModelFamily: Classic\nGeneration: 6th generation revision B",
+        ] {
+            let device = device_with_identity(identity, None).unwrap();
+            let profile = device.profile().unwrap();
+            assert_eq!(profile.key(), "classic-7g", "{identity}");
+            let caps = profile.capabilities();
+            assert_eq!(caps.backend, BackendKind::Binary);
+            assert_eq!(caps.checksum, ChecksumKind::Hash58);
+            assert_eq!(caps.music_directories, 50);
+            assert_eq!(caps.cdb_version, 0x30);
+            assert!(!caps.compressed_cdb);
+            assert!(caps.supports_artwork());
+            assert_eq!(caps.artwork_formats[0].slot_bytes, 6_272);
+            assert!(!profile.has_required_signing_identity(device.evidence()));
+        }
+        let device = device_with_identity("", Some(
+            "<plist version=\"1.0\"><dict><key>ModelNumStr</key><string>MC293LL/A</string><key>FireWireGUID</key><string>0123456789abcdef</string></dict></plist>"
+        )).unwrap();
+        let profile = device.profile().unwrap();
+        assert_eq!(profile.key(), "classic-7g");
+        assert!(profile.has_required_signing_identity(device.evidence()));
+    }
+
+    #[test]
+    fn shared_classic_usb_id_does_not_claim_a_revision() {
+        for identity in [
+            "USBProductID: 0x1261",
+            "ModelNumStr: A1238\nUSBProductID: 4705",
+            "ModelFamily: iPod Classic",
+        ] {
+            let device = device_with_identity(identity, None).unwrap();
+            assert_eq!(device.profile().unwrap().key(), "classic");
+        }
+        assert!(device_with_identity("ModelNumStr: A1238", None)
+            .unwrap()
+            .profile()
+            .is_none());
+        for (model, key) in [
+            ("MB029", "classic-6g"),
+            ("MB150", "classic-6g"),
+            ("MB562", "classic-6.5g"),
+            ("B565", "classic-6.5g"),
+        ] {
+            let device =
+                device_with_identity(&format!("ModelNumStr: {model}\nUSBProductID: 0x1261"), None)
+                    .unwrap();
+            assert_eq!(device.profile().unwrap().key(), key);
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_classic_identity() {
+        for identity in [
+            "ModelFamily: iPod Nano\nUSBProductID: 0x1261",
+            "ModelFamily: iPod Classic\nUSBProductID: 0x1267",
+            "ModelNumStr: MC293\nUSBProductID: 0x1262",
+            "ModelNumStr: MC297\nModelFamily: iPod Classic\nGeneration: 6th Gen",
+        ] {
+            assert!(
+                matches!(
+                    device_with_identity(identity, None),
+                    Err(Error::ConflictingEvidence { .. })
+                ),
+                "{identity}"
+            );
+        }
+        assert!(matches!(
+            device_with_identity(
+                "ModelNumStr: MC293",
+                Some("<plist version=\"1.0\"><dict><key>SQLiteDB</key><true/></dict></plist>")
+            ),
+            Err(Error::ConflictingEvidence { .. })
+        ));
+        let nano = device_with_identity(
+            "ModelFamily: iPod Nano\nGeneration: 7th Gen\nUSBProductID: 0x1267",
+            None,
+        )
+        .unwrap();
+        assert_eq!(nano.profile().unwrap().key(), "nano-7g");
+    }
+
+    #[test]
+    fn podcast_support_excludes_unimplemented_nano_profiles() {
+        assert!(nano_7g().supports_podcasts());
+        for profile in [nano_1g(), nano_2g(), nano_3g(), nano_4g()] {
+            assert!(!profile.supports_podcasts());
+        }
+    }
 
     #[test]
     fn artwork_support_matches_the_device_family() {

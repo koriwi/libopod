@@ -3,9 +3,12 @@ mod commit;
 mod generation;
 mod manifest;
 mod playlist;
+mod progress;
 pub(crate) mod sort;
 
 pub use generation::{FileFingerprint, GenerationFingerprint};
+pub use progress::ProgressEvent;
+use progress::Progress;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -484,11 +487,11 @@ impl<'device> EditSession<'device> {
             });
         }
         if track.media_kind == MediaKind::Podcast
-            && self.device.profile().map(crate::DeviceProfile::key) != Some("nano-7g")
+            && !self.device.profile().is_some_and(crate::DeviceProfile::supports_podcasts)
         {
             return Err(Error::Unsupported {
                 feature: "podcast addition",
-                reason: "podcasts are currently qualified only for the Nano 7G profile".to_owned(),
+                reason: "podcast writes are supported only on Classic and Nano 7G profiles".to_owned(),
             });
         }
         if track.title.trim().is_empty() || track.sample_rate == 0 {
@@ -529,30 +532,45 @@ impl<'device> EditSession<'device> {
     /// inside the opened mount, required schemas differ, a database operation
     /// fails, or output validation fails.
     pub fn stage_sqlite_preview(&self, destination: impl AsRef<Path>) -> Result<StagedSqliteEdit> {
+        self.stage_sqlite_preview_with_progress(destination, |_| {})
+    }
+
+    /// Stages an edit with synchronous, opt-in progress observations.
+    /// See [`ProgressEvent`] for callback and counter semantics. This works
+    /// with both binary and `SQLite` devices and never prints to the terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::stage_sqlite_preview`].
+    pub fn stage_sqlite_preview_with_progress(
+        &self,
+        destination: impl AsRef<Path>,
+        mut progress: impl FnMut(ProgressEvent<'_>),
+    ) -> Result<StagedSqliteEdit> {
         if self.removals.is_empty() && self.additions.is_empty() && self.playlist_edits.is_empty() {
             return Err(Error::Unsupported {
                 feature: "empty edit preview",
                 reason: "queue at least one track or playlist edit before staging".to_owned(),
             });
         }
-        self.stage_preview(destination.as_ref())
+        self.stage_preview(destination.as_ref(), &mut progress)
     }
 
     pub(crate) fn stage_noop_preview(
         &self,
         destination: impl AsRef<Path>,
     ) -> Result<StagedSqliteEdit> {
-        self.stage_preview(destination.as_ref())
+        self.stage_preview(destination.as_ref(), &mut |_| {})
     }
 
-    fn stage_preview(&self, destination: &Path) -> Result<StagedSqliteEdit> {
+    fn stage_preview(&self, destination: &Path, progress: &mut Progress<'_>) -> Result<StagedSqliteEdit> {
         match self
             .device
             .profile()
             .map(|profile| profile.capabilities().backend)
         {
-            Some(BackendKind::SqliteWithBinaryCompanion) => self.stage_sqlite(destination),
-            Some(BackendKind::Binary) => self.stage_classic(destination),
+            Some(BackendKind::SqliteWithBinaryCompanion) => self.stage_sqlite(destination, progress),
+            Some(BackendKind::Binary) => self.stage_classic(destination, progress),
             None => Err(Error::Unsupported {
                 feature: "edit staging",
                 reason: "the device profile is unknown".to_owned(),
@@ -564,12 +582,13 @@ impl<'device> EditSession<'device> {
     /// the queued removals/additions, re-signs with the profile scheme, and
     /// writes a manifest whose only output is the `iTunesDB`.
     #[allow(clippy::too_many_lines)]
-    fn stage_classic(&self, destination: &Path) -> Result<StagedSqliteEdit> {
+    fn stage_classic(&self, destination: &Path, progress: &mut Progress<'_>) -> Result<StagedSqliteEdit> {
+        progress(ProgressEvent::Phase("Verifying source databases"));
         self.device
             .generation()
             .verify_unchanged(self.device.mount(), self.device.profile())?;
         let destination = validate_destination(self.device, destination)?;
-        back_up_generation(self.device, &destination, self.device.generation())?;
+        back_up_generation(self.device, &destination, self.device.generation(), progress)?;
 
         let profile = self.device.profile().ok_or_else(|| Error::Unsupported {
             feature: "classic staging",
@@ -586,8 +605,9 @@ impl<'device> EditSession<'device> {
             feature: "classic staging",
             reason: "the classic iTunesDB library is unavailable".to_owned(),
         })?;
-        let resolved = self.resolve_additions(&destination)?;
+        let resolved = self.resolve_additions(&destination, progress)?;
         if !self.removals.is_empty() {
+            progress(ProgressEvent::Phase("Removing tracks from iTunesDB"));
             let removals: Vec<PersistentId> = self.removals.iter().copied().collect();
             database = crate::storage::binary::remove_classic_tracks(
                 &database,
@@ -596,7 +616,11 @@ impl<'device> EditSession<'device> {
                 &removals,
             )?;
         }
-        for addition in &resolved {
+        for (index, addition) in resolved.iter().enumerate() {
+            progress(ProgressEvent::Item {
+                operation: "Updating iTunesDB", current: index + 1, total: resolved.len(),
+                name: &addition.title,
+            });
             database = crate::storage::binary::add_classic_track(
                 &database,
                 checksum,
@@ -605,6 +629,7 @@ impl<'device> EditSession<'device> {
             )?;
         }
         if !self.playlist_edits.is_empty() {
+            progress(ProgressEvent::Phase("Updating playlists"));
             if self.playlist_edits.values().any(|edit| match edit {
                 PlaylistEdit::Create { track_ids, .. }
                 | PlaylistEdit::Update {
@@ -641,10 +666,25 @@ impl<'device> EditSession<'device> {
                 .collect::<Vec<_>>();
             database = edit_classic_playlists(&database, checksum, guid.as_ref(), &mutations)?;
         }
+        // The Classic firmware needs a flagged Podcasts playlist as well as
+        // media-kind fields on the tracks. Rebuild show groups after removals
+        // too, so no empty or dangling podcast group headers survive.
+        if profile.supports_podcasts()
+            && (resolved.iter().any(|track| track.media_kind == MediaKind::Podcast)
+                || before.tracks().iter().any(|track| {
+                    track.media_kind == MediaKind::Podcast && self.removals.contains(&track.id)
+                }))
+        {
+            progress(ProgressEvent::Phase("Updating podcast show groups"));
+            database = crate::storage::binary::sync_classic_podcasts(
+                &database, checksum, guid.as_ref(),
+            )?;
+        }
         // Classic artwork uses the same mhfd ArtworkDB and fixed-slot ithmb
         // files as the Nano 7G: removals drop records and reindex slots,
         // additions append records and frames. Nano 1G/2G artwork writing is
         // not implemented, so their edits must leave ArtworkDB untouched.
+        progress(ProgressEvent::Phase("Updating artwork database and thumbnails"));
         let artwork_supported = profile.capabilities().supports_artwork();
         if !self.removals.is_empty() && artwork_supported {
             write_artwork_preview(self.device, &destination, &self.removals)?;
@@ -654,6 +694,7 @@ impl<'device> EditSession<'device> {
             write_artwork_frames(self.device, &destination, &resolved)?;
         }
 
+        progress(ProgressEvent::Phase("Writing and verifying staged iTunesDB"));
         let output = destination.join("iTunesDB");
         write_file_sync(&output, &database)?;
         let staged_bytes = fs::read(&output)
@@ -678,6 +719,7 @@ impl<'device> EditSession<'device> {
                 });
             }
         }
+        progress(ProgressEvent::Phase("Verifying source and preparing staging manifest"));
         self.device
             .generation()
             .verify_unchanged(self.device.mount(), self.device.profile())?;
@@ -743,30 +785,34 @@ impl<'device> EditSession<'device> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn stage_sqlite(&self, destination: &Path) -> Result<StagedSqliteEdit> {
+    fn stage_sqlite(&self, destination: &Path, progress: &mut Progress<'_>) -> Result<StagedSqliteEdit> {
+        progress(ProgressEvent::Phase("Verifying source databases"));
         self.device
             .generation()
             .verify_unchanged(self.device.mount(), self.device.profile())?;
         let destination = validate_destination(self.device, destination)?;
-        back_up_generation(self.device, &destination, self.device.generation())?;
+        back_up_generation(self.device, &destination, self.device.generation(), progress)?;
         let source = self
             .device
             .mount()
             .resolve_existing(&IpodPath::new(ITLP_PATH)?)?;
+        progress(ProgressEvent::Phase("Copying SQLite databases to staging"));
         copy_sqlite_set(&source, &destination)?;
 
         let before = self.device.library().ok_or_else(|| Error::Unsupported {
             feature: "SQLite staging",
             reason: "the source library is unavailable".to_owned(),
         })?;
-        let resolved = self.resolve_additions(&destination)?;
+        let resolved = self.resolve_additions(&destination, progress)?;
         if !self.removals.is_empty() {
+            progress(ProgressEvent::Phase("Removing tracks from SQLite databases"));
             edit_staged_databases(&destination, &self.removals)?;
         }
         if !resolved.is_empty() {
-            add_tracks_to_staged_databases(&destination, &resolved)?;
+            add_tracks_to_staged_databases(&destination, &resolved, progress)?;
         }
         if !self.playlist_edits.is_empty() {
+            progress(ProgressEvent::Phase("Updating playlists"));
             edit_staged_playlists(&destination, &self.playlist_edits)?;
         }
 
@@ -781,25 +827,30 @@ impl<'device> EditSession<'device> {
         if self.removals.is_empty() && resolved.is_empty() {
             copy_unchanged_companions(&source, self.device, &destination)?;
         } else {
+            progress(ProgressEvent::Phase("Signing SQLite companion files"));
             write_and_verify_cbk(&destination, guid)?;
             let artwork_supported = self
                 .device
                 .profile()
                 .is_some_and(|profile| profile.capabilities().supports_artwork());
             if !self.removals.is_empty() {
+                progress(ProgressEvent::Phase("Removing tracks from binary companion"));
                 write_cdb_preview(self.device, &destination, guid, &self.removals)?;
                 if artwork_supported {
+                    progress(ProgressEvent::Phase("Reindexing artwork and thumbnails"));
                     write_artwork_preview(self.device, &destination, &self.removals)?;
                 }
             }
             if !resolved.is_empty() {
-                write_cdb_additions(self.device, &destination, guid, &resolved)?;
+                write_cdb_additions(self.device, &destination, guid, &resolved, progress)?;
+                progress(ProgressEvent::Phase("Updating artwork database and thumbnails"));
                 if artwork_supported {
                     write_artwork_additions(self.device, &destination, &resolved)?;
                     write_artwork_frames(self.device, &destination, &resolved)?;
                 }
             }
         }
+        progress(ProgressEvent::Phase("Verifying staged databases"));
         validate_staged_set(&destination)?;
 
         let after = Library::read_sqlite(
@@ -813,6 +864,7 @@ impl<'device> EditSession<'device> {
             &resolved,
             &self.playlist_edits,
         )?;
+        progress(ProgressEvent::Phase("Verifying source and preparing staging manifest"));
         self.device
             .generation()
             .verify_unchanged(self.device.mount(), self.device.profile())?;
@@ -879,7 +931,7 @@ impl<'device> EditSession<'device> {
     /// Allocates media paths, stages copies of each source file, and assigns
     /// persistent IDs and timestamps for every queued addition.
     #[allow(clippy::too_many_lines)]
-    fn resolve_additions(&self, destination: &Path) -> Result<Vec<ResolvedAddition>> {
+    fn resolve_additions(&self, destination: &Path, progress: &mut Progress<'_>) -> Result<Vec<ResolvedAddition>> {
         if self.additions.is_empty() {
             return Ok(Vec::new());
         }
@@ -929,7 +981,11 @@ impl<'device> EditSession<'device> {
         } else {
             100
         };
-        for track in &self.additions {
+        for (index, track) in self.additions.iter().enumerate() {
+            progress(ProgressEvent::Item {
+                operation: "Staging audio and artwork", current: index + 1, total: self.additions.len(),
+                name: &track.title,
+            });
             let (media_relative, _staged_path) =
                 allocate_media_path(self.device, destination, &track.source_path)?;
             let metadata = fs::metadata(&track.source_path)
@@ -1027,7 +1083,24 @@ impl StagedSqliteEdit {
     /// edit, or any filesystem operation fails. On error the transaction is
     /// rolled back from its on-device backup.
     pub fn install(&self, device: &Device) -> Result<()> {
-        self::commit::install_staged_removal(device, self, self::commit::FailureMode::RollBack)
+        self.install_with_progress(device, |_| {})
+    }
+
+    /// Installs this bundle with synchronous progress observations.
+    /// See [`ProgressEvent`] for callback semantics. Transaction safeguards
+    /// and recovery behavior are identical to [`Self::install`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::install`].
+    pub fn install_with_progress(
+        &self,
+        device: &Device,
+        mut progress: impl FnMut(ProgressEvent<'_>),
+    ) -> Result<()> {
+        self::commit::install_staged_with_progress(
+            device, self, self::commit::FailureMode::RollBack, &mut progress,
+        )
     }
 
     /// Returns the host directory containing staged database files.
@@ -1911,11 +1984,16 @@ fn write_cdb_additions(
     directory: &Path,
     guid: [u8; 8],
     additions: &[ResolvedAddition],
+    progress: &mut Progress<'_>,
 ) -> Result<()> {
     let relative = IpodPath::new("iPod_Control/iTunes/iTunesCDB")?;
     let source = device.mount().resolve_existing(&relative)?;
     let mut bytes = read_limited(&source, MAX_CDB_BYTES, "iTunesCDB")?;
-    for addition in additions {
+    for (index, addition) in additions.iter().enumerate() {
+        progress(ProgressEvent::Item {
+            operation: "Updating binary companion", current: index + 1, total: additions.len(),
+            name: &addition.title,
+        });
         let cdb_addition = CdbTrackAddition {
             persistent_id: addition.pid,
             location: format!(":iPod_Control:Music:{}", addition.media_relative),
@@ -1980,6 +2058,10 @@ fn write_artwork_preview(
         return Ok(());
     }
     let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
+    // An initialized music-only Classic need not have an ArtworkDB yet.
+    if !device.mount().contains(&relative)? {
+        return Ok(());
+    }
     let source = device.mount().resolve_existing(&relative)?;
     let bytes = read_limited(&source, MAX_ARTWORK_BYTES, "ArtworkDB")?;
     let records = crate::artwork::parse_artwork_records(&bytes)?;
@@ -2446,3 +2528,6 @@ fn sqlite_error(operation: &'static str, path: &Path, source: rusqlite::Error) -
 }
 
 include!("tests.rs");
+
+#[cfg(test)]
+mod classic_tests;

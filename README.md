@@ -29,9 +29,29 @@ println!("{} tracks", device.library().map_or(0, |library| library.track_count()
 | iPod Nano 3G | ✅ Tested |
 | iPod Nano 7G | ✅ Tested |
 | iPod Nano 1G, 4G, 5G, 6G | 🧪 Testers wanted |
-| All iPod Classic models | 🧪 Testers wanted |
+| iPod Classic 160 GB revision B (7G) | ✅ Music sync tested; podcasts need testing |
+| iPod Classic 6G, 120 GB revision A | 🧪 Implemented; hardware testing needed |
 
 Testing on unlisted hardware is greatly appreciated. See [HARDWARE_TESTING.md](HARDWARE_TESTING.md) before writing to a device.
+
+## iPod Classic support
+
+Classic profiles support binary `iTunesDB` reads, track additions/removals,
+standard playlists, HASH58 signing, cover art, and transaction recovery.
+Podcast additions include the flagged Podcasts playlist, dataset-3 show
+groups, resume/shuffle flags, and removal of empty show groups.
+The 2009 160 GB revision B (often called 7G) is identified by `MC293`/`MC297`
+(or `C293`/`C297`) model numbers. USB PID `0x1261` identifies the Classic
+family, not its revision; all three revisions share the same writer.
+Linux can obtain this PID and the required `FireWire` GUID from USB when
+`SysInfo` is empty. Other platforms need on-device identity/signing evidence.
+
+Initialize the library with iTunes or another compatible manager first:
+libopod edits an existing `iPod_Control/iTunes/iTunesDB`; it does not bootstrap
+a blank device. Cover-art writes also require an existing `ArtworkDB`.
+Synthetic tests cover music, playlists, artwork, signing and interrupted
+transaction recovery. The operator confirmed music sync on Classic 7G;
+podcast playback and other Classic revisions still need hardware verification. Keep a complete backup and verify playback after safely ejecting.
 
 ## Reference
 
@@ -46,6 +66,15 @@ cargo run --example opod-inspect -- /path/to/ipod/mount
 ```
 
 The inspector hides serial numbers, `FireWire` GUIDs, and track metadata.
+
+## Progress callbacks
+
+The existing staging and installation methods remain silent. For live UI or
+logging, use `EditSession::stage_sqlite_preview_with_progress` and
+`StagedSqliteEdit::install_with_progress`, each with an `FnMut(ProgressEvent)`
+callback. Events run synchronously before the named work; item counters are
+one-based and per operation. Events can contain track titles or paths, so they
+are not redacted. Callbacks must not panic or mutate the device/bundle.
 
 ## More information
 

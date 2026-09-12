@@ -5,6 +5,9 @@
 //! the container differs (no zlib) and the signature uses the profile's
 //! checksum scheme instead of HASHAB.
 
+mod podcasts;
+pub(crate) use podcasts::sync_podcasts;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::cdb_add::{
@@ -387,10 +390,10 @@ fn playlist_is_smart(playlist: &[u8]) -> Result<bool> {
 }
 
 fn require_editable_playlist(playlist: &[u8]) -> Result<()> {
-    if playlist[0x14] != 0 {
+    if playlist[0x14] != 0 || (playlist.len() >= 0x2c && playlist[0x2a] & 1 != 0) {
         return Err(Error::Unsupported {
             feature: "playlist mutation",
-            reason: "master and hidden playlists cannot be edited".to_owned(),
+            reason: "master, hidden and podcast playlists cannot be edited".to_owned(),
         });
     }
     if playlist_is_smart(playlist)? {

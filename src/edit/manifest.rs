@@ -59,11 +59,17 @@ pub(crate) fn back_up_generation(
     device: &Device,
     destination: &Path,
     generation: &GenerationFingerprint,
+    progress: &mut super::progress::Progress<'_>,
 ) -> Result<()> {
     let backup_root = destination.join("original");
     fs::create_dir(&backup_root)
         .map_err(|source| io_error("create host backup directory", &backup_root, source))?;
-    for fingerprint in generation.files() {
+    let files: Vec<_> = generation.files().iter().filter(|f| f.bytes().is_some()).collect();
+    for (index, fingerprint) in files.iter().enumerate() {
+        progress(super::ProgressEvent::Item {
+            operation: "Backing up to host", current: index + 1, total: files.len(),
+            name: fingerprint.path().as_str(),
+        });
         let (Some(expected_bytes), Some(expected_digest)) =
             (fingerprint.bytes(), fingerprint.sha256())
         else {

@@ -59,6 +59,7 @@ pub(crate) struct ArtworkFrameOut {
 pub(crate) fn add_tracks_to_staged_databases(
     directory: &Path,
     additions: &[ResolvedAddition],
+    progress: &mut super::progress::Progress<'_>,
 ) -> Result<()> {
     if additions.is_empty() {
         return Ok(());
@@ -84,9 +85,14 @@ pub(crate) fn add_tracks_to_staged_databases(
     let transaction = connection
         .transaction()
         .map_err(|source| sqlite_error("begin staged add", &library_path, source))?;
-    for addition in additions {
+    for (index, addition) in additions.iter().enumerate() {
+        progress(super::ProgressEvent::Item {
+            operation: "Updating SQLite library", current: index + 1, total: additions.len(),
+            name: &addition.title,
+        });
         insert_track(&transaction, addition, &library_path)?;
     }
+    progress(super::ProgressEvent::Phase("Verifying and indexing SQLite library"));
     validate_added_invariants(&transaction, additions, &library_path)?;
     // Reindex browse order columns so new artists/albums land in sorted
     // position and pre-existing stale rows are healed.

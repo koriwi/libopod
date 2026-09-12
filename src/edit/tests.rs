@@ -815,8 +815,19 @@ mod tests {
         })
         .unwrap();
         let bundle = tempdir().unwrap();
-        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        let mut operations = Vec::new();
+        let staged = edit.stage_sqlite_preview_with_progress(bundle.path(), |event| {
+            if let crate::ProgressEvent::Item { operation, current, total, name } = event {
+                if name == "LibOpod Podcast Episode" {
+                    assert_eq!((current, total), (1, 1));
+                    operations.push(operation);
+                }
+            }
+        }).unwrap();
         assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(operations, [
+            "Staging audio and artwork", "Updating SQLite library", "Updating binary companion",
+        ]);
 
         let library = Connection::open(bundle.path().join("Library.itdb")).unwrap();
         let pid: i64 = library

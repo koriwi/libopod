@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use super::{
     generation::fingerprint_host_file,
     manifest::{read_staging_manifest, ManifestOutputFile, StagingManifest},
-    StagedSqliteEdit,
+    progress::Progress,
+    ProgressEvent, StagedSqliteEdit,
 };
 use crate::{error::io_error, Device, Error, IpodPath, MountRoot, Result};
 
@@ -223,11 +224,22 @@ pub fn install_staged_removal(
     staged: &StagedSqliteEdit,
     failure_mode: FailureMode,
 ) -> Result<()> {
+    install_staged_with_progress(device, staged, failure_mode, &mut |_| {})
+}
+
+pub(crate) fn install_staged_with_progress(
+    device: &Device,
+    staged: &StagedSqliteEdit,
+    failure_mode: FailureMode,
+    progress: &mut Progress<'_>,
+) -> Result<()> {
+    progress(ProgressEvent::Phase("Verifying device before installation"));
     staged
         .source_generation
         .verify_unchanged(device.mount(), device.profile())?;
     let manifest = read_staging_manifest(staged.manifest())?;
-    verify_bundle(device, staged, &manifest)?;
+    verify_bundle(device, staged, &manifest, progress)?;
+    progress(ProgressEvent::Phase("Checking space and preparing transaction"));
     require_transaction_space(device.mount(), &manifest)?;
     let transaction = transaction_host_path(device.mount())?;
     fs::create_dir(&transaction).map_err(|source| {
@@ -241,8 +253,9 @@ pub fn install_staged_removal(
     })?;
     sync_directory(transaction.parent().unwrap_or(device.mount().as_path()))?;
 
-    let result = install_inner(device, staged, manifest, &transaction, failure_mode);
+    let result = install_inner(device, staged, manifest, &transaction, failure_mode, progress);
     if result.is_err() && failure_mode == FailureMode::RollBack {
+        progress(ProgressEvent::Phase("Installation failed; recovering transaction"));
         let rollback_result = recover_transaction(device.mount());
         if let Err(rollback_error) = rollback_result {
             return Err(Error::Verification {
@@ -261,6 +274,7 @@ fn install_inner(
     manifest: StagingManifest,
     transaction: &Path,
     failure_mode: FailureMode,
+    progress: &mut Progress<'_>,
 ) -> Result<()> {
     #[cfg(not(test))]
     let _ = failure_mode;
@@ -277,8 +291,10 @@ fn install_inner(
     write_journal(transaction, &journal)?;
 
     for (outputs_backed_up, output) in journal.staging.outputs.iter().enumerate() {
-        #[cfg(not(test))]
-        let _ = outputs_backed_up;
+        progress(ProgressEvent::Item {
+            operation: "Preparing device backup", current: outputs_backed_up + 1,
+            total: journal.staging.outputs.len(), name: &output.target,
+        });
         let original = original_state(&journal.staging, output)?;
         match (original.bytes, original.sha256.as_deref()) {
             (Some(bytes), Some(digest)) => {
@@ -323,6 +339,7 @@ fn install_inner(
     // Deletions are immediate: no byte backup is staged or copied on-device.
     // The operator asked for a delete, so the install unlinks by path and
     // rollback restores only the database (the media file is gone by design).
+    progress(ProgressEvent::Phase("Flushing backups and rechecking device"));
     sync_directory(&backup)?;
     staged
         .source_generation
@@ -338,6 +355,10 @@ fn install_inner(
                 reason: format!("stopped before installing file {index}"),
             });
         }
+        progress(ProgressEvent::Item {
+            operation: "Installing", current: index + 1,
+            total: journal.staging.outputs.len(), name: &output.target,
+        });
         journal.installed = index + 1;
         write_journal(transaction, &journal)?;
         let staged_file = staged.directory().join(&output.staged);
@@ -358,8 +379,10 @@ fn install_inner(
     }
 
     for (deletion_index, deletion) in journal.staging.deletions.iter().enumerate() {
-        #[cfg(not(test))]
-        let _ = deletion_index;
+        progress(ProgressEvent::Item {
+            operation: "Deleting media", current: deletion_index + 1,
+            total: journal.staging.deletions.len(), name: &deletion.target,
+        });
         let relative = IpodPath::new(deletion.target.clone())?;
         let target = device.mount().resolve_possible(&relative)?;
         // Another recovery tool or the firmware may already have removed a
@@ -378,6 +401,7 @@ fn install_inner(
     // directory fsync, so sync each affected parent directory once instead of
     // once per deleted file. A full-library mirror drops from hundreds of
     // syncs to a handful.
+    progress(ProgressEvent::Phase("Flushing media directories"));
     let mut synced = std::collections::BTreeSet::new();
     for deletion in &journal.staging.deletions {
         let relative = IpodPath::new(deletion.target.clone())?;
@@ -390,7 +414,11 @@ fn install_inner(
 
     journal.phase = TransactionPhase::Validating;
     write_journal(transaction, &journal)?;
-    for output in &journal.staging.outputs {
+    for (index, output) in journal.staging.outputs.iter().enumerate() {
+        progress(ProgressEvent::Item {
+            operation: "Verifying installed file", current: index + 1,
+            total: journal.staging.outputs.len(), name: &output.target,
+        });
         let original = original_state(&journal.staging, output)?;
         if original.bytes.is_some() {
             let target = resolve_target(device.mount(), output)?;
@@ -413,6 +441,7 @@ fn install_inner(
         let target = device.mount().resolve_possible(&relative)?;
         verify_absent(&target, "deleted output")?;
     }
+    progress(ProgressEvent::Phase("Reading back installed library"));
     let reopened = Device::open_during_transaction(device.mount().as_path())?;
     if reopened.library().map_or(0, crate::Library::track_count) != staged.remaining_tracks() {
         return Err(Error::Verification {
@@ -430,6 +459,7 @@ fn install_inner(
             reason: "stopped after the committed journal write".to_owned(),
         });
     }
+    progress(ProgressEvent::Phase("Finalizing transaction"));
     remove_transaction_directory(transaction)?;
     Ok(())
 }
@@ -588,7 +618,8 @@ fn validate_recovery_state(
     let classic_targets = ["iPod_Control/iTunes/iTunesDB"];
     let expected_targets: &[&str] = match journal.staging.profile.as_str() {
         "nano-7g" => &sqlite_targets,
-        "nano-1g" | "nano-2g" | "nano-3g" | "nano-4g" => &classic_targets,
+        "nano-1g" | "nano-2g" | "nano-3g" | "nano-4g"
+        | "classic" | "classic-6g" | "classic-6.5g" | "classic-7g" => &classic_targets,
         _ => {
             return Err(Error::Verification {
                 format: "device transaction",
@@ -741,6 +772,7 @@ fn verify_bundle(
     device: &Device,
     staged: &StagedSqliteEdit,
     manifest: &StagingManifest,
+    progress: &mut Progress<'_>,
 ) -> Result<()> {
     let profile = device.profile().ok_or_else(|| Error::Unsupported {
         feature: "device transaction",
@@ -777,7 +809,11 @@ fn verify_bundle(
             reason: "media output count is inconsistent".to_owned(),
         });
     }
-    for output in &manifest.outputs {
+    for (index, output) in manifest.outputs.iter().enumerate() {
+        progress(ProgressEvent::Item {
+            operation: "Verifying staged file", current: index + 1,
+            total: manifest.outputs.len(), name: &output.target,
+        });
         verify_file(
             &staged.directory().join(&output.staged),
             output.bytes,

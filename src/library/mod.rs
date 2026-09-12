@@ -157,8 +157,8 @@ impl Library {
                 id: playlist.id,
                 name: playlist.name.clone(),
                 parent_id: None,
-                distinguished_kind: 0,
-                is_hidden: playlist.is_hidden,
+                distinguished_kind: if playlist.is_podcast { 11 } else { 0 },
+                is_hidden: playlist.is_hidden || playlist.is_podcast,
                 is_smart: playlist.is_smart,
                 track_ids: playlist
                     .track_ids
