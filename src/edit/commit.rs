@@ -34,6 +34,10 @@ pub(crate) const NEW_ART_ADDITION_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH NEW COVER ART";
 const JOURNAL_NAME: &str = "journal.json";
 
+mod rename;
+#[cfg(test)]
+mod rename_tests;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FailureMode {
     RollBack,
@@ -47,6 +51,8 @@ pub(crate) enum FailureMode {
     SimulateInterruptionDuringValidation,
     #[cfg(test)]
     SimulateInterruptionAfterCommitted,
+    #[cfg(test)]
+    SimulateRenameInterruption(usize, rename::Step),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,6 +71,8 @@ enum TransactionPhase {
     Installing,
     Validating,
     Committed,
+    RollingBack,
+    RolledBack,
 }
 
 pub(crate) fn install_noop_hardware_test(
@@ -252,6 +260,7 @@ pub(crate) fn install_staged_and_open(
         .verify_unchanged(device.mount(), device.profile())?;
     let manifest = read_staging_manifest(staged.manifest())?;
     verify_manifest_generation(staged, &manifest)?;
+    rename::validate_paths(&manifest)?;
     let fast_media = fast_media_targets(staged, &manifest, mode)?;
     verify_bundle(device, staged, &manifest, &fast_media, progress)?;
     progress(ProgressEvent::Phase("Checking space and preparing transaction"));
@@ -292,14 +301,9 @@ fn install_inner(
     fast_media: &BTreeSet<String>,
     progress: &mut Progress<'_>,
 ) -> Result<Device> {
-    #[cfg(not(test))]
-    let _ = failure_mode;
-    let backup = transaction.join("backup");
-    fs::create_dir(&backup)
-        .map_err(|source| io_error("create device transaction backup", &backup, source))?;
     let mut journal = TransactionJournal {
         format: "libopod-device-transaction".to_owned(),
-        version: 2,
+        version: 3,
         phase: TransactionPhase::BackingUp,
         installed: 0,
         staging: manifest,
@@ -315,20 +319,14 @@ fn install_inner(
         let original = original_state(&journal.staging, output)?;
         match (original.bytes, original.sha256.as_deref()) {
             (Some(bytes), Some(digest)) => {
-                // Staging already made a verified host snapshot of this
-                // generation. Read it from the host rather than rereading
-                // the live USB file twice (hash, then copy). The on-device
-                // backup is still flushed and fully read back below, and the
-                // whole live generation is rechecked before installation.
+                // Keep the verified host snapshot, but do not copy its bytes
+                // back to USB. The original live file will become the backup
+                // by rename, only after its replacement is ready and durable.
                 let relative = IpodPath::new(output.target.clone())?;
                 let source = host_original.resolve_existing(&relative)?;
-                let backup_file = backup.join(&output.staged);
-                if let Some(parent) = backup_file.parent() {
-                    fs::create_dir_all(parent).map_err(|source| {
-                        io_error("create transaction backup parent", parent, source)
-                    })?;
-                }
-                copy_new_verified(&source, &backup_file, bytes, digest)?;
+                verify_file(&source, bytes, digest, "host transaction backup")?;
+                let _ = rename::prepare_backup_path(transaction, output)?;
+                rename::replacement_target(device.mount(), output)?;
             }
             (None, None) => {
                 let relative = IpodPath::new(output.target.clone())?;
@@ -361,8 +359,7 @@ fn install_inner(
     // Deletions are immediate: no byte backup is staged or copied on-device.
     // The operator asked for a delete, so the install unlinks by path and
     // rollback restores only the database (the media file is gone by design).
-    progress(ProgressEvent::Phase("Flushing backups and rechecking device"));
-    sync_directory(&backup)?;
+    progress(ProgressEvent::Phase("Rechecking device before installation"));
     staged
         .source_generation
         .verify_unchanged(device.mount(), device.profile())?;
@@ -392,12 +389,20 @@ fn install_inner(
         }
         let original = original_state(&journal.staging, output)?;
         let target = if original.bytes.is_some() {
-            resolve_target(device.mount(), output)?
+            rename::replacement_target(device.mount(), output)?
         } else {
             let relative = IpodPath::new(output.target.clone())?;
             device.mount().resolve_possible(&relative)?
         };
-        install_file_impl(&staged_file, &target, index, stream_verified.then_some(output))?;
+        if let (Some(bytes), Some(digest)) = (original.bytes, original.sha256.as_deref()) {
+            let backup = rename::prepare_backup_path(transaction, output)?;
+            rename::install_replacement(
+                &staged_file, &target, &backup, output, (bytes, digest),
+                index, failure_mode, progress,
+            )?;
+        } else {
+            install_file_impl(&staged_file, &target, index, stream_verified.then_some(output))?;
+        }
     }
 
     for (deletion_index, deletion) in journal.staging.deletions.iter().enumerate() {
@@ -486,7 +491,7 @@ fn install_inner(
         });
     }
     progress(ProgressEvent::Phase("Finalizing transaction"));
-    remove_transaction_directory(transaction)?;
+    rename::remove_transaction_directory(transaction, failure_mode)?;
     // This handle already contains the verified installed library and its
     // freshly captured generation; reopening it would repeat all those reads.
     Ok(reopened)
@@ -497,9 +502,17 @@ pub(crate) fn recover_transaction(mount: &MountRoot) -> Result<()> {
     recover_transaction_with_progress(mount, &mut |_| {})
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn recover_transaction_with_progress(
     mount: &MountRoot,
+    progress: &mut Progress<'_>,
+) -> Result<()> {
+    recover_with_failure_mode(mount, FailureMode::RollBack, progress)
+}
+
+#[allow(clippy::too_many_lines)]
+fn recover_with_failure_mode(
+    mount: &MountRoot,
+    failure_mode: FailureMode,
     progress: &mut Progress<'_>,
 ) -> Result<()> {
     progress(ProgressEvent::Phase("Reading recovery journal"));
@@ -507,7 +520,10 @@ pub(crate) fn recover_transaction_with_progress(
     if !transaction.exists() {
         return Ok(());
     }
-    let journal = read_journal(&transaction)?;
+    if rename::remove_empty_scaffold(&transaction)? {
+        return Ok(());
+    }
+    let mut journal = read_journal(&transaction)?;
     progress(ProgressEvent::Phase("Validating recovery journal and interrupted state"));
     validate_recovery_state(mount, &transaction, &journal, progress)?;
     // Only trust target-derived temporary names after the journal and live
@@ -516,6 +532,8 @@ pub(crate) fn recover_transaction_with_progress(
     cleanup_interrupted_temporaries(mount, &transaction, &journal, progress)?;
     if journal.phase == TransactionPhase::Committed {
         progress(ProgressEvent::Phase("Transaction already committed; keeping installed files"));
+    } else if journal.phase == TransactionPhase::RolledBack {
+        progress(ProgressEvent::Phase("Transaction already rolled back; keeping restored files"));
     } else {
         // Preserve reverse installation order while counting only the files
         // relevant to each rollback operation. Validation bounded installed.
@@ -546,9 +564,18 @@ pub(crate) fn recover_transaction_with_progress(
             if target.exists() {
                 verify_file(&target, output.bytes, &output.sha256, "installed new output")?;
                 remove_if_present(&target, "remove rolled-back new output")?;
-                sync_directory(target.parent().unwrap_or(mount.as_path()))?;
             }
+            // A previous recovery may have unlinked it without completing
+            // the directory flush. Absence alone is not a durability barrier.
+            sync_directory(target.parent().unwrap_or(mount.as_path()))?;
             verify_absent(&target, "rolled-back new output")?;
+        }
+        // Persist rollback intent before consuming any rename-backed original.
+        // Free new payloads/temporaries first so ENOSPC need not prevent this
+        // small journal update. Missing new outputs are valid interrupted states.
+        if journal.version == 3 {
+            journal.phase = TransactionPhase::RollingBack;
+            write_journal(&transaction, &journal)?;
         }
         // Once new payloads are gone, restore every replaced database/artwork
         // file from its verified transaction backup.
@@ -557,9 +584,26 @@ pub(crate) fn recover_transaction_with_progress(
                 operation: "Restoring recovery backup", current: current + 1,
                 total: replacements.len(), name: &output.target,
             });
+            if journal.version == 3 {
+                let target = rename::replacement_target(mount, output)?;
+                if let Some(backup) = rename::existing_backup(&transaction, output)? {
+                    verify_file(&backup, *bytes, digest, "recovery backup")?;
+                    rename::restore_backup(&backup, &target, *index, failure_mode)?;
+                } else {
+                    // Either installation never moved this original, or an
+                    // earlier recovery already restored it. Never infer that
+                    // from absence alone: the live original must verify.
+                    verify_file(&target, *bytes, digest, "unmoved recovery original")?;
+                    rename::finish_restored_sync(&transaction, output, &target, *index, failure_mode)?;
+                }
+            } else {
+                let target = resolve_target(mount, output)?;
+                let backup = rename::existing_backup(&transaction, output)?.ok_or_else(|| Error::Verification {
+                    format: "device transaction", reason: "legacy recovery backup is missing".to_owned(),
+                })?;
+                install_file(&backup, &target, *index)?;
+            }
             let target = resolve_target(mount, output)?;
-            let backup = transaction.join("backup").join(&output.staged);
-            install_file(&backup, &target, *index)?;
             progress(ProgressEvent::Item {
                 operation: "Verifying restored file", current: current + 1,
                 total: replacements.len(), name: &output.target,
@@ -590,12 +634,15 @@ pub(crate) fn recover_transaction_with_progress(
                 }
             }
         }
-        // Fast-deletion journals carry no byte backup: once the install
-        // unlinked a media file it is gone by design, so recovery restores
-        // only the database outputs above and leaves deletions absent.
+        // Terminal proof makes cleanup restartable even after some backups
+        // have been deleted. Upgrade recovered legacy journals for this marker.
+        journal.version = 3;
+        journal.phase = TransactionPhase::RolledBack;
+        write_journal(&transaction, &journal)?;
+        // Deleted audio has no byte backup and remains absent by design.
     }
     progress(ProgressEvent::Phase("Removing recovery journal and backups"));
-    remove_transaction_directory(&transaction)
+    rename::remove_transaction_directory(&transaction, failure_mode)
 }
 
 fn cleanup_interrupted_temporaries(
@@ -626,8 +673,10 @@ fn cleanup_interrupted_temporaries(
         let temporary = parent.join(format!(".{name}.libopod-{index}.tmp"));
         if temporary.exists() {
             remove_if_present(&temporary, "remove interrupted sibling installation file")?;
-            parents.insert(parent.to_path_buf());
         }
+        // Retry a flush even if a preceding recovery already unlinked the
+        // temporary but stopped before making that deletion durable.
+        parents.insert(parent.to_path_buf());
     }
     let journal_temporary = transaction.join("journal.tmp");
     if journal_temporary.exists() {
@@ -657,7 +706,12 @@ fn validate_recovery_state(
     journal: &TransactionJournal,
     progress: &mut Progress<'_>,
 ) -> Result<()> {
-    if journal.installed > journal.staging.outputs.len() {
+    rename::validate_paths(&journal.staging)?;
+    if journal.installed > journal.staging.outputs.len()
+        || (journal.phase == TransactionPhase::BackingUp && journal.installed != 0)
+        || (matches!(journal.phase, TransactionPhase::Validating | TransactionPhase::Committed)
+            && journal.installed != journal.staging.outputs.len())
+    {
         return Err(Error::Verification {
             format: "device transaction",
             reason: "journal installation count is invalid".to_owned(),
@@ -771,9 +825,15 @@ fn validate_recovery_state(
         let original = original_state(&journal.staging, output)?;
         match (original.bytes, original.sha256.as_deref()) {
             (Some(original_bytes), Some(original_digest)) => {
+                if journal.version == 3 {
+                    rename::validate_replacement(mount, transaction, journal, index, output, original_bytes, original_digest)?;
+                    continue;
+                }
                 let target = resolve_target(mount, output)?;
-                if journal.phase != TransactionPhase::BackingUp {
-                    let backup = transaction.join("backup").join(&output.staged);
+                if !matches!(journal.phase, TransactionPhase::BackingUp | TransactionPhase::Committed) {
+                    let backup = rename::existing_backup(transaction, output)?.ok_or_else(|| Error::Verification {
+                        format: "device transaction", reason: "legacy recovery backup is missing".to_owned(),
+                    })?;
                     verify_file(&backup, original_bytes, original_digest, "recovery backup")?;
                 }
                 // Compare one live fingerprint with both permitted states,
@@ -799,7 +859,9 @@ fn validate_recovery_state(
                 let present = target.exists();
                 let output_matches =
                     present && fingerprint_matches(&target, output.bytes, &output.sha256)?;
-                if !(!present || may_be_output && output_matches) {
+                if present && (journal.phase == TransactionPhase::RolledBack
+                    || !may_be_output || !output_matches)
+                {
                     return Err(Error::Verification {
                         format: "device transaction",
                         reason: format!(
@@ -958,15 +1020,21 @@ fn original_state<'a>(
 }
 
 fn require_transaction_space(mount: &MountRoot, manifest: &StagingManifest) -> Result<()> {
-    let backup_bytes = manifest.outputs.iter().try_fold(0_u64, |total, output| {
-        let original = original_state(manifest, output)?;
-        total
-            .checked_add(original.bytes.unwrap_or(0))
-            .ok_or_else(|| Error::Verification {
-                format: "device transaction",
-                reason: "required backup space overflowed u64".to_owned(),
-            })
-    })?;
+    let required = required_transaction_bytes(manifest)?;
+    let available = fs2::available_space(mount.as_path())
+        .map_err(|source| io_error("check transaction free space", mount.as_path(), source))?;
+    if available < required {
+        return Err(Error::Verification {
+            format: "device transaction",
+            reason: format!(
+                "at least {required} bytes are required, but only {available} bytes are available"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn required_transaction_bytes(manifest: &StagingManifest) -> Result<u64> {
     // Every new media output remains on the volume, and replacement outputs
     // temporarily coexist with their live originals. Counting all outputs is
     // conservative, but prevents a many-track sync from passing preflight by
@@ -981,51 +1049,45 @@ fn require_transaction_space(mount: &MountRoot, manifest: &StagingManifest) -> R
     })?;
     // Fast deletions happen only after database installation, so their future
     // space cannot safely offset the installation requirement.
-    let required = backup_bytes
-        .checked_add(output_bytes)
+    // Originals already occupy device space. Forward and rollback renames do
+    // not allocate another full copy. Allow two serialized journals (current
+    // and temporary) plus metadata headroom, even for large unbatched edits.
+    let largest_journal = TransactionJournal {
+        format: "libopod-device-transaction".to_owned(),
+        version: 3,
+        phase: TransactionPhase::RollingBack, // longest serialized phase name
+        installed: manifest.outputs.len(),
+        staging: manifest.clone(),
+    };
+    let journal_bytes = serde_json::to_vec_pretty(&largest_journal).map_err(|error| Error::Verification {
+        format: "device transaction", reason: format!("cannot size transaction journal: {error}"),
+    })?.len() as u64;
+    output_bytes
+        .checked_add(journal_bytes.saturating_add(1024).saturating_mul(2))
         .and_then(|bytes| bytes.checked_add(4 * 1024 * 1024))
         .ok_or_else(|| Error::Verification {
             format: "device transaction",
             reason: "required transaction space overflowed u64".to_owned(),
-        })?;
-    let available = fs2::available_space(mount.as_path())
-        .map_err(|source| io_error("check transaction free space", mount.as_path(), source))?;
-    if available < required {
-        return Err(Error::Verification {
-            format: "device transaction",
-            reason: format!(
-                "at least {required} bytes are required, but only {available} bytes are available"
-            ),
-        });
-    }
-    Ok(())
+        })
 }
 
 fn transaction_host_path(mount: &MountRoot) -> Result<PathBuf> {
     let relative = IpodPath::new(TRANSACTION_PATH)?;
     let mut path = mount.as_path().to_path_buf();
     path.extend(relative.components());
+    if mount.contains(&relative)? {
+        if fs::symlink_metadata(&path).map_err(|error| io_error("inspect transaction directory", &path, error))?.file_type().is_symlink() {
+            return Err(Error::Verification {
+                format: "device transaction", reason: "transaction directory must not be a symlink".to_owned(),
+            });
+        }
+        return mount.resolve_existing(&relative);
+    }
     Ok(path)
 }
 
 fn resolve_target(mount: &MountRoot, output: &ManifestOutputFile) -> Result<PathBuf> {
     mount.resolve_existing(&IpodPath::new(output.target.clone())?)
-}
-
-fn copy_new_verified(source: &Path, destination: &Path, bytes: u64, digest: &str) -> Result<()> {
-    let mut input = File::open(source)
-        .map_err(|error| io_error("open transaction backup source", source, error))?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .map_err(|error| io_error("create transaction backup", destination, error))?;
-    std::io::copy(&mut input, &mut output)
-        .map_err(|error| io_error("copy transaction backup", destination, error))?;
-    output
-        .sync_all()
-        .map_err(|error| io_error("flush transaction backup", destination, error))?;
-    verify_file(destination, bytes, digest, "transaction backup")
 }
 
 fn install_file(source: &Path, target: &Path, sequence: usize) -> Result<()> {
@@ -1052,23 +1114,7 @@ fn install_file_impl(
     let temporary = parent.join(format!(".{name}.libopod-{sequence}.tmp"));
     remove_if_present(&temporary, "remove stale sibling installation file")?;
     let result = (|| {
-        let mut input = File::open(source)
-            .map_err(|error| io_error("open staged installation source", source, error))?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| io_error("create sibling installation file", &temporary, error))?;
-        if let Some(expected) = expected {
-            copy_verified_media(&mut input, &mut output, expected, &temporary)?;
-        } else {
-            std::io::copy(&mut input, &mut output)
-                .map_err(|error| io_error("copy sibling installation file", &temporary, error))?;
-        }
-        output
-            .sync_all()
-            .map_err(|error| io_error("flush sibling installation file", &temporary, error))?;
-        drop(output);
+        write_installation_temporary(source, &temporary, expected)?;
         fs::rename(&temporary, target)
             .map_err(|error| io_error("replace live database file", target, error))?;
         sync_directory(parent)
@@ -1080,6 +1126,24 @@ fn install_file_impl(
         sync_directory(parent)?;
     }
     result
+}
+
+fn write_installation_temporary(
+    source: &Path,
+    temporary: &Path,
+    expected: Option<&ManifestOutputFile>,
+) -> Result<()> {
+    let mut input = File::open(source)
+        .map_err(|error| io_error("open staged installation source", source, error))?;
+    let mut output = OpenOptions::new().write(true).create_new(true).open(temporary)
+        .map_err(|error| io_error("create sibling installation file", temporary, error))?;
+    if let Some(expected) = expected {
+        copy_verified_media(&mut input, &mut output, expected, temporary)?;
+    } else {
+        std::io::copy(&mut input, &mut output)
+            .map_err(|error| io_error("copy sibling installation file", temporary, error))?;
+    }
+    output.sync_all().map_err(|error| io_error("flush sibling installation file", temporary, error))
 }
 
 fn remove_if_present(path: &Path, operation: &'static str) -> Result<()> {
@@ -1204,6 +1268,13 @@ fn write_journal(directory: &Path, journal: &TransactionJournal) -> Result<()> {
 
 fn read_journal(directory: &Path) -> Result<TransactionJournal> {
     let path = directory.join(JOURNAL_NAME);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|source| io_error("inspect transaction journal", &path, source))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(Error::Verification {
+            format: "device transaction", reason: "journal must be a regular file, not a symlink".to_owned(),
+        });
+    }
     let bytes =
         fs::read(&path).map_err(|source| io_error("read transaction journal", &path, source))?;
     let journal: TransactionJournal =
@@ -1212,22 +1283,15 @@ fn read_journal(directory: &Path) -> Result<TransactionJournal> {
             offset: u64::try_from(source.column()).unwrap_or(u64::MAX),
             reason: source.to_string(),
         })?;
-    if journal.format != "libopod-device-transaction" || journal.version != 2 {
+    if journal.format != "libopod-device-transaction" || !matches!(journal.version, 2 | 3)
+        || (journal.version == 2 && matches!(journal.phase, TransactionPhase::RollingBack | TransactionPhase::RolledBack))
+    {
         return Err(Error::Unsupported {
             feature: "transaction journal version",
-            reason: "expected libopod-device-transaction version 2".to_owned(),
+            reason: "expected libopod-device-transaction version 2 or 3".to_owned(),
         });
     }
     Ok(journal)
-}
-
-fn remove_transaction_directory(path: &Path) -> Result<()> {
-    fs::remove_dir_all(path)
-        .map_err(|source| io_error("remove completed transaction directory", path, source))?;
-    sync_directory(path.parent().ok_or_else(|| Error::Verification {
-        format: "device transaction",
-        reason: "transaction directory has no parent".to_owned(),
-    })?)
 }
 
 fn sync_directory(path: &Path) -> Result<()> {

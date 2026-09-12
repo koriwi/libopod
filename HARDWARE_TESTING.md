@@ -6,6 +6,18 @@ operator confirmation that identifies the mounted volume.
 The initial Nano 7G backup at `backup_7g/` is private and immutable. It is a
 file-level development input, not a write target.
 
+## Rename-backed transactions (journal version 3)
+
+New commits preserve originals by rename after verifying durable replacement
+siblings. Rollback also uses renames; synthetic tests interrupt every rename
+boundary, remove the host staging bundle, and check recovery and cleanup retries.
+This new path still needs hardware qualification. The successful gate results
+below describe the earlier copy-backup implementation, not a power-loss test of
+version 3. Keep an independent verified backup. After an interruption, use the
+current recovery tool before using the device: a live file can temporarily be
+absent between the two renames. Do not downgrade with a pending transaction.
+The current tool also recovers version 2 journals.
+
 ## Current gate: media-deletion removal (gate 7) and artwork-delete removal (gate 8)
 
 Gates 1–6 (no-op, both removals, both additions, both artwork paths) have
@@ -64,8 +76,8 @@ cargo run --release --example opod-hardware-test -- \
   'I HAVE A VERIFIED BACKUP; RUN NANO 7G NO-OP WRITE TEST'
 ```
 
-libopod revalidates every source generation, checks free space, writes verified
-on-device backups and a durable journal, installs through flushed sibling
+libopod revalidates every source generation, checks free space, preserves verified
+on-device originals by rename under a durable journal, installs through flushed sibling
 files, reads the resulting library back, and removes the journal only after a
 successful commit. If the process, host, or device is interrupted, do not run
 another sync. Reconnect and run:
@@ -76,7 +88,9 @@ cargo run --release --example opod-hardware-test -- \
 ```
 
 Recovery refuses to write unless volume identity inputs, the journal, current
-mixed state, and all backups verify. After a successful no-op test, safely
+mixed state, and required rollback backups verify. Terminal journals allow only
+verified cleanup, even if earlier cleanup already removed backups.
+After a successful no-op test, safely
 eject, reboot, browse and play multiple tracks, reconnect, and run
 `opod-inspect` again. Record whether the firmware or Apple software requests a
 restore.

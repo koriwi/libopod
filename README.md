@@ -88,11 +88,24 @@ reopening and fingerprinting all database/artwork files again.
 Staging verifies the initial generation through its host backup rather than
 hashing every live input before copying it. Staging reads the main databases
 from those host snapshots. Thumbnail staging copies the existing host prefix
-once per format, then appends new frames and flushes once. Installation also uses host
-snapshots to supply on-device rollback backups; it still flushes and fully
-verifies those backups and rechecks the live generation before installation.
+once per format, then appends new frames and flushes once. Installation verifies
+the host snapshots and rechecks the live generation, but no longer copies those
+snapshots back to USB as rollback backups. Instead it writes, flushes and verifies
+a replacement sibling first, then renames the original into the recovery
+directory, flushes both directories and verifies the preserved original before
+publishing the replacement. Full original files remain on-device until commit.
+Rollback also uses verified renames rather than allocating another full copy.
 Keep the entire staging bundle, including `original`, intact until installation
 finishes. Recovery still needs no host bundle and keeps full byte verification.
+
+New transactions use journal **version 3**; the directory name remains
+`.libopod-transaction-v1`. Recovery also accepts version 2 copy-backup journals.
+Older binaries cannot recover version 3: do not downgrade while a transaction
+is pending. A power cut between renames can leave a live file temporarily absent;
+run recovery with the current version before using the iPod. Terminal journals
+remain until cleanup finishes, so interrupted backup cleanup is retryable.
+These rename boundaries have synthetic fault-injection coverage, not hardware
+power-loss qualification yet.
 Media allocation inventories `Music/Fxx` once per staging batch, not per song,
 and reserves complete filenames case-insensitively before copying.
 

@@ -135,7 +135,7 @@ fn changed_snapshot_and_manifest_cannot_replace_the_trusted_source_fingerprint()
 }
 
 #[test]
-fn live_changes_during_host_sourced_backup_still_block_installation() {
+fn live_changes_during_backup_preparation_still_block_installation() {
     for mode in [InstallMode::Full, InstallMode::Fast] {
         let directory = virtual_classic("ModelNumStr: MC293", false);
         let device = Device::open(directory.path()).unwrap();
@@ -176,7 +176,7 @@ fn live_changes_during_host_sourced_backup_still_block_installation() {
             .join(staged.added_media()[0].as_str())
             .exists());
         // Strict recovery refuses unknown live bytes; do not overwrite them
-        // just because a valid host-sourced rollback backup is available.
+        // just because a valid host snapshot is available.
         assert!(directory.path().join(TRANSACTION_PATH).exists());
         fs::write(directory.path().join(DB), &original).unwrap();
         assert!(recover_interrupted_transaction(directory.path()).unwrap());

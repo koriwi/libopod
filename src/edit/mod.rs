@@ -1080,18 +1080,19 @@ impl StagedSqliteEdit {
     /// against its manifest fingerprint, the databases are installed, the
     /// rewritten library is read back and validated, media deletions (when the
     /// session used [`MediaDeletionPolicy::Delete`]) are applied, and the
-    /// result is signed. On any failure the transaction is rolled back from
-    /// its on-device backup; an interrupted install is completed or rolled
+    /// result is signed. Installation failures trigger a verified recovery
+    /// attempt using on-device originals; an interrupted install is completed or rolled
     /// back by [`crate::recover_interrupted_transaction`]. Keep the host bundle,
-    /// including `original`, intact until installation finishes: it supplies
-    /// bytes for the flushed and verified on-device rollback backups.
+    /// including `original`, intact until installation finishes: preflight
+    /// verifies that host snapshot. On-device backups preserve the live
+    /// originals through durable, verified renames (journal version 3).
     ///
     /// # Errors
     ///
     /// Returns an error when the source generation changed, a staged file
     /// fails verification, the read-back library does not match the staged
-    /// edit, or any filesystem operation fails. On error the transaction is
-    /// rolled back from its on-device backup.
+    /// edit, or any filesystem operation fails. Recovery refuses destructive
+    /// work on an unknown state; a pending journal may require later recovery.
     pub fn install(&self, device: &Device) -> Result<()> {
         self.install_with_progress(device, |_| {})
     }
@@ -1138,7 +1139,7 @@ impl StagedSqliteEdit {
     ///
     /// Returns the same errors as [`Self::install_with_mode`]. Keep the host
     /// bundle (including its `original` snapshot) intact until installation
-    /// finishes; it supplies bytes for the verified on-device recovery backup.
+    /// finishes; preflight verifies it before preparing rename-based recovery.
     pub fn install_and_open(
         &self,
         device: &Device,
