@@ -6,17 +6,24 @@ operator confirmation that identifies the mounted volume.
 The initial Nano 7G backup at `backup_7g/` is private and immutable. It is a
 file-level development input, not a write target.
 
-## Rename-backed transactions (journal version 3)
+## Incremental artwork and rename-backed transactions (journal version 4)
 
-New commits preserve originals by rename after verifying durable replacement
-siblings. Rollback also uses renames; synthetic tests interrupt every rename
-boundary, remove the host staging bundle, and check recovery and cleanup retries.
-This new path still needs hardware qualification. The successful gate results
-below describe the earlier copy-backup implementation, not a power-loss test of
-version 3. Keep an independent verified backup. After an interruption, use the
-current recovery tool before using the device: a live file can temporarily be
-absent between the two renames. Do not downgrade with a pending transaction.
-The current tool also recovers version 2 journals.
+New commits preserve replacement originals by rename after verifying durable
+siblings. Eligible large thumbnails instead keep their original prefix in place
+and append only new frames. Before append intent, an on-device suffix spool must
+pass flushing and verification. Recovery verifies the unchanged prefix and any
+partial suffix before truncating. A real journal-space reserve supports recovery
+when in-place writes exhaust free space. See the README for format/host limits.
+
+Synthetic tests interrupt spool preparation, append writes, truncation, renames
+and cleanup; recovery runs without the host staging bundle. Logical 4 KiB
+alignment is a conservative eligibility check, not a hardware power-loss proof.
+This path still needs hardware qualification. The successful gate results below
+describe the earlier copy-backup implementation, not power-loss tests of versions
+3 or 4. Keep an independent verified backup. After interruption, recover before
+using the device: a live file can temporarily be absent between renames. Do not
+downgrade or switch away from a supported Unix host with a pending append
+transaction. The current tool also recovers version 2 and version 3 journals.
 
 ## Current gate: media-deletion removal (gate 7) and artwork-delete removal (gate 8)
 

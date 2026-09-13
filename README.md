@@ -90,7 +90,7 @@ hashing every live input before copying it. Staging reads the main databases
 from those host snapshots. Thumbnail staging copies the existing host prefix
 once per format, then appends new frames and flushes once. Installation verifies
 the host snapshots and rechecks the live generation, but no longer copies those
-snapshots back to USB as rollback backups. Instead it writes, flushes and verifies
+snapshots back to USB as rollback backups. For replacements it writes, flushes and verifies
 a replacement sibling first, then renames the original into the recovery
 directory, flushes both directories and verifies the preserved original before
 publishing the replacement. Full original files remain on-device until commit.
@@ -98,14 +98,36 @@ Rollback also uses verified renames rather than allocating another full copy.
 Keep the entire staging bundle, including `original`, intact until installation
 finishes. Recovery still needs no host bundle and keeps full byte verification.
 
-New transactions use journal **version 3**; the directory name remains
-`.libopod-transaction-v1`. Recovery also accepts version 2 copy-backup journals.
-Older binaries cannot recover version 3: do not downgrade while a transaction
-is pending. A power cut between renames can leave a live file temporarily absent;
-run recovery with the current version before using the iPod. Terminal journals
-remain until cleanup finishes, so interrupted backup cleanup is retryable.
-These rename boundaries have synthetic fault-injection coverage, not hardware
-power-loss qualification yet.
+### Incremental thumbnail installation
+
+On supported Unix file geometry, growing `F1055_1.ithmb`, `F1068_1.ithmb`
+(Classic, Nano 3G/4G) and `F1060_1.ithmb` (Classic, Nano 3G) can append only new
+frames. Eligibility requires whole aligned slots and a staged prefix whose
+SHA-256 matches the original generation. Read-only or multiply linked files,
+unaligned formats, reindexed/changed prefixes and unsupported hosts retain full
+replacement. The optimizer also falls back when two suffix writes would exceed
+the cost of one complete replacement.
+
+Before append intent, installation writes, flushes and verifies an on-device
+**suffix spool** containing only the new bytes. Those bytes are then appended to
+the live thumbnail and fully verified. The old prefix stays in the live file;
+it is not copied to another on-device backup. Recovery verifies the entire old
+prefix, compares any partial suffix byte-for-byte with the spool, and binds the
+spool to the expected complete output hash before truncating back to the old
+length. Required spools remain until terminal cleanup. A small, physically
+allocated journal-space reserve supports rollback if an append fills the volume.
+Full file verification and generation checks remain enabled in both install modes.
+Host staging still builds complete preview files.
+
+New transactions use journal **version 4**; the directory name remains
+`.libopod-transaction-v1`. Recovery also accepts version 2 copy-backup and
+version 3 rename-backup journals. Older binaries cannot recover version 4:
+do not downgrade with a pending transaction. Recover pending append transactions
+on a supported Unix host before moving to another host. A power cut between
+renames can leave a live file temporarily absent; run recovery before using the
+iPod. Terminal journals remain until cleanup finishes, making cleanup retryable.
+Rename/append boundaries have synthetic fault-injection coverage, not hardware
+power-loss qualification. Keep an independent verified backup.
 Media allocation inventories `Music/Fxx` once per staging batch, not per song,
 and reserves complete filenames case-insensitively before copying.
 

@@ -1,5 +1,5 @@
-//! Version 3: durable originals move to backup only after replacements are
-//! ready. Recovery recognizes the rename gap and can consume backups only
+//! Rename-backed replacements (versions 3 and 4): durable originals move to
+//! backup only after replacements are ready. Recovery recognizes the gap and can consume backups only
 //! after durable rollback intent. Version 2 keeps its copy-based recovery.
 use std::{
     collections::BTreeSet,
@@ -386,7 +386,7 @@ pub(super) fn remove_empty_scaffold(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn flush_original(path: &Path, operation: &'static str) -> Result<()> {
+pub(super) fn flush_original(path: &Path, operation: &'static str) -> Result<()> {
     let mut options = OpenOptions::new();
     options.read(true);
     // FlushFileBuffers needs a writable handle on Windows; Unix fsync works

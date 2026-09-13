@@ -8,7 +8,7 @@ use tempfile::{tempdir, TempDir};
 
 const DB: &str = "iPod_Control/iTunes/iTunesDB";
 
-fn fixture() -> (TempDir, TempDir, Device, StagedSqliteEdit) {
+pub(super) fn fixture() -> (TempDir, TempDir, Device, StagedSqliteEdit) {
     let directory = virtual_classic("ModelNumStr: MC293", true);
     let device = Device::open(directory.path()).unwrap();
     let mut edit = device.edit().unwrap();
@@ -19,6 +19,17 @@ fn fixture() -> (TempDir, TempDir, Device, StagedSqliteEdit) {
         .unwrap()
         .install_and_open(&device, InstallMode::Full, |_| {})
         .unwrap();
+    // Read-only originals can be renamed but must not be opened for append.
+    // Keep this suite exercising the replacement fallback on Unix too.
+    #[cfg(unix)]
+    for entry in fs::read_dir(directory.path().join("iPod_Control/Artwork")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().ends_with(".ithmb") {
+            let mut permissions = entry.metadata().unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(entry.path(), permissions).unwrap();
+        }
+    }
     let mut edit = seeded.edit().unwrap();
     let mut track = addition(directory.path(), true);
     track.title = "Second batch".to_owned();
@@ -84,7 +95,8 @@ fn each_forward_rename_boundary_recovers_without_the_host_bundle() {
                 interrupt(&device, &staged, index, step, mode);
                 let transaction = directory.path().join(TRANSACTION_PATH);
                 let journal = read_journal(&transaction).unwrap();
-                assert_eq!(journal.version, 3);
+                assert_eq!(journal.version, 4);
+                assert!(journal.appends.is_empty());
                 assert_eq!(journal.installed, index + 1);
                 let backup = transaction.join("backup").join(&output.staged);
                 if step == Step::TemporaryReady {
@@ -586,17 +598,17 @@ fn readonly_original_can_be_preserved_and_restored_without_changing_its_mode() {
 fn free_space_budget_does_not_allocate_another_copy_of_original_files() {
     let (_directory, _bundle, _device, staged) = fixture();
     let mut manifest = read_staging_manifest(staged.manifest()).unwrap();
-    let before = required_transaction_bytes(&manifest).unwrap();
+    let before = required_transaction_bytes(&manifest, &append::Plans::new()).unwrap();
     for source in &mut manifest.source {
         if source.bytes.is_some() {
             source.bytes = Some(1_000_000_000_000);
         }
     }
-    let after = required_transaction_bytes(&manifest).unwrap();
+    let after = required_transaction_bytes(&manifest, &append::Plans::new()).unwrap();
     assert!(
         after.abs_diff(before) < 4096,
         "only serialized journal size should change"
     );
     manifest.outputs[0].bytes = u64::MAX;
-    assert!(required_transaction_bytes(&manifest).is_err());
+    assert!(required_transaction_bytes(&manifest, &append::Plans::new()).is_err());
 }

@@ -1084,8 +1084,10 @@ impl StagedSqliteEdit {
     /// attempt using on-device originals; an interrupted install is completed or rolled
     /// back by [`crate::recover_interrupted_transaction`]. Keep the host bundle,
     /// including `original`, intact until installation finishes: preflight
-    /// verifies that host snapshot. On-device backups preserve the live
-    /// originals through durable, verified renames (journal version 3).
+    /// verifies that host snapshot. Journal version 4 uses verified renames
+    /// for replacements and guarded appends for eligible aligned thumbnails.
+    /// Append recovery verifies preserved prefixes and on-device suffix spools
+    /// before truncation; unsupported formats/host geometry use replacements.
     ///
     /// # Errors
     ///
@@ -1139,7 +1141,7 @@ impl StagedSqliteEdit {
     ///
     /// Returns the same errors as [`Self::install_with_mode`]. Keep the host
     /// bundle (including its `original` snapshot) intact until installation
-    /// finishes; preflight verifies it before preparing rename-based recovery.
+    /// finishes; preflight verifies it before preparing on-device recovery.
     pub fn install_and_open(
         &self,
         device: &Device,

@@ -34,7 +34,10 @@ pub(crate) const NEW_ART_ADDITION_CONFIRMATION: &str =
     "I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH NEW COVER ART";
 const JOURNAL_NAME: &str = "journal.json";
 
+mod append;
 mod rename;
+#[cfg(test)]
+mod append_tests;
 #[cfg(test)]
 mod rename_tests;
 
@@ -53,6 +56,8 @@ pub(crate) enum FailureMode {
     SimulateInterruptionAfterCommitted,
     #[cfg(test)]
     SimulateRenameInterruption(usize, rename::Step),
+    #[cfg(test)]
+    SimulateAppendInterruption(usize, append::Step),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -62,6 +67,8 @@ struct TransactionJournal {
     phase: TransactionPhase,
     installed: usize,
     staging: StagingManifest,
+    #[serde(default, skip_serializing_if = "append::Plans::is_empty")]
+    appends: append::Plans,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -264,7 +271,8 @@ pub(crate) fn install_staged_and_open(
     let fast_media = fast_media_targets(staged, &manifest, mode)?;
     verify_bundle(device, staged, &manifest, &fast_media, progress)?;
     progress(ProgressEvent::Phase("Checking space and preparing transaction"));
-    require_transaction_space(device.mount(), &manifest)?;
+    let appends = append::plan(device.mount(), staged.directory(), &manifest)?;
+    require_transaction_space(device.mount(), &manifest, &appends)?;
     let transaction = transaction_host_path(device.mount())?;
     fs::create_dir(&transaction).map_err(|source| {
         if source.kind() == std::io::ErrorKind::AlreadyExists {
@@ -277,7 +285,7 @@ pub(crate) fn install_staged_and_open(
     })?;
     sync_directory(transaction.parent().unwrap_or(device.mount().as_path()))?;
 
-    let result = install_inner(device, staged, manifest, &transaction, failure_mode, &fast_media, progress);
+    let result = install_inner(device, staged, manifest, appends, &transaction, failure_mode, &fast_media, progress);
     if result.is_err() && failure_mode == FailureMode::RollBack {
         progress(ProgressEvent::Phase("Installation failed; recovering transaction"));
         let rollback_result = recover_transaction_with_progress(device.mount(), progress);
@@ -291,11 +299,12 @@ pub(crate) fn install_staged_and_open(
     result
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn install_inner(
     device: &Device,
     staged: &StagedSqliteEdit,
     manifest: StagingManifest,
+    appends: append::Plans,
     transaction: &Path,
     failure_mode: FailureMode,
     fast_media: &BTreeSet<String>,
@@ -303,12 +312,14 @@ fn install_inner(
 ) -> Result<Device> {
     let mut journal = TransactionJournal {
         format: "libopod-device-transaction".to_owned(),
-        version: 3,
+        version: 4,
         phase: TransactionPhase::BackingUp,
         installed: 0,
         staging: manifest,
+        appends,
     };
     write_journal(transaction, &journal)?;
+    append::reserve_recovery_space(transaction, &journal, progress)?;
     let host_original = MountRoot::open(staged.directory().join("original"))?;
 
     for (outputs_backed_up, output) in journal.staging.outputs.iter().enumerate() {
@@ -319,13 +330,15 @@ fn install_inner(
         let original = original_state(&journal.staging, output)?;
         match (original.bytes, original.sha256.as_deref()) {
             (Some(bytes), Some(digest)) => {
-                // Keep the verified host snapshot, but do not copy its bytes
-                // back to USB. The original live file will become the backup
-                // by rename, only after its replacement is ready and durable.
+                // Verify the host snapshot without copying its bytes back
+                // to USB. Replacements preserve originals by rename; appends
+                // preserve the unchanged prefix in the live thumbnail.
                 let relative = IpodPath::new(output.target.clone())?;
                 let source = host_original.resolve_existing(&relative)?;
                 verify_file(&source, bytes, digest, "host transaction backup")?;
-                let _ = rename::prepare_backup_path(transaction, output)?;
+                if !journal.appends.contains_key(&output.target) {
+                    let _ = rename::prepare_backup_path(transaction, output)?;
+                }
                 rename::replacement_target(device.mount(), output)?;
             }
             (None, None) => {
@@ -375,18 +388,25 @@ fn install_inner(
             });
         }
         let stream_verified = fast_media.contains(&output.target);
+        let append_plan = journal.appends.get(&output.target);
         progress(ProgressEvent::Item {
-            operation: if stream_verified { "Copying and hashing media (fast)" } else { "Installing" },
+            operation: if append_plan.is_some() { "Appending artwork" }
+                else if stream_verified { "Copying and hashing media (fast)" } else { "Installing" },
             current: index + 1, total: journal.staging.outputs.len(), name: &output.target,
         });
-        journal.installed = index + 1;
-        write_journal(transaction, &journal)?;
         let staged_file = staged.directory().join(&output.staged);
         if !stream_verified {
             verify_file(
                 &staged_file, output.bytes, &output.sha256, "staged transaction output",
             )?;
         }
+        // Suffix spools must be durable before append intent. Until then the
+        // live original is untouched and recovery may discard a partial spool.
+        if let Some(plan) = append_plan {
+            append::prepare(transaction, &staged_file, output, plan, index, failure_mode, progress)?;
+        }
+        journal.installed = index + 1;
+        write_journal(transaction, &journal)?;
         let original = original_state(&journal.staging, output)?;
         let target = if original.bytes.is_some() {
             rename::replacement_target(device.mount(), output)?
@@ -395,11 +415,15 @@ fn install_inner(
             device.mount().resolve_possible(&relative)?
         };
         if let (Some(bytes), Some(digest)) = (original.bytes, original.sha256.as_deref()) {
-            let backup = rename::prepare_backup_path(transaction, output)?;
-            rename::install_replacement(
-                &staged_file, &target, &backup, output, (bytes, digest),
-                index, failure_mode, progress,
-            )?;
+            if let Some(plan) = append_plan {
+                append::install(transaction, &target, output, digest, plan, index, failure_mode, progress)?;
+            } else {
+                let backup = rename::prepare_backup_path(transaction, output)?;
+                rename::install_replacement(
+                    &staged_file, &target, &backup, output, (bytes, digest),
+                    index, failure_mode, progress,
+                )?;
+            }
         } else {
             install_file_impl(&staged_file, &target, index, stream_verified.then_some(output))?;
         }
@@ -573,18 +597,32 @@ fn recover_with_failure_mode(
         // Persist rollback intent before consuming any rename-backed original.
         // Free new payloads/temporaries first so ENOSPC need not prevent this
         // small journal update. Missing new outputs are valid interrupted states.
-        if journal.version == 3 {
-            journal.phase = TransactionPhase::RollingBack;
-            write_journal(&transaction, &journal)?;
+        if journal.version >= 3 {
+            progress(ProgressEvent::Phase("Persisting rollback intent"));
+            if journal.phase == TransactionPhase::RollingBack {
+                // A prior recovery may have published the marker but failed
+                // its directory flush. Repeat the barriers without allocating
+                // another journal; visible intent is not necessarily durable.
+                rename::flush_original(&transaction.join(JOURNAL_NAME), "flush rollback journal")?;
+                sync_directory(&transaction)?;
+            } else {
+                journal.phase = TransactionPhase::RollingBack;
+                write_journal(&transaction, &journal)?;
+            }
         }
         // Once new payloads are gone, restore every replaced database/artwork
         // file from its verified transaction backup.
         for (current, (index, output, bytes, digest)) in replacements.iter().enumerate() {
             progress(ProgressEvent::Item {
-                operation: "Restoring recovery backup", current: current + 1,
+                operation: if journal.appends.contains_key(&output.target) {
+                    "Truncating appended thumbnail"
+                } else { "Restoring recovery backup" }, current: current + 1,
                 total: replacements.len(), name: &output.target,
             });
-            if journal.version == 3 {
+            if let Some(plan) = journal.appends.get(&output.target) {
+                let target = rename::replacement_target(mount, output)?;
+                append::rollback(&target, plan, *index, failure_mode)?;
+            } else if journal.version >= 3 {
                 let target = rename::replacement_target(mount, output)?;
                 if let Some(backup) = rename::existing_backup(&transaction, output)? {
                     verify_file(&backup, *bytes, digest, "recovery backup")?;
@@ -636,7 +674,7 @@ fn recover_with_failure_mode(
         }
         // Terminal proof makes cleanup restartable even after some backups
         // have been deleted. Upgrade recovered legacy journals for this marker.
-        journal.version = 3;
+        journal.version = journal.version.max(3);
         journal.phase = TransactionPhase::RolledBack;
         write_journal(&transaction, &journal)?;
         // Deleted audio has no byte backup and remains absent by design.
@@ -683,6 +721,7 @@ fn cleanup_interrupted_temporaries(
         remove_if_present(&journal_temporary, "remove interrupted journal temporary")?;
         parents.insert(transaction.to_path_buf());
     }
+    append::release_recovery_space(transaction, journal)?;
     progress(ProgressEvent::Phase("Flushing recovery temporary-file cleanup"));
     for parent in parents {
         sync_directory(&parent)?;
@@ -707,6 +746,7 @@ fn validate_recovery_state(
     progress: &mut Progress<'_>,
 ) -> Result<()> {
     rename::validate_paths(&journal.staging)?;
+    append::validate_plans(journal)?;
     if journal.installed > journal.staging.outputs.len()
         || (journal.phase == TransactionPhase::BackingUp && journal.installed != 0)
         || (matches!(journal.phase, TransactionPhase::Validating | TransactionPhase::Committed)
@@ -825,7 +865,11 @@ fn validate_recovery_state(
         let original = original_state(&journal.staging, output)?;
         match (original.bytes, original.sha256.as_deref()) {
             (Some(original_bytes), Some(original_digest)) => {
-                if journal.version == 3 {
+                if let Some(plan) = journal.appends.get(&output.target) {
+                    append::validate(mount, transaction, journal, index, output, original_digest, plan)?;
+                    continue;
+                }
+                if journal.version >= 3 {
                     rename::validate_replacement(mount, transaction, journal, index, output, original_bytes, original_digest)?;
                     continue;
                 }
@@ -1019,8 +1063,8 @@ fn original_state<'a>(
         })
 }
 
-fn require_transaction_space(mount: &MountRoot, manifest: &StagingManifest) -> Result<()> {
-    let required = required_transaction_bytes(manifest)?;
+fn require_transaction_space(mount: &MountRoot, manifest: &StagingManifest, appends: &append::Plans) -> Result<()> {
+    let required = required_transaction_bytes(manifest, appends)?;
     let available = fs2::available_space(mount.as_path())
         .map_err(|source| io_error("check transaction free space", mount.as_path(), source))?;
     if available < required {
@@ -1034,14 +1078,19 @@ fn require_transaction_space(mount: &MountRoot, manifest: &StagingManifest) -> R
     Ok(())
 }
 
-fn required_transaction_bytes(manifest: &StagingManifest) -> Result<u64> {
+fn required_transaction_bytes(manifest: &StagingManifest, appends: &append::Plans) -> Result<u64> {
     // Every new media output remains on the volume, and replacement outputs
     // temporarily coexist with their live originals. Counting all outputs is
     // conservative, but prevents a many-track sync from passing preflight by
     // accounting for only its single largest file.
     let output_bytes = manifest.outputs.iter().try_fold(0_u64, |total, output| {
-        total
-            .checked_add(output.bytes)
+        let allocated = if let Some(plan) = appends.get(&output.target) {
+            // Both the spool and live suffix coexist until terminal cleanup.
+            output.bytes.checked_sub(plan.original_bytes).and_then(|bytes| bytes.checked_mul(2))
+        } else {
+            Some(output.bytes)
+        };
+        allocated.and_then(|bytes| total.checked_add(bytes))
             .ok_or_else(|| Error::Verification {
                 format: "device transaction",
                 reason: "required output space overflowed u64".to_owned(),
@@ -1049,22 +1098,32 @@ fn required_transaction_bytes(manifest: &StagingManifest) -> Result<u64> {
     })?;
     // Fast deletions happen only after database installation, so their future
     // space cannot safely offset the installation requirement.
-    // Originals already occupy device space. Forward and rollback renames do
-    // not allocate another full copy. Allow two serialized journals (current
-    // and temporary) plus metadata headroom, even for large unbatched edits.
+    // Originals already occupy device space. Append transactions additionally
+    // reserve two journal capacities on disk, released before rollback so an
+    // exhausted volume need not prevent durable rollback/terminal markers.
+    let journal_copies = if appends.is_empty() { 2 } else { 4 };
+    output_bytes
+        .checked_add(journal_capacity(manifest, appends)?.saturating_mul(journal_copies))
+        .and_then(|bytes| bytes.checked_add(4 * 1024 * 1024))
+        .ok_or_else(|| Error::Verification {
+            format: "device transaction",
+            reason: "required transaction space overflowed u64".to_owned(),
+        })
+}
+
+fn journal_capacity(manifest: &StagingManifest, appends: &append::Plans) -> Result<u64> {
     let largest_journal = TransactionJournal {
         format: "libopod-device-transaction".to_owned(),
-        version: 3,
+        version: 4,
         phase: TransactionPhase::RollingBack, // longest serialized phase name
         installed: manifest.outputs.len(),
         staging: manifest.clone(),
+        appends: appends.clone(),
     };
     let journal_bytes = serde_json::to_vec_pretty(&largest_journal).map_err(|error| Error::Verification {
         format: "device transaction", reason: format!("cannot size transaction journal: {error}"),
     })?.len() as u64;
-    output_bytes
-        .checked_add(journal_bytes.saturating_add(1024).saturating_mul(2))
-        .and_then(|bytes| bytes.checked_add(4 * 1024 * 1024))
+    journal_bytes.checked_add(1024)
         .ok_or_else(|| Error::Verification {
             format: "device transaction",
             reason: "required transaction space overflowed u64".to_owned(),
@@ -1283,12 +1342,12 @@ fn read_journal(directory: &Path) -> Result<TransactionJournal> {
             offset: u64::try_from(source.column()).unwrap_or(u64::MAX),
             reason: source.to_string(),
         })?;
-    if journal.format != "libopod-device-transaction" || !matches!(journal.version, 2 | 3)
+    if journal.format != "libopod-device-transaction" || !matches!(journal.version, 2..=4)
         || (journal.version == 2 && matches!(journal.phase, TransactionPhase::RollingBack | TransactionPhase::RolledBack))
     {
         return Err(Error::Unsupported {
             feature: "transaction journal version",
-            reason: "expected libopod-device-transaction version 2 or 3".to_owned(),
+            reason: "expected libopod-device-transaction version 2, 3 or 4".to_owned(),
         });
     }
     Ok(journal)
