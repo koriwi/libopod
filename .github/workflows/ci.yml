@@ -105,12 +105,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes libsqlite3-dev pkg-config
 
-      - name: Annotate Rust diagnostics
-        shell: bash
-        run: |
-          printf '%s\n' '{"problemMatcher":[{"owner":"rust","pattern":[{"regexp":"^(error|warning)(\\[E[0-9]+\\])?: (.*)$","severity":1,"code":2,"message":3},{"regexp":"^\\s+--> (.*):([0-9]+):([0-9]+)$","file":1,"line":2,"column":3}]}]}' > "$RUNNER_TEMP/rust-problem-matcher.json"
-          echo "::add-matcher::$RUNNER_TEMP/rust-problem-matcher.json"
-
       - name: Run unit, integration, and example tests
         run: cargo test --locked --all-targets --no-default-features --features "$SQLITE_FEATURE"
 
@@ -118,4 +112,18 @@ jobs:
         run: cargo test --locked --doc --no-default-features --features "$SQLITE_FEATURE"
 
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets --no-default-features --features "$SQLITE_FEATURE" -- -D warnings
+        env:
+          CARGO_TERM_COLOR: never
+        shell: bash
+        run: |
+          if cargo clippy --locked --all-targets --no-default-features --features "$SQLITE_FEATURE" -- -D warnings 2>&1 | tee "$RUNNER_TEMP/clippy.log"; then
+            exit 0
+          fi
+          # Also expose diagnostics on the public check, not just in job logs.
+          # Escape workflow-command data before displaying compiler output.
+          details=$(tail -n 100 "$RUNNER_TEMP/clippy.log")
+          details=${details//'%'/'%25'}
+          details=${details//$'\r'/'%0D'}
+          details=${details//$'\n'/'%0A'}
+          echo "::error title=Clippy diagnostics::$details"
+          exit 1
