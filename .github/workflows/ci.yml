@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: "Optional PR number: test its merge ref using this workflow from main"
+        required: false
+        type: string
+
+# Fork code must never receive write permissions, repository secrets, or
+# persisted checkout credentials. Do not replace pull_request with
+# pull_request_target to execute PR code.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || inputs.pull_request || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  source:
+    name: Select test revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ref: ${{ steps.checkout.outputs.commit }}
+    steps:
+      - name: Select merge commit or requested PR
+        id: revision
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_PR: ${{ inputs.pull_request }}
+        run: |
+          ref="$GITHUB_SHA"
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+              echo "Manual CI must be dispatched from main." >&2
+              exit 1
+            fi
+            if [[ -n "$REQUESTED_PR" ]]; then
+              if [[ ! "$REQUESTED_PR" =~ ^[1-9][0-9]*$ ]]; then
+                echo "pull_request must be a positive PR number." >&2
+                exit 1
+              fi
+              ref="refs/pull/$REQUESTED_PR/merge"
+            fi
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Testing revision: $ref" >> "$GITHUB_STEP_SUMMARY"
+          echo "Private device dumps are not supplied; fixture-dependent tests may skip." >> "$GITHUB_STEP_SUMMARY"
+
+      # Resolve a moving PR merge ref once, so both matrix jobs test the same
+      # immutable commit even if the contributor pushes again during this run.
+      - name: Resolve immutable checkout SHA
+        id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.revision.outputs.ref }}
+          persist-credentials: false
+
+      - name: Record exact tested commit
+        env:
+          TEST_SHA: ${{ steps.checkout.outputs.commit }}
+        run: |
+          echo "Tested merge/revision SHA: $TEST_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    name: Tests (${{ matrix.sqlite }})
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sqlite: [bundled-sqlite, system-sqlite]
+    env:
+      SQLITE_FEATURE: ${{ matrix.sqlite }}
+    steps:
+      - name: Check out test revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source.outputs.ref }}
+          persist-credentials: false
+
+      - name: Install stable Rust and Clippy
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Install system SQLite development files
+        if: matrix.sqlite == 'system-sqlite'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libsqlite3-dev pkg-config
+
+      - name: Run unit, integration, and example tests
+        run: cargo test --locked --all-targets --no-default-features --features "$SQLITE_FEATURE"
+
+      - name: Run documentation tests
+        run: cargo test --locked --doc --no-default-features --features "$SQLITE_FEATURE"
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --no-default-features --features "$SQLITE_FEATURE" -- -D warnings
