@@ -77,7 +77,15 @@ impl DeviceProfile {
     pub fn supports_podcasts(&self) -> bool {
         matches!(
             self.key,
-            "nano-7g" | "classic" | "classic-6g" | "classic-6.5g" | "classic-7g"
+            "nano-1g"
+                | "nano-2g"
+                | "nano-3g"
+                | "nano-4g"
+                | "nano-7g"
+                | "classic"
+                | "classic-6g"
+                | "classic-6.5g"
+                | "classic-7g"
         )
     }
 
@@ -321,7 +329,7 @@ fn nano_7g() -> DeviceProfile {
 }
 
 /// Uncompressed binary `iTunesDB` profile, without `SQLite`.
-/// Nano 1G/2G artwork writing remains unimplemented.
+/// Nano 1G artwork writing remains unimplemented.
 ///
 /// Covers the signing matrix entry NONE for Nano 1–2G and HASH58 for
 /// Nano 3–4G. `cdb_version` matches the device's `mhbd` version field
@@ -421,7 +429,12 @@ fn nano_2g() -> DeviceProfile {
         ChecksumKind::None,
         0x13,
         14,
-        Vec::new(),
+        // libgpod ipod_nano_cover_art_info; verified against the operator's
+        // Nano 2G mhni sizes and ithmb lengths (RGB565 LE, no row padding).
+        vec![
+            ArtworkFormatProfile { format_id: 1031, slot_bytes: 3_528 },
+            ArtworkFormatProfile { format_id: 1027, slot_bytes: 20_000 },
+        ],
     )
 }
 
@@ -551,22 +564,20 @@ mod tests {
     }
 
     #[test]
-    fn podcast_support_excludes_unimplemented_nano_profiles() {
-        assert!(nano_7g().supports_podcasts());
-        for profile in [nano_1g(), nano_2g(), nano_3g(), nano_4g()] {
-            assert!(!profile.supports_podcasts());
+    fn podcast_support_includes_every_writable_nano_generation() {
+        for profile in [nano_1g(), nano_2g(), nano_3g(), nano_4g(), nano_7g()] {
+            assert!(profile.supports_podcasts(), "{}", profile.key());
         }
     }
 
     #[test]
     fn artwork_support_matches_the_device_family() {
-        // Nano 1G/2G can display artwork, but their writer profiles are not
-        // implemented yet. Staging must therefore leave their ArtworkDB and
-        // ithmb files untouched. Nano 3G/4G and 7G are writable.
-        for profile in [nano_1g(), nano_2g()] {
-            assert!(!profile.capabilities().supports_artwork());
-        }
-        for profile in [nano_3g(), nano_4g(), nano_7g()] {
+        // Nano 1G can display artwork, but its writer is not enabled yet.
+        assert!(!nano_1g().capabilities().supports_artwork());
+        assert_eq!(nano_2g().capabilities().artwork_formats.iter()
+            .map(|format| (format.format_id, format.slot_bytes)).collect::<Vec<_>>(),
+            [(1031, 3_528), (1027, 20_000)]);
+        for profile in [nano_2g(), nano_3g(), nano_4g(), nano_7g()] {
             assert!(profile.capabilities().supports_artwork());
         }
     }

@@ -1,7 +1,7 @@
-//! New-artwork encoding for Nano 7G `.ithmb` frames.
+//! New-artwork encoding for supported Nano and Classic `.ithmb` frames.
 //!
-//! Source images (JPEG/PNG) are decoded, resized to each of the four Nano 7G
-//! cover formats, and encoded as RGB565 little-endian frames with the
+//! Source images (JPEG/PNG) are decoded, resized to the profile's cover
+//! formats, and encoded as RGB565 little-endian frames with the
 //! per-format stride. Frames are stored in fixed-size `.ithmb` slots; new art
 //! appends one slot per format to the existing files.
 
@@ -9,7 +9,7 @@ use image::imageops::FilterType;
 
 use crate::{Error, Result};
 
-/// One Nano 7G cover-art format definition.
+/// One RGB565 cover-art format definition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Nano7gFormat {
     pub format_id: u32,
@@ -72,6 +72,14 @@ impl EncodedFrame {
         self.row_bytes() * u64::from(self.height)
     }
 }
+
+/// Nano 2G cover formats from libgpod's `ipod_nano_cover_art_info`, corroborated
+/// by on-device mhni sizes and file lengths. These are cover formats, not the
+/// different 1032/1023 photo-library formats. Neither slot is 4 KiB aligned.
+const NANO2G_COVER_FORMATS: [Nano7gFormat; 2] = [
+    Nano7gFormat { format_id: 1031, width: 42, height: 42, stride_pixels: 42, filename: "F1031_1.ithmb" },
+    Nano7gFormat { format_id: 1027, width: 100, height: 100, stride_pixels: 100, filename: "F1027_1.ithmb" },
+];
 
 /// Nano 3G cover-art formats measured from the operator's real device.
 pub(crate) const NANO3G_COVER_FORMATS: [Nano7gFormat; 4] = [
@@ -182,6 +190,7 @@ pub(crate) fn encode_new_frames(source: &[u8]) -> Result<Vec<EncodedFrame>> {
 /// Returns an error for an unsupported classic profile or invalid image.
 pub(crate) fn encode_classic_frames(source: &[u8], profile_key: &str) -> Result<Vec<EncodedFrame>> {
     match profile_key {
+        "nano-2g" => encode_frames(source, &NANO2G_COVER_FORMATS),
         "nano-3g" => encode_frames(source, &NANO3G_COVER_FORMATS),
         "nano-4g" => encode_frames(source, &NANO4G_COVER_FORMATS),
         "classic" | "classic-6g" | "classic-6.5g" | "classic-7g" => {

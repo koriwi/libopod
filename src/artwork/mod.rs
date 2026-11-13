@@ -9,7 +9,7 @@ mod encode;
 pub(crate) use encode::{encode_classic_frames, encode_new_frames};
 mod write;
 
-pub(crate) use write::{append_artwork_records, build_reused_children, NewArtworkRecord};
+pub(crate) use write::{append_artwork_records, build_reused_children, reuse_record_children, NewArtworkRecord};
 
 use std::{
     collections::{BTreeMap, BTreeSet},

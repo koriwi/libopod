@@ -25,14 +25,40 @@ println!("{} tracks", device.library().map_or(0, |library| library.track_count()
 
 | Device | Status |
 |---|---|
-| iPod Nano 2G | ✅ Tested |
-| iPod Nano 3G | ✅ Tested |
+| iPod Nano 2G | ✅ Music tested; artwork and podcasts need playback verification |
+| iPod Nano 3G | ✅ Music tested; podcasts need playback verification |
 | iPod Nano 7G | ✅ Tested |
-| iPod Nano 1G, 4G, 5G, 6G | 🧪 Testers wanted |
+| iPod Nano 1G, 4G | 🧪 Music and podcasts implemented; hardware testing needed |
+| iPod Nano 5G, 6G | 🧪 Testers wanted |
 | iPod Classic 160 GB revision B (7G) | ✅ Music sync tested; podcasts need testing |
 | iPod Classic 6G, 120 GB revision A | 🧪 Implemented; hardware testing needed |
 
 Testing on unlisted hardware is greatly appreciated. See [HARDWARE_TESTING.md](HARDWARE_TESTING.md) before writing to a device.
+
+## iPod Nano 2G artwork
+
+Nano 2G now supports cover additions, reuse, removal/reindexing, and recovery.
+Its native cover formats are **1031 (42×42, 3,528 bytes)** and **1027 (100×100,
+20,000 bytes)**, RGB565 little-endian without row padding. These match
+[libgpod's device table](https://github.com/fadingred/libgpod/blob/master/src/itdb_device.c)
+and read-only measurements of the operator's Nano 2G files. Existing reused
+cover records retain their padding/crop and opaque child metadata.
+
+The writer requires initialized `iTunesDB` and `ArtworkDB` files. It supports
+legacy 0x148-byte track headers, linking covers through track persistent IDs.
+Nano 2G uses verified full-file replacements with rename backups, not incremental
+thumbnail appends. Synthetic tests and edits on a disposable copy of native
+files pass; physical display/playback qualification remains outstanding.
+Nano 1G artwork writing remains disabled; its music edits leave artwork alone.
+
+## Click-wheel Nano podcast support
+
+Nano 1G through 4G support podcast additions and removals through their binary
+`iTunesDB` backend. Podcast tracks get the media-kind, resume, shuffle, unplayed,
+and Now Playing flags, plus a protected Podcasts playlist with dataset-3 show
+groups. Nano 1G and 2G use the same version-0x13, 0x148-byte track layout;
+Nano 3G and 4G use their HASH58-signed layout. Synthetic tests cover all four
+generations, but podcast playback still needs hardware verification.
 
 ## iPod Classic support
 

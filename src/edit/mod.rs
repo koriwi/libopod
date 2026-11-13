@@ -491,7 +491,8 @@ impl<'device> EditSession<'device> {
         {
             return Err(Error::Unsupported {
                 feature: "podcast addition",
-                reason: "podcast writes are supported only on Classic and Nano 7G profiles".to_owned(),
+                reason: "podcast writes are supported only on podcast-capable device profiles"
+                    .to_owned(),
             });
         }
         if track.title.trim().is_empty() || track.sample_rate == 0 {
@@ -664,9 +665,10 @@ impl<'device> EditSession<'device> {
                 .collect::<Vec<_>>();
             database = edit_classic_playlists(&database, checksum, guid.as_ref(), &mutations)?;
         }
-        // The Classic firmware needs a flagged Podcasts playlist as well as
-        // media-kind fields on the tracks. Rebuild show groups after removals
-        // too, so no empty or dangling podcast group headers survive.
+        // Classic-format firmware (Nano 1G–4G and full-size Classic) needs a
+        // flagged Podcasts playlist as well as media-kind fields on the tracks.
+        // Rebuild show groups after removals too, so no empty or dangling
+        // podcast group headers survive.
         if profile.supports_podcasts()
             && (resolved.iter().any(|track| track.media_kind == MediaKind::Podcast)
                 || before.tracks().iter().any(|track| {
@@ -680,7 +682,7 @@ impl<'device> EditSession<'device> {
         }
         // Classic artwork uses the same mhfd ArtworkDB and fixed-slot ithmb
         // files as the Nano 7G: removals drop records and reindex slots,
-        // additions append records and frames. Nano 1G/2G artwork writing is
+        // additions append records and frames. Nano 1G artwork writing is
         // not implemented, so their edits must leave ArtworkDB untouched.
         progress(ProgressEvent::Phase("Updating artwork database and thumbnails"));
         let artwork_supported = profile.capabilities().supports_artwork();
@@ -1328,7 +1330,11 @@ fn resolve_reused_artwork(
             format: "artwork reuse",
             reason: "album-mate track has no ArtworkDB record".to_owned(),
         })?;
-    let (mhod_children, child_count) = crate::artwork::build_reused_children(&record.formats);
+    let profile = device.profile().ok_or_else(|| Error::Unsupported {
+        feature: "artwork reuse", reason: "device profile is unknown".to_owned(),
+    })?;
+    referenced_artwork_files(std::slice::from_ref(record), &profile.capabilities().artwork_formats)?;
+    let (mhod_children, child_count) = crate::artwork::reuse_record_children(&bytes, record.track_id)?;
     let image_id = *next_image_id;
     *next_image_id = next_image_id.saturating_add(1);
     Ok(Some(ArtworkLink {
@@ -1565,7 +1571,10 @@ fn removed_ithmb_targets(
     device: &Device,
     removals: &BTreeSet<PersistentId>,
 ) -> Result<Vec<IpodPath>> {
-    if removals.is_empty() {
+    // Match write_artwork_preview: a profile without an artwork writer must
+    // neither modify thumbnails nor claim/validate thumbnail rewrite outputs.
+    if removals.is_empty() || !device.profile()
+        .is_some_and(|profile| profile.capabilities().supports_artwork()) {
         return Ok(Vec::new());
     }
     let has_artwork = device.library().is_some_and(|library| {
@@ -2003,7 +2012,7 @@ fn write_artwork_preview(
     directory: &Path,
     removals: &BTreeSet<PersistentId>,
 ) -> Result<()> {
-    // Profiles without writable artwork formats (currently Nano 1G/2G) must
+    // Profiles without writable artwork formats (currently Nano 1G) must
     // leave artwork storage untouched during a database/media removal.
     if !device
         .profile()
@@ -2501,6 +2510,8 @@ include!("tests.rs");
 
 #[cfg(test)]
 mod classic_tests;
+#[cfg(test)]
+mod nano2_artwork_tests;
 #[cfg(test)]
 mod fast_tests;
 #[cfg(test)]

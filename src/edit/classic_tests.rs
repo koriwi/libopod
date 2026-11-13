@@ -479,6 +479,112 @@ fn classic_podcasts_have_a_protected_container_and_show_groups() {
 }
 
 #[test]
+fn nano1_through_nano4_write_native_podcast_tracks_and_containers() {
+    for (identity, key, db_version, mhit_header, hash58) in [
+        (
+            "ModelFamily: iPod Nano\nGeneration: 4th Gen",
+            "nano-4g",
+            0x30,
+            0x270,
+            true,
+        ),
+        (
+            "ModelFamily: iPod Nano\nGeneration: 3rd Gen",
+            "nano-3g",
+            0x30,
+            0x270,
+            true,
+        ),
+        (
+            "ModelFamily: iPod Nano\nGeneration: 2nd Gen",
+            "nano-2g",
+            0x13,
+            0x148,
+            false,
+        ),
+        (
+            "ModelFamily: iPod Nano\nGeneration: 1st Gen",
+            "nano-1g",
+            0x13,
+            0x148,
+            false,
+        ),
+    ] {
+        let directory = virtual_classic(identity, false);
+        let root = directory.path();
+        // Exercise the legacy 1G/2G header selected by their native database
+        // version. The 3G/4G fixture already uses the HASH58-era version.
+        let mut database = fs::read(root.join(DB)).unwrap();
+        put(&mut database, 0x10, usize::try_from(db_version).unwrap());
+        if hash58 {
+            crate::crypto::hash58::sign_database(&GUID, &mut database);
+        }
+        fs::write(root.join(DB), database).unwrap();
+
+        let device = Device::open(root).unwrap();
+        let profile = device.profile().unwrap();
+        assert_eq!(profile.key(), key);
+        assert_eq!(profile.capabilities().cdb_version, db_version);
+        assert!(profile.supports_podcasts());
+
+        let mut edit = device.edit().unwrap();
+        for (title, show) in [("Episode A", "Show A"), ("Episode B", "Show B")] {
+            let mut track = addition(root, false);
+            track.title = title.to_owned();
+            track.album = Some(show.to_owned());
+            track.media_kind = MediaKind::Podcast;
+            edit.add_track(track).unwrap();
+        }
+        let bundle = tempdir().unwrap();
+        edit.stage_sqlite_preview(bundle.path())
+            .unwrap()
+            .install(&device)
+            .unwrap();
+
+        let device = Device::open(root).unwrap();
+        let library = device.library().unwrap();
+        assert_eq!(library.track_count(), 2, "{key}");
+        assert!(library
+            .tracks()
+            .iter()
+            .all(|track| track.media_kind == MediaKind::Podcast));
+        let podcasts = library
+            .playlists()
+            .iter()
+            .filter(|playlist| playlist.distinguished_kind == 11)
+            .collect::<Vec<_>>();
+        assert_eq!(podcasts.len(), 1, "{key}");
+        assert!(podcasts[0].is_hidden);
+        assert_eq!(podcasts[0].track_ids().len(), 2);
+
+        let database = fs::read(root.join(DB)).unwrap();
+        let datasets = children(&database, number(&database, 4), number(&database, 0x14));
+        let tracks = datasets
+            .iter()
+            .find(|dataset| number(dataset, 12) == 1)
+            .unwrap();
+        let list = number(tracks, 4);
+        let rows = children(
+            tracks,
+            list + number(tracks, list + 4),
+            number(tracks, list + 8),
+        );
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(number(row, 4), mhit_header, "{key}");
+            assert_eq!(&row[0xa5..0xa8], &[1, 1, 1], "{key}");
+            assert_eq!(row[0xb2], 2, "{key}");
+            assert_eq!(number(row, 0xd0), 4, "{key}");
+        }
+        assert_eq!(podcast_items(&database, 2).len(), 2, "{key}");
+        assert_eq!(podcast_items(&database, 3).len(), 4, "{key}");
+        if hash58 {
+            assert_signed(root);
+        }
+    }
+}
+
+#[test]
 fn progress_events_bracket_real_staging_install_and_deletion_work() {
     use crate::ProgressEvent;
 

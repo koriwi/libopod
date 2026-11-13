@@ -6,6 +6,29 @@ operator confirmation that identifies the mounted volume.
 The initial Nano 7G backup at `backup_7g/` is private and immutable. It is a
 file-level development input, not a write target.
 
+## Nano 2G artwork qualification
+
+Read-only inspection confirmed cover format 1031 slots of 3,528 bytes and format
+1027 slots of 20,000 bytes, matching libgpod's 42×42 and 100×100 RGB565 LE tables.
+Native records also carried vertical padding, which image reuse now preserves.
+Synthetic tests cover encoding byte order, short 0x148 MHIT headers, artwork
+additions, reuse, deletion/reindexing, unknown formats, and interrupted recovery
+in Full/Fast modes. A disposable copy of native files passed add/remove/recovery
+checks. No write test has run on the physical Nano 2G for this artwork change.
+
+An optional offline-copy test accepts an `iPod_Control` snapshot directory:
+
+```console
+LIBOPOD_TEST_NANO2_SNAPSHOT=/path/to/snapshot/iPod_Control \
+  cargo test nano2_artwork_tests::native_nano2_snapshot_roundtrip_when_supplied
+```
+
+The test copies only databases/thumbnails to temporary storage, supplies its own
+Nano 2G identity and synthetic audio, and modifies only that temporary copy.
+It does not qualify firmware playback or power-loss behavior. Keep a verified
+independent backup before a real sync, then safely eject and inspect covers.
+Nano 2G thumbnails use full replacement with rename backups, not append journals.
+
 ## Incremental artwork and rename-backed transactions (journal version 4)
 
 New commits preserve replacement originals by rename after verifying durable

@@ -1033,7 +1033,7 @@ fn expected_artwork_outputs(
     removed_ithmb: &[IpodPath],
 ) -> usize {
     if !artwork_supported {
-        // Nano 1G/2G libraries can contain ArtworkDB records even though
+        // Unimplemented profiles can contain ArtworkDB records even though
         // libopod does not yet have a qualified writer for their formats.
         // Their staging bundles intentionally leave all artwork files alone.
         return 0;
@@ -1379,7 +1379,7 @@ mod tests {
         assert_eq!(
             expected_artwork_outputs(false, 3, 0, &[], &[]),
             0,
-            "Nano 1G/2G edits intentionally leave their existing artwork untouched"
+            "edits on profiles without an artwork writer leave existing artwork untouched"
         );
     }
 

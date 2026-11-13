@@ -79,6 +79,33 @@ pub(crate) fn append_artwork_records(
     Ok(output)
 }
 
+/// Copy an existing image's children verbatim. Rebuilding from parsed format
+/// references loses padding/crop and opaque fields (notably on Nano 2G).
+/// Only the enclosing mhii gets a new image ID and track persistent ID.
+pub(crate) fn reuse_record_children(bytes: &[u8], track_id: PersistentId) -> Result<(Vec<u8>, u32)> {
+    // Validate all record/child bounds before walking and slicing raw chunks.
+    super::parse_artwork_records(bytes)?;
+    let mut dataset = header_length(bytes)?;
+    for _ in 0..le_u32(bytes, 20)? {
+        if le_u32(bytes, dataset + 12)? == 1 {
+            let list = dataset + usize_value(le_u32(bytes, dataset + 4)?, dataset + 4)?;
+            let mut record = list + usize_value(le_u32(bytes, list + 4)?, list + 4)?;
+            for _ in 0..le_u32(bytes, list + 8)? {
+                let total = usize_value(le_u32(bytes, record + 8)?, record + 8)?;
+                if super::le_u64(bytes, record + 20)? == track_id.to_bits() {
+                    let header = usize_value(le_u32(bytes, record + 4)?, record + 4)?;
+                    let children = bytes.get(record + header..record + total)
+                        .ok_or_else(|| verification("reused artwork child range is invalid"))?;
+                    return Ok((children.to_vec(), le_u32(bytes, record + 12)?));
+                }
+                record += total;
+            }
+        }
+        dataset += usize_value(le_u32(bytes, dataset + 8)?, dataset + 8)?;
+    }
+    Err(verification("reused artwork record is missing"))
+}
+
 fn rewrite_mhli_with_appends(
     bytes: &[u8],
     dataset_offset: usize,
@@ -152,7 +179,8 @@ fn build_mhii(record: &NewArtworkRecord) -> Vec<u8> {
 
 /// Serializes one type-2 container MHOD per format ref, wrapping a fresh MHNI
 /// that references an existing `.ithmb` slot, and returns the bytes plus the
-/// child count. Used when a new track reuses an album's slots.
+/// child count. Used for newly encoded frames. Existing image reuse must use
+/// `reuse_record_children` to preserve padding and opaque metadata.
 pub(crate) fn build_reused_children(format_refs: &[super::ArtworkFormatRef]) -> (Vec<u8>, u32) {
     let mut children = Vec::new();
     let mut count = 0_u32;
