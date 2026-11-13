@@ -7,6 +7,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use super::sort::sort_key;
 use crate::{Error, MediaKind, PersistentId, Result, SqliteLibraryFile};
 
+#[cfg(test)]
+#[path = "sqlite_regression_tests.rs"]
+mod regression_tests;
+
 /// A fully resolved staged track addition: metadata, persistent ID, media
 /// target, and timestamps are fixed before any database write.
 #[derive(Clone, Debug)]
@@ -1139,7 +1143,8 @@ pub(crate) fn reindex_browse_orders(transaction: &Transaction<'_>, path: &Path) 
     // Album rows: one rank slot per album row, sorted by sort key, ties in
     // pid order (Apple ranks rows, not distinct names — "Follow the Leader"
     // is 5100 while its deduped name rank is 48). sort_order mirrors
-    // name_order exactly, as Apple writes it.
+    // name_order exactly, as Apple writes it. libopod places empty effective
+    // sort keys last; equal keys still receive separate slots in PID order.
     let mut albums: Vec<(i64, String)> = transaction
         .prepare("SELECT pid, COALESCE(NULLIF(sort_name, ''), name, '') FROM album")
         .map_err(|source| sqlite_error("prepare album reindex", path, source))?
@@ -1148,9 +1153,13 @@ pub(crate) fn reindex_browse_orders(transaction: &Transaction<'_>, path: &Path) 
         .collect::<std::result::Result<_, _>>()
         .map_err(|source| sqlite_error("collect album reindex", path, source))?;
     albums.sort_by(|left, right| {
-        sort_key(&left.1)
-            .cmp(&sort_key(&right.1))
-            .then(left.0.cmp(&right.0))
+        let left_key = sort_key(&left.1);
+        let right_key = sort_key(&right.1);
+        left_key
+            .is_empty()
+            .cmp(&right_key.is_empty())
+            .then_with(|| left_key.cmp(&right_key))
+            .then_with(|| left.0.cmp(&right.0))
     });
     for (index, (pid, _name)) in albums.iter().enumerate() {
         let order = i64::try_from(index + 1)

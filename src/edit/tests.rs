@@ -1504,7 +1504,7 @@ mod tests {
         connection.query_row(sql, [], |row| row.get(0)).unwrap()
     }
 
-    fn create_database_set(directory: &std::path::Path) {
+    pub(super) fn create_database_set(directory: &std::path::Path) {
         let library = Connection::open(
             directory.join(SqliteLibraryFile::Library.file_name()),
         )
