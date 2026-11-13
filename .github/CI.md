@@ -1,14 +1,18 @@
 # Continuous integration
 
 The `CI` workflow runs on pushes to `main`, pull requests targeting `main`
-(including forks), and manual dispatches. Each run checks stable Rust with both
-bundled SQLite and the system SQLite library:
+(including forks), and manual dispatches. Each run checks both bundled SQLite
+and the system SQLite library:
 
-- `cargo test --locked --all-targets` (unit, integration, and example targets)
-- `cargo test --locked --doc`
-- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo test --locked --all-targets` on latest stable Rust (unit, integration,
+  and example targets)
+- `cargo test --locked --doc` on latest stable Rust
+- `cargo +1.95.0 clippy --locked --all-targets -- -D warnings`
 
 Both SQLite jobs use `--no-default-features --features <sqlite-feature>`.
+Clippy uses the previously qualified Rust 1.95.0 lint baseline: newer stable
+releases introduce pedantic lints, so upgrade that baseline deliberately rather
+than blocking unrelated PRs. The test compiler still follows stable.
 Formatting is not enforced yet: the repository has existing rustfmt drift.
 
 ## Fork PRs and trusted workflow definitions

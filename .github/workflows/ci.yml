@@ -93,11 +93,10 @@ jobs:
           ref: ${{ needs.source.outputs.ref }}
           persist-credentials: false
 
-      - name: Install stable Rust and Clippy
+      - name: Install stable Rust
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
-          components: clippy
 
       - name: Install system SQLite development files
         if: matrix.sqlite == 'system-sqlite'
@@ -111,12 +110,21 @@ jobs:
       - name: Run documentation tests
         run: cargo test --locked --doc --no-default-features --features "$SQLITE_FEATURE"
 
+      # Keep the lint baseline reproducible: new pedantic lints in a stable
+      # release must not break otherwise unrelated PRs. Tests above still use
+      # the latest stable compiler. Upgrade this baseline deliberately.
+      - name: Install qualified Clippy baseline
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable action implementation
+        with:
+          toolchain: 1.95.0
+          components: clippy
+
       - name: Run Clippy
         env:
           CARGO_TERM_COLOR: never
         shell: bash
         run: |
-          if cargo clippy --locked --all-targets --no-default-features --features "$SQLITE_FEATURE" -- -D warnings 2>&1 | tee "$RUNNER_TEMP/clippy.log"; then
+          if cargo +1.95.0 clippy --locked --all-targets --no-default-features --features "$SQLITE_FEATURE" -- -D warnings 2>&1 | tee "$RUNNER_TEMP/clippy.log"; then
             exit 0
           fi
           # Also expose diagnostics on the public check, not just in job logs.
