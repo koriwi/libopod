@@ -4,7 +4,7 @@ Experimental Rust library for managing storage-mounted iPods running Apple firmw
 
 [![CI](https://github.com/koriwi/libopod/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/koriwi/libopod/actions/workflows/ci.yml)
 
-CI runs tests, documentation tests, and Clippy for bundled and system SQLite on
+CI runs tests, documentation tests, and Clippy for bundled and system `SQLite` on
 pushes and fork PRs. See [CI setup](.github/CI.md) for required checks, trusted
 `main`-workflow runs of existing PRs, and the limits of public-fixture coverage.
 
