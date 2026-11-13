@@ -1,21 +1,21 @@
 # PR #1 regression checks
 
 These tests use synthetic databases only. They do not need private device dumps
-or physical hardware. The local changes include the chosen empty-last album-row
-policy. The other production fixes remain separate in PR #1.
+or physical hardware. PR #1 is merged in `c59d2f5`; the follow-up artist fixes
+make all **21 checks pass**, with no ignored checks.
 
-Run the active checks:
+Run the checks:
 
 ```sh
 cargo test --locked --lib edit::add::regression_tests
 ```
 
-Comparison performed against:
+## Historical comparison before the artist follow-up
 
-- `main` at `40725d7` plus the local empty-last album-row fix
-- The same source plus PR #1 head `81ebf88`
+The original 18 checks compared `main` at `40725d7` plus the empty-last album-row
+fix against the same source plus PR #1 head `81ebf88`:
 
-| Case | Main + local album fix | Same source + PR #1 |
+| Case | Main + album fix | Same source + PR #1 |
 | --- | --- | --- |
 | NULL-name rank queries and insertions (6 tests) | Fail | Pass |
 | Preserve an artist while an album needs it | Fail | Pass |
@@ -26,10 +26,10 @@ Comparison performed against:
 | Remove the retained artist after its last album disappears in a later edit | Pass | Fail |
 | Empty album rows last, with distinct slots and PID tie order (2 tests) | Pass | Pass |
 
-Totals: **5 pass / 13 fail / 0 ignored** without PR #1;
-**16 pass / 2 fail / 0 ignored** with PR #1.
+Those totals were **5 pass / 13 fail** without PR #1 and **16 pass / 2 fail**
+with PR #1. The two failures motivated the artist follow-up below.
 
-## Artist cases that need more work
+## Artist follow-up fixes
 
 The fixture has two tracks on one album. Track 1 directly names artist 20;
 track 2 directly names artist 21. The album refers to artist 20.
@@ -37,36 +37,39 @@ track 2 directly names artist 21. The album refers to artist 20.
 1. Remove track 1. Keep artist 20 because the album still needs it.
 2. Refresh artist 20's flags and counts according to the existing production
    UPDATE expressions, which use direct `item.artist_pid` references. Keep its
-   artwork link to the surviving album. The PR preserves the row but skips the
-   UPDATE, so this check still fails.
+   artwork link to the surviving album. The update now includes affected artists
+   with no direct tracks.
 3. Remove track 2 in a separate edit. No track or album now needs artist 20.
-   The PR leaves that record behind because the second edit only queues artist
-   21 for cleanup. This check passes on main only because main prematurely
-   deletes artist 20 in the first edit; the preservation test catches that bug.
+   The edit captures the album's artist before deleting the album, so cleanup
+   now includes artist 20 as well as the removed track's artist 21.
 
-These checks exercise database consistency rules. They do not claim a specific
-visible firmware fault or prove Apple's intended artist-aggregate semantics.
+Three additional tests check that:
+
+- Cleanup includes an album owner even if no track directly names that artist.
+- Another surviving album keeps its artist alive and supplies the new artwork
+  link; removing that last album then permits artist cleanup.
+- Cleanup does not refresh or delete unrelated NULL-name firmware placeholders.
+
+Before the follow-up, the expanded suite had **17 passing and 4 failing**
+checks. After the follow-up, all **21 pass**. These checks exercise database
+consistency rules. They do not prove Apple's intended artist-aggregate semantics
+or a specific visible firmware fault.
 
 ## Chosen album-order policy
 
 The maintainer chose empty album rows last as an explicit libopod rule. Both
-album-row tests now run normally. They failed before the local comparator fix
-and pass after it. The fix puts empty effective sort keys after named keys,
-keeps one scaled rank per album row, breaks equal-key ties by PID, and updates
+album-row tests run normally. They failed before the comparator fix and pass
+after it. The fix puts empty effective sort keys after named keys, keeps one
+scaled rank per album row, breaks equal-key ties by PID, and updates
 `name_order` and `sort_order` together.
 
-The PR changes the shared key-order function, but album rows use this separate
-comparator. Keep the local album fix when testing or merging the PR.
-
-Run the album checks alone:
+The shared key-order function and the separate album-row comparator both follow
+this policy. Run the album checks alone:
 
 ```sh
 cargo test --locked --lib album_rows_
 ```
 
 These tests define our chosen policy. They do not independently prove the
-behavior of every iPod firmware or browse category.
-
-The active tests intentionally leave the suite red until the corresponding
-fixes meet the checks. Review or amend the criteria before committing them to
-main. No test changes the mounted iPod or the original private fixtures.
+behavior of every iPod firmware or browse category. No test changes a mounted
+iPod or the original private fixtures.

@@ -1776,10 +1776,13 @@ fn prepare_removal_tables(
             reason: "one or more queued tracks disappeared from the source generation".to_owned(),
         });
     }
+    // Capture album owners before deleting albums: the surviving tracks can
+    // name different artists. Refresh and clean up both sets of artist IDs.
     transaction
         .execute_batch(
             "INSERT INTO temp.opod_album SELECT DISTINCT album_pid FROM item JOIN temp.opod_removed USING(pid);\
              INSERT INTO temp.opod_artist SELECT DISTINCT artist_pid FROM item JOIN temp.opod_removed USING(pid);\
+             INSERT INTO temp.opod_artist SELECT DISTINCT artist_pid FROM album WHERE pid IN temp.opod_album;\
              INSERT INTO temp.opod_track_artist SELECT DISTINCT track_artist_pid FROM item JOIN temp.opod_removed USING(pid);\
              INSERT INTO temp.opod_composer SELECT DISTINCT composer_pid FROM item JOIN temp.opod_removed USING(pid);\
              INSERT INTO temp.opod_genre SELECT DISTINCT genre_id FROM item JOIN temp.opod_removed USING(pid);\
@@ -1817,10 +1820,10 @@ fn delete_direct_references(transaction: &Transaction<'_>, path: &Path) -> Resul
 
 #[allow(clippy::too_many_lines)]
 fn update_derived_rows(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
-    // Orphan-free delete: albums also reference artist rows
-    // (album.artist_pid), so the artist DELETE below must keep an artist that
-    // only albums still point at — Apple never leaves a dangling
-    // album.artist_pid behind.
+    // Albums also reference artist rows. Refresh affected artists even when
+    // they have no direct tracks, then keep them while any album needs them.
+    // The candidate IDs include album owners, so later edits can remove an
+    // owner after its last album disappears without touching unrelated rows.
     transaction
         .execute_batch(
             "UPDATE album SET \
@@ -1842,7 +1845,7 @@ fn update_derived_rows(transaction: &Transaction<'_>, path: &Path) -> Result<()>
                album_count=(SELECT COUNT(DISTINCT album_pid) FROM item WHERE item.artist_pid=artist.pid),\
                artwork_album_pid=COALESCE((SELECT pid FROM album WHERE album.artist_pid=artist.pid AND COALESCE(artwork_status,0)!=0 ORDER BY COALESCE(name_order,0),pid LIMIT 1),0),\
                artwork_status=EXISTS(SELECT 1 FROM album WHERE album.artist_pid=artist.pid AND COALESCE(artwork_status,0)!=0)\
-             WHERE pid IN temp.opod_artist AND EXISTS(SELECT 1 FROM item WHERE item.artist_pid=artist.pid);\
+             WHERE pid IN temp.opod_artist;\
              DELETE FROM artist WHERE pid IN temp.opod_artist AND pid!=0 AND NOT EXISTS(SELECT 1 FROM item WHERE item.artist_pid=artist.pid) AND NOT EXISTS(SELECT 1 FROM album WHERE album.artist_pid=artist.pid);\
              UPDATE track_artist SET \
                has_songs=EXISTS(SELECT 1 FROM item WHERE item.track_artist_pid=track_artist.pid AND is_song!=0),\

@@ -246,6 +246,96 @@ fn one_removal_deletes_artists_when_no_track_or_album_needs_them() {
 }
 
 #[test]
+fn removal_cleans_up_an_album_artist_with_no_direct_tracks() {
+    let (directory, connection) = multi_artist_album();
+    connection
+        .execute_batch("UPDATE item SET artist_pid=21,artist='Guest Artist',sort_artist=NULL;")
+        .unwrap();
+    remove_tracks(&directory, &[1, 2]);
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM artist WHERE pid IN (20,21)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0, "cleanup must include the album's own artist");
+}
+
+#[test]
+fn album_artist_survives_until_its_last_other_album_disappears() {
+    let (directory, connection) = multi_artist_album();
+    connection
+        .execute_batch(
+            "INSERT INTO item \
+               (pid,physical_order,album_pid,artist_pid,track_artist_pid,composer_pid,genre_id,\
+                category_id,genius_id,media_kind,is_song,is_music_video,is_movie,is_compilation,\
+                artwork_status,title,artist,album) \
+             VALUES (3,2,11,21,30,40,50,0,0,1,1,0,0,0,1,'Other Track','Guest Artist','Other Album');\
+             INSERT INTO album \
+               (pid,item_count,has_songs,has_music_videos,has_movies,has_any_compilations,\
+                all_compilations,artwork_item_pid,artwork_status,min_volume_normalization_energy,\
+                artist_pid,name_order,name) \
+             VALUES (11,1,1,0,0,0,0,3,1,9,20,200,'Other Album');\
+             INSERT INTO avformat_info VALUES (3,9);",
+        )
+        .unwrap();
+    remove_tracks(&directory, &[1]);
+    remove_tracks(&directory, &[2]);
+    let artist: Option<(i64, i64, i64)> = connection
+        .query_row(
+            "SELECT has_songs,album_count,artwork_album_pid FROM artist WHERE pid=20",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        artist,
+        Some((0, 0, 11)),
+        "keep artist 20 for album 11 and move its artwork link away from deleted album 10"
+    );
+    remove_tracks(&directory, &[3]);
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM artist WHERE pid IN (20,21)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "no artist reference remains after the last album"
+    );
+}
+
+#[test]
+fn album_artist_cleanup_does_not_touch_unrelated_firmware_placeholders() {
+    let (directory, connection) = multi_artist_album();
+    connection
+        .execute_batch(
+            "INSERT INTO artist \
+               (pid,name,has_songs,album_count,artwork_album_pid,artwork_status) \
+             VALUES (900,NULL,1,7,0,0);",
+        )
+        .unwrap();
+    remove_tracks(&directory, &[1, 2]);
+    let placeholder: Option<(Option<String>, i64, i64)> = connection
+        .query_row(
+            "SELECT name,has_songs,album_count FROM artist WHERE pid=900",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        placeholder,
+        Some((None, 1, 7)),
+        "only refresh and remove artists affected by this edit"
+    );
+}
+
+#[test]
 fn key_orders_put_empty_keys_last_and_keep_dense_named_ranks() {
     let keys = ["Zulu", "", "Alpha", "ALPHA", ""].map(str::to_owned);
     for scale in [1, 100] {
