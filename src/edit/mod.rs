@@ -1817,6 +1817,10 @@ fn delete_direct_references(transaction: &Transaction<'_>, path: &Path) -> Resul
 
 #[allow(clippy::too_many_lines)]
 fn update_derived_rows(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
+    // Orphan-free delete: albums also reference artist rows
+    // (album.artist_pid), so the artist DELETE below must keep an artist that
+    // only albums still point at — Apple never leaves a dangling
+    // album.artist_pid behind.
     transaction
         .execute_batch(
             "UPDATE album SET \
@@ -1839,7 +1843,7 @@ fn update_derived_rows(transaction: &Transaction<'_>, path: &Path) -> Result<()>
                artwork_album_pid=COALESCE((SELECT pid FROM album WHERE album.artist_pid=artist.pid AND COALESCE(artwork_status,0)!=0 ORDER BY COALESCE(name_order,0),pid LIMIT 1),0),\
                artwork_status=EXISTS(SELECT 1 FROM album WHERE album.artist_pid=artist.pid AND COALESCE(artwork_status,0)!=0)\
              WHERE pid IN temp.opod_artist AND EXISTS(SELECT 1 FROM item WHERE item.artist_pid=artist.pid);\
-             DELETE FROM artist WHERE pid IN temp.opod_artist AND pid!=0 AND NOT EXISTS(SELECT 1 FROM item WHERE item.artist_pid=artist.pid);\
+             DELETE FROM artist WHERE pid IN temp.opod_artist AND pid!=0 AND NOT EXISTS(SELECT 1 FROM item WHERE item.artist_pid=artist.pid) AND NOT EXISTS(SELECT 1 FROM album WHERE album.artist_pid=artist.pid);\
              UPDATE track_artist SET \
                has_songs=EXISTS(SELECT 1 FROM item WHERE item.track_artist_pid=track_artist.pid AND is_song!=0),\
                has_music_videos=EXISTS(SELECT 1 FROM item WHERE item.track_artist_pid=track_artist.pid AND is_music_video!=0),\
